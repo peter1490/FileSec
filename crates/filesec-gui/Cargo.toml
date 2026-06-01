@@ -1,0 +1,28 @@
+[package]
+name = "filesec-gui"
+description = "Native egui/eframe desktop app for FileSec secure file exchange."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "filesec"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward the core post-quantum opt-in.
+pqc = ["filesec-core/pqc"]
+
+[dependencies]
+directories = "6.0.0"
+eframe = "0.32.3"
+egui = "0.32.3"
+egui_extras = "0.32.3"
+filesec-core = { path = "../filesec-core" }
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+walkdir = "2.5.0"
+# rest filled in via `cargo add`
