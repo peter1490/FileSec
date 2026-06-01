@@ -206,6 +206,17 @@ cannot reach editor swap/backup files (see the threat model). A crash that
 bypasses check-in/discard leaves the temp until the next unlock, which wipes the
 `checkout/` directory.
 
+**Read-only View** (the 👁 button on a file): for a quick look without editing,
+the file is decrypted to a disposable, read-only temp and opened in your default
+app — there's nothing to check in. A background watcher securely wipes the temp
+the moment the app you opened it with closes (via a blocking launcher: macOS
+`open -W`, Windows `start /wait`), and any survivor is wiped when you leave the
+vault, lock, or quit. Caveats of the close-detection: it fires when the
+*application* exits, not when a single window closes, so if your viewer was
+already running the wipe waits until that whole app quits (the leave-the-vault
+backstop still covers it); on Linux there is no blocking launcher, so views are
+wiped on leaving the vault rather than on close.
+
 Planned, in dependency order:
 
 1. **Trust-UX polish** — richer verification flow and armored-key paste niceties.

@@ -113,6 +113,17 @@ struct Checkout {
     mode: Option<u32>,
 }
 
+/// A read-only view in progress: one file decrypted to a disposable temp file
+/// and opened in the OS app. There is nothing to check in — a detached watcher
+/// thread securely wipes the temp the moment the app that opened it closes, and
+/// any survivors are wiped when the vault is left. Multiple views may be active.
+struct ActiveView {
+    /// Display leaf (for the "viewing" banner).
+    leaf: String,
+    /// The decrypted read-only temp file on disk.
+    temp_path: std::path::PathBuf,
+}
+
 struct ExportForm {
     vault_id: String,
     selected: HashSet<String>,
@@ -136,6 +147,7 @@ struct Session {
     nav: Nav,
     open: Option<OpenVault>,
     checkout: Option<Checkout>,
+    views: Vec<ActiveView>,
     new_vault_name: String,
     show_new_vault: bool,
     new_folder_name: String,
@@ -159,6 +171,7 @@ impl Session {
             nav: Nav::Vaults,
             open: None,
             checkout: None,
+            views: Vec::new(),
             new_vault_name: String::new(),
             show_new_vault: false,
             new_folder_name: String::new(),
@@ -187,6 +200,7 @@ enum Action {
     NewFolder,
     DeleteEntry(String),
     SaveEntryAs(String),
+    ViewFile(String),
     CheckOut(String),
     CheckIn,
     Discard,
@@ -292,6 +306,8 @@ enum Outcome {
     EndCheckout {
         replace: Option<(String, Box<VaultReader>, Registry)>,
     },
+    /// Register a read-only view after decrypting it to a temp file.
+    StartView(Box<ActiveView>),
     Imported(Box<ImportData>),
     Contacts(ContactBook),
 }
@@ -400,14 +416,15 @@ impl eframe::App for App {
         }
     }
 
-    /// Best-effort wipe of an active check-out's temp file on a clean exit. A
-    /// hard crash (SIGKILL/power loss) bypasses this; the next-unlock
-    /// `clean_checkout_dir` is the backstop.
+    /// Best-effort wipe of an active check-out's temp file and any read-only view
+    /// temps on a clean exit. A hard crash (SIGKILL/power loss) bypasses this; the
+    /// next-unlock `clean_checkout_dir` is the backstop.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let State::Unlocked(s) = &self.state {
+        if let State::Unlocked(s) = &mut self.state {
             if let Some(c) = &s.checkout {
                 let _ = crate::store::secure_wipe(&c.temp_path);
             }
+            wipe_all_views(&mut s.views);
         }
     }
 }
@@ -592,6 +609,11 @@ impl App {
                     }
                 }
             }
+            Outcome::StartView(v) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.views.push(*v);
+                }
+            }
             Outcome::Imported(data) => {
                 if let State::Unlocked(s) = &mut self.state {
                     let contact = s.contacts.find(&data.sender_fpr);
@@ -630,6 +652,9 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
+                if let State::Unlocked(s) = &mut self.state {
+                    wipe_all_views(&mut s.views);
+                }
                 self.state = State::Unlock(Unlock::default());
                 self.toast = None;
             }
@@ -645,6 +670,7 @@ impl App {
                     return;
                 }
                 if let State::Unlocked(s) = &mut self.state {
+                    wipe_all_views(&mut s.views);
                     s.nav = n;
                     s.open = None;
                 }
@@ -663,6 +689,7 @@ impl App {
                     return;
                 }
                 if let State::Unlocked(s) = &mut self.state {
+                    wipe_all_views(&mut s.views);
                     s.open = None;
                 }
             }
@@ -723,6 +750,7 @@ impl App {
             Action::DeleteEntry(p) => self.spawn_delete_entry(ctx, p),
             Action::ExtractAll => self.spawn_extract_all(ctx),
             Action::SaveEntryAs(p) => self.spawn_save_entry_as(ctx, p),
+            Action::ViewFile(p) => self.spawn_view(ctx, p),
             Action::CheckOut(p) => self.spawn_check_out(ctx, p),
             Action::CheckIn => self.spawn_check_in(ctx),
             Action::Discard => self.spawn_discard(ctx),
@@ -1192,6 +1220,106 @@ impl App {
                 Ok(()) => JobReport::ok(Outcome::Noop, format!("Saved to {}", target.display())),
                 Err(e) => JobReport::err(e.to_string()),
             }
+        });
+    }
+
+    /// View a file read-only: decrypt it to a disposable, read-only temp file and
+    /// open it in the OS default app. There is no check-in — a detached watcher
+    /// securely wipes the temp the moment the app that opened it closes (where the
+    /// platform can report that), and any survivors are wiped when you leave the
+    /// vault. Multiple views may be open at once.
+    fn spawn_view(&mut self, ctx: &egui::Context, path: String) {
+        // Validate kind on the UI thread (metadata only, no decryption). Viewing
+        // is disabled while an edit is checked out (the row buttons enforce this
+        // too); guard here as well.
+        let leaf = {
+            let s = match &self.state {
+                State::Unlocked(s) => s,
+                _ => return,
+            };
+            if s.checkout.is_some() {
+                self.set_toast("Finish your current edit first.", true);
+                return;
+            }
+            let open = match &s.open {
+                Some(o) => o,
+                None => return,
+            };
+            match open.reader.entries().iter().find(|e| e.path == path) {
+                Some(e) if e.kind == EntryKind::File => {
+                    path.rsplit('/').next().unwrap_or("file").to_string()
+                }
+                Some(_) => {
+                    self.set_toast("Only files can be viewed.", true);
+                    return;
+                }
+                None => {
+                    self.set_toast("Entry not found.", true);
+                    return;
+                }
+            }
+        };
+        let (_, reader) = match self.open_reader() {
+            Some(x) => x,
+            None => return,
+        };
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        let leaf_clean = sanitize_leaf(&leaf);
+        self.spawn_job(ctx, "Opening…", move || {
+            // Decrypt the one file into a private temp, then drop it to read-only.
+            let temp_path = match store.create_private_checkout_file(&leaf_clean) {
+                Ok(p) => p,
+                Err(e) => return JobReport::err(e),
+            };
+            let out = match std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = crate::store::secure_wipe(&temp_path);
+                    return JobReport::err(e.to_string());
+                }
+            };
+            let mut out = std::io::BufWriter::new(out);
+            if let Err(e) = reader.read_entry_to_writer(&path, &mut out) {
+                let _ = std::io::Write::flush(&mut out);
+                drop(out);
+                let _ = crate::store::secure_wipe(&temp_path);
+                return JobReport::err(e.to_string());
+            }
+            if let Err(e) = std::io::Write::flush(&mut out) {
+                drop(out);
+                let _ = crate::store::secure_wipe(&temp_path);
+                return JobReport::err(e.to_string());
+            }
+            drop(out);
+            // Signal "look, don't edit" — and make secure_wipe restore writability
+            // before it overwrites (see store::secure_wipe).
+            let _ = crate::store::make_readonly(&temp_path);
+            // Launch the app and, where the platform can report it, watch for the
+            // app to close and wipe the temp then. Otherwise it's wiped on leaving
+            // the vault.
+            let msg = match start_view(&temp_path) {
+                ViewLaunch::WatchingForClose => {
+                    format!("Viewing {leaf} (read-only) — wiped when you close it.")
+                }
+                ViewLaunch::LaunchedNoWatch => {
+                    format!("Viewing {leaf} (read-only) — wiped when you leave the vault.")
+                }
+                ViewLaunch::Failed => format!(
+                    "Decrypted a read-only copy to {} (couldn't launch an app).",
+                    temp_path.display()
+                ),
+            };
+            JobReport::ok(
+                Outcome::StartView(Box::new(ActiveView { leaf, temp_path })),
+                msg,
+            )
         });
     }
 
@@ -1891,9 +2019,13 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         Some(o) => (o.reader.name().to_string(), o.id.clone()),
         None => return,
     };
+    // Drop any view whose temp a watcher already wiped (the app was closed), so
+    // the banner reflects what is actually still open.
+    s.views.retain(|v| v.temp_path.exists());
     // Leaf of the file currently checked out for editing (if any). While set,
     // all other vault mutations are disabled and the user must check in/discard.
     let editing = s.checkout.as_ref().map(|c| c.leaf.clone());
+    let viewing: Vec<String> = s.views.iter().map(|v| v.leaf.clone()).collect();
 
     ui.horizontal(|ui| {
         if ui.button("← Vaults").clicked() {
@@ -1917,6 +2049,28 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
                 if ui.button("Discard").clicked() {
                     *action = Some(Action::Discard);
                 }
+            });
+        });
+    }
+
+    if !viewing.is_empty() {
+        let plural = if viewing.len() == 1 { "y" } else { "ies" };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ACCENT,
+                    format!("👁 Viewing {} read-only cop{plural}", viewing.len()),
+                );
+                ui.label(
+                    RichText::new(format!("({})", viewing.join(", ")))
+                        .color(MUTED)
+                        .small(),
+                );
+                ui.label(
+                    RichText::new("— wiped automatically on close, or when you leave the vault.")
+                        .color(MUTED)
+                        .small(),
+                );
             });
         });
     }
@@ -1996,6 +2150,14 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
                             .clicked()
                     {
                         *action = Some(Action::CheckOut(path.clone()));
+                    }
+                    if kind == EntryKind::File
+                        && ui
+                            .add_enabled(idle, egui::Button::new("👁").small())
+                            .on_hover_text("View read-only (auto-wiped on close)")
+                            .clicked()
+                    {
+                        *action = Some(Action::ViewFile(path.clone()));
                     }
                 });
             });
@@ -2335,6 +2497,80 @@ fn open_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
         std::process::Command::new("xdg-open").arg(path).spawn()?;
     }
     Ok(())
+}
+
+/// Result of launching a read-only view. Which variants are constructed depends
+/// on the target OS (e.g. `LaunchedNoWatch` only on Linux), so all are allowed
+/// to be "unused" on any single platform.
+#[allow(dead_code)]
+enum ViewLaunch {
+    /// Launched, and a detached thread is waiting to wipe the temp on close.
+    WatchingForClose,
+    /// Launched, but this platform's launcher can't report when the app closes;
+    /// the temp is wiped when the user leaves the vault instead.
+    LaunchedNoWatch,
+    /// The launcher could not be started at all.
+    Failed,
+}
+
+/// Open `path` read-only in the OS default app for *viewing*. On platforms whose
+/// launcher blocks until the app closes (macOS `open -W`, Windows `start /wait`),
+/// spawn a detached thread that waits on that process and securely wipes the temp
+/// the moment it returns. On platforms without a blocking launcher (Linux
+/// `xdg-open`), there is no close signal, so cleanup falls to the leave-the-vault
+/// backstop.
+///
+/// Caveat: a blocking launcher reports when the *application* exits, not when a
+/// single document window closes — if the app was already running, the wipe waits
+/// until that whole app quits. The leave-the-vault backstop covers that gap.
+fn start_view(path: &std::path::Path) -> ViewLaunch {
+    let p = path.to_path_buf();
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("open").arg("-W").arg(&p).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    let _ = crate::store::secure_wipe(&p);
+                });
+                ViewLaunch::WatchingForClose
+            }
+            Err(_) => ViewLaunch::Failed,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match std::process::Command::new("cmd")
+            .args(["/C", "start", "/wait", ""])
+            .arg(&p)
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    let _ = crate::store::secure_wipe(&p);
+                });
+                ViewLaunch::WatchingForClose
+            }
+            Err(_) => ViewLaunch::Failed,
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        match std::process::Command::new("xdg-open").arg(&p).spawn() {
+            Ok(_) => ViewLaunch::LaunchedNoWatch,
+            Err(_) => ViewLaunch::Failed,
+        }
+    }
+}
+
+/// Securely wipe every active view's temp file and clear the list. Called when
+/// leaving the vault (close/nav/lock) and on exit. Idempotent: `secure_wipe`
+/// tolerates already-gone files, so a watcher that wiped first is harmless.
+fn wipe_all_views(views: &mut Vec<ActiveView>) {
+    for v in views.drain(..) {
+        let _ = crate::store::secure_wipe(&v.temp_path);
+    }
 }
 
 fn human_size(bytes: u64) -> String {

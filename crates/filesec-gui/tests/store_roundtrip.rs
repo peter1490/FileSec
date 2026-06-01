@@ -6,7 +6,9 @@ use filesec_core::identity::Identity;
 use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::KeystoreFile;
 use filesec_core::vault::Vault;
-use filesec_gui::store::{extract_vault, new_vault_id, secure_wipe, Registry, Store, VaultMeta};
+use filesec_gui::store::{
+    extract_vault, make_readonly, new_vault_id, secure_wipe, Registry, Store, VaultMeta,
+};
 use std::path::PathBuf;
 
 fn tmp() -> PathBuf {
@@ -148,6 +150,18 @@ fn secure_wipe_removes_file_and_tolerates_absent() {
     assert!(!p.exists());
     // Wiping an already-absent path is a no-op success.
     secure_wipe(&p).unwrap();
+}
+
+#[test]
+fn secure_wipe_handles_readonly_view_temp() {
+    // A view temp is marked read-only; secure_wipe must still be able to
+    // overwrite and remove it (it restores owner write first).
+    let p = tmp();
+    std::fs::write(&p, b"viewed copy").unwrap();
+    make_readonly(&p).unwrap();
+    assert!(std::fs::metadata(&p).unwrap().permissions().readonly());
+    secure_wipe(&p).unwrap();
+    assert!(!p.exists());
 }
 
 #[test]

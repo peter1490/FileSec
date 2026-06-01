@@ -434,6 +434,25 @@ pub fn extract_vault(vault: &Vault, dest: &Path) -> StoreResult<()> {
     Ok(())
 }
 
+/// Best-effort: restore owner write permission on a file that was marked
+/// read-only, so it can be overwritten. On Unix this sets mode `0600` (owner-only)
+/// rather than clearing the read-only bit globally (which would be world-writable).
+#[cfg(unix)]
+fn restore_writable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restore_writable(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
 /// Best-effort secure deletion: overwrite the file's current length with random
 /// bytes, fsync, then unlink. A no-op if the file is absent.
 ///
@@ -447,10 +466,16 @@ pub fn extract_vault(vault: &Vault, dest: &Path) -> StoreResult<()> {
 /// bar against casual recovery only.
 pub fn secure_wipe(path: &Path) -> StoreResult<()> {
     use std::io::{Seek, SeekFrom, Write};
-    if !path.exists() {
-        return Ok(());
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // absent (or unreadable) — nothing to wipe
+    };
+    let len = meta.len();
+    // Read-only files (e.g. view temps) can't be opened for writing; restore
+    // owner write first so we can overwrite before unlinking.
+    if meta.permissions().readonly() {
+        restore_writable(path);
     }
-    let len = std::fs::metadata(path).map_err(err)?.len();
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -469,6 +494,15 @@ pub fn secure_wipe(path: &Path) -> StoreResult<()> {
     drop(f);
     std::fs::remove_file(path).map_err(err)?;
     Ok(())
+}
+
+/// Best-effort: mark `path` read-only, signalling "look, don't edit" for a
+/// view temp. Advisory only — many apps ignore it, and [`secure_wipe`] restores
+/// writability before overwriting.
+pub fn make_readonly(path: &Path) -> StoreResult<()> {
+    let mut perms = std::fs::metadata(path).map_err(err)?.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(path, perms).map_err(err)
 }
 
 /// Create (truncating) a file for writing with owner-only permissions from the
