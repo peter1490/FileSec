@@ -40,6 +40,36 @@ fn stream_roundtrips_across_sizes() {
 }
 
 #[test]
+fn decrypt_chunk_enables_random_access() {
+    use filesec_core::aead::{decrypt_chunk, TAG_LEN};
+    let key = SymKey::random().unwrap();
+    let nonce = random_vec(STREAM_NONCE_LEN).unwrap();
+    let chunk = 100usize;
+    // 350 bytes -> chunks of 100,100,100,50 = 4 chunks.
+    let pt: Vec<u8> = (0..350u32).map(|i| (i % 256) as u8).collect();
+    let mut ct = Vec::new();
+    encrypt_stream(&key, &nonce, b"aad", Cursor::new(&pt), &mut ct, chunk).unwrap();
+
+    let num_chunks = 4u32;
+    let mut reassembled = Vec::new();
+    let mut offset = 0usize;
+    for c in 0..num_chunks {
+        let is_last = c == num_chunks - 1;
+        let pt_len = if is_last { 50 } else { 100 };
+        let ct_len = pt_len + TAG_LEN;
+        let slice = &ct[offset..offset + ct_len];
+        let dec = decrypt_chunk(&key, &nonce, b"aad", c, is_last, slice).unwrap();
+        reassembled.extend_from_slice(&dec);
+        offset += ct_len;
+    }
+    assert_eq!(reassembled, pt);
+
+    // A wrong index or last-flag must fail authentication.
+    assert!(decrypt_chunk(&key, &nonce, b"aad", 0, true, &ct[0..100 + TAG_LEN]).is_err());
+    assert!(decrypt_chunk(&key, &nonce, b"aad", 1, false, &ct[0..100 + TAG_LEN]).is_err());
+}
+
+#[test]
 fn stream_wrong_key_or_aad_fails() {
     let key = SymKey::random().unwrap();
     let other = SymKey::random().unwrap();

@@ -223,11 +223,101 @@ impl Store {
         Ok(())
     }
 
-    /// Load a vault from its local encrypted file.
+    /// Load a vault fully into memory (used for mutation and re-export, which
+    /// need the entire plaintext).
     pub fn load_vault(&self, identity: &Identity, id: &str) -> StoreResult<Vault> {
         let imported =
             format::import_vault_from_path(&self.vault_path(id), identity).map_err(err)?;
         Ok(imported.vault)
+    }
+
+    /// Lazily open a vault: authenticate and load only the manifest (metadata),
+    /// decrypting file contents on demand. Cheap even for very large vaults.
+    pub fn open_vault(&self, identity: &Identity, id: &str) -> StoreResult<format::VaultReader> {
+        format::open_vault_from_path(&self.vault_path(id), identity).map_err(err)
+    }
+
+    /// Add files (streamed from disk) and empty directories to an existing vault
+    /// **without** decrypting it into memory: the new container is written from
+    /// `reader` (which streams the existing data) plus the new files, to a temp
+    /// file that atomically replaces the vault. Peak memory is a couple of chunks
+    /// regardless of vault or file size.
+    pub fn append_files_to_vault(
+        &self,
+        identity: &Identity,
+        id: &str,
+        reader: &format::VaultReader,
+        added: &[format::AddedFile],
+        added_dirs: &[String],
+    ) -> StoreResult<()> {
+        let final_path = self.vault_path(id);
+        let tmp = self.vaults_dir.join(format!("{id}.fsec.tmp"));
+        if let Err(e) = reader.append_files_to_path(
+            identity,
+            &[identity.public()],
+            &ExportOptions::default(),
+            added,
+            added_dirs,
+            &tmp,
+        ) {
+            let _ = std::fs::remove_file(&tmp); // don't leave a partial temp behind
+            return Err(err(e));
+        }
+        std::fs::rename(&tmp, &final_path).map_err(err)?;
+        harden_file(&final_path);
+        Ok(())
+    }
+
+    /// Remove paths (each entry plus, for a directory, its subtree) from an
+    /// existing vault **without** decrypting it into memory: the new container is
+    /// streamed from `reader` minus the removed files, to a temp file that
+    /// atomically replaces the vault.
+    pub fn remove_paths_from_vault(
+        &self,
+        identity: &Identity,
+        id: &str,
+        reader: &format::VaultReader,
+        remove: &[String],
+    ) -> StoreResult<()> {
+        let final_path = self.vault_path(id);
+        let tmp = self.vaults_dir.join(format!("{id}.fsec.tmp"));
+        if let Err(e) = reader.remove_paths_to_path(
+            identity,
+            &[identity.public()],
+            &ExportOptions::default(),
+            remove,
+            &tmp,
+        ) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(e));
+        }
+        std::fs::rename(&tmp, &final_path).map_err(err)?;
+        harden_file(&final_path);
+        Ok(())
+    }
+
+    /// Transcode a just-verified incoming container straight into the local
+    /// self-encrypted store, **streaming** from `reader` so a huge imported file
+    /// is never held in memory. Writes to the (new) vault path directly — there is
+    /// no existing file to preserve — and cleans up on failure.
+    pub fn import_reader_to_vault(
+        &self,
+        identity: &Identity,
+        id: &str,
+        reader: &format::VaultReader,
+    ) -> StoreResult<()> {
+        let path = self.vault_path(id);
+        if let Err(e) = reader.reexport_to_path(
+            identity,
+            &[identity.public()],
+            &ExportOptions::default(),
+            &path,
+        ) {
+            let _ = std::fs::remove_file(&path);
+            return Err(err(e));
+        }
+        harden_file(&path);
+        Ok(())
     }
 
     /// Delete a vault's encrypted file.

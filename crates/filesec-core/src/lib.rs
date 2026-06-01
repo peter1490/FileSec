@@ -36,7 +36,7 @@ pub mod util;
 pub mod vault;
 
 pub use error::{Error, Result};
-pub use format::{ExportOptions, ImportedVault};
+pub use format::{AddedFile, ExportOptions, ImportedVault, VaultReader, VerifiedSender};
 pub use identity::{Identity, PublicIdentity};
 pub use suite::SuiteId;
 pub use vault::Vault;

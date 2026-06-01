@@ -25,4 +25,6 @@ filesec-core = { path = "../filesec-core" }
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 walkdir = "2.5.0"
+# Pinned to match filesec-core (Rust 1.86 MSRV); wipes passphrases held in UI state.
+zeroize = "1.8.2"
 # rest filled in via `cargo add`

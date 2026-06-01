@@ -1,17 +1,23 @@
 //! The egui application: state machine, screens, and action handling.
 //!
 //! Rendering is immediate-mode and side-effect-free: each screen only *collects*
-//! an [`Action`]. After the frame is laid out, [`App::handle`] applies the
-//! action — performing crypto and I/O — so borrow scopes stay simple and the UI
-//! never mutates persistent state mid-render.
+//! an [`Action`]. After the frame is laid out, [`App::dispatch`] applies it.
+//!
+//! All crypto and I/O (Argon2 unlock, vault encryption/decryption, export and
+//! import) run on a **background worker thread** so the UI never blocks — even
+//! for very large vaults. While a job is in flight the UI is disabled behind a
+//! spinner; when the worker finishes it sends back a [`JobReport`] that is
+//! applied on the UI thread.
 
 use std::collections::HashSet;
+use std::sync::{mpsc, Arc};
 use std::time::UNIX_EPOCH;
 
 use eframe::egui::{self, Color32, RichText};
+use zeroize::{Zeroize, Zeroizing};
 
 use filesec_core::contacts::{ContactBook, Trust};
-use filesec_core::format::{self, ExportOptions};
+use filesec_core::format::{self, ExportOptions, VaultReader};
 use filesec_core::identity::Identity;
 use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::KeystoreFile;
@@ -19,7 +25,7 @@ use filesec_core::manifest::EntryKind;
 use filesec_core::util::{hex, now_unix};
 use filesec_core::vault::Vault;
 
-use crate::store::{extract_vault, new_vault_id, Registry, Store, VaultMeta};
+use crate::store::{new_vault_id, Registry, Store, VaultMeta};
 
 const OK_GREEN: Color32 = Color32::from_rgb(0x3c, 0xb3, 0x71);
 const ERR_RED: Color32 = Color32::from_rgb(0xd6, 0x5d, 0x5d);
@@ -28,9 +34,10 @@ const ACCENT: Color32 = Color32::from_rgb(0x5a, 0x9b, 0xd4);
 
 /// Top-level application.
 pub struct App {
-    store: Option<Store>,
+    store: Option<Arc<Store>>,
     state: State,
     toast: Option<Toast>,
+    job: Option<Job>,
 }
 
 struct Toast {
@@ -53,10 +60,27 @@ struct FirstRun {
     error: Option<String>,
 }
 
+/// Wipe the passphrase buffers when the first-run form is discarded (e.g. on a
+/// successful unlock). `String::clear`/`mem::take` alone leave the old bytes in
+/// freed heap; this zeroizes them.
+impl Drop for FirstRun {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+        self.pass2.zeroize();
+    }
+}
+
 #[derive(Default)]
 struct Unlock {
     pass: String,
     error: Option<String>,
+}
+
+/// Wipe the passphrase buffer when the unlock form is discarded. See [`FirstRun`].
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -68,7 +92,7 @@ enum Nav {
 
 struct OpenVault {
     id: String,
-    vault: Vault,
+    reader: VaultReader,
 }
 
 struct ExportForm {
@@ -85,9 +109,10 @@ struct ImportInfo {
     file_count: usize,
 }
 
-/// Unlocked session state.
+/// Unlocked session state. The identity is reference-counted so it can be
+/// shared (read-only) with background worker threads.
 struct Session {
-    identity: Identity,
+    identity: Arc<Identity>,
     contacts: ContactBook,
     registry: Registry,
     nav: Nav,
@@ -103,7 +128,7 @@ struct Session {
 
 impl Session {
     fn new(
-        identity: Identity,
+        identity: Arc<Identity>,
         contacts: ContactBook,
         registry: Registry,
         data_dir: String,
@@ -158,6 +183,88 @@ enum Action {
     DismissToast,
 }
 
+// ---------------------------------------------------------------------------
+// Background jobs
+// ---------------------------------------------------------------------------
+
+/// A running background job; the UI polls `rx` each frame.
+struct Job {
+    rx: mpsc::Receiver<JobReport>,
+    label: String,
+}
+
+/// What a finished worker asks the UI thread to do.
+struct JobReport {
+    outcome: Outcome,
+    /// Optional `(message, is_error)` toast.
+    toast: Option<(String, bool)>,
+}
+
+impl JobReport {
+    fn ok(outcome: Outcome, msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        let toast = if msg.is_empty() {
+            None
+        } else {
+            Some((msg, false))
+        };
+        Self { outcome, toast }
+    }
+
+    fn err(msg: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::Noop,
+            toast: Some((msg.into(), true)),
+        }
+    }
+}
+
+/// Freshly-unlocked session material produced by a worker.
+struct SessionInit {
+    identity: Identity,
+    contacts: ContactBook,
+    registry: Registry,
+    data_dir: String,
+}
+
+/// Result of importing a `.fsec` container (sender trust is resolved on the UI
+/// thread against the live contact book).
+struct ImportData {
+    registry: Registry,
+    sender_fpr: [u8; 32],
+    vault_name: String,
+    file_count: usize,
+}
+
+/// State mutations applied on the UI thread when a job completes.
+enum Outcome {
+    Noop,
+    Unlocked(Box<SessionInit>),
+    FirstRunFailed(String),
+    UnlockFailed(String),
+    Created {
+        registry: Registry,
+        id: String,
+        reader: Box<VaultReader>,
+    },
+    SetOpen {
+        id: String,
+        reader: Box<VaultReader>,
+    },
+    /// Replace the open vault's reader after a successful mutate + re-encrypt.
+    ReplaceOpen {
+        id: String,
+        reader: Box<VaultReader>,
+        registry: Registry,
+    },
+    Deleted {
+        registry: Registry,
+        closed_id: String,
+    },
+    Imported(Box<ImportData>),
+    Contacts(ContactBook),
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new()
@@ -175,15 +282,17 @@ impl App {
                     State::FirstRun(FirstRun::default())
                 };
                 App {
-                    store: Some(store),
+                    store: Some(Arc::new(store)),
                     state,
                     toast: None,
+                    job: None,
                 }
             }
             Err(e) => App {
                 store: None,
                 state: State::Fatal(e),
                 toast: None,
+                job: None,
             },
         }
     }
@@ -191,9 +300,19 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply a finished background job, if any.
+        if let Some(job) = &self.job {
+            if let Ok(report) = job.rx.try_recv() {
+                self.job = None;
+                self.apply(report);
+            }
+        }
+        let busy = self.job.is_some();
         let mut action: Option<Action> = None;
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui, &mut action));
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_enabled_ui(!busy, |ui| self.top_bar(ui, &mut action));
+        });
 
         if let Some(t) = &self.toast {
             egui::TopBottomPanel::bottom("toast").show(ctx, |ui| {
@@ -209,18 +328,44 @@ impl eframe::App for App {
             });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match &mut self.state {
-            State::Fatal(msg) => {
-                ui.heading("FileSec could not start");
-                ui.colored_label(ERR_RED, msg.clone());
-            }
-            State::FirstRun(f) => first_run_ui(f, ui, &mut action),
-            State::Unlock(u) => unlock_ui(u, ui, &mut action),
-            State::Unlocked(s) => session_ui(s, ui, &mut action),
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_enabled_ui(!busy, |ui| match &mut self.state {
+                State::Fatal(msg) => {
+                    ui.heading("FileSec could not start");
+                    ui.colored_label(ERR_RED, msg.clone());
+                }
+                State::FirstRun(f) => first_run_ui(f, ui, &mut action),
+                State::Unlock(u) => unlock_ui(u, ui, &mut action),
+                State::Unlocked(s) => session_ui(s, ui, &mut action),
+            });
         });
 
+        if busy {
+            let label = self
+                .job
+                .as_ref()
+                .map(|j| j.label.clone())
+                .unwrap_or_default();
+            egui::Window::new("working")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(label);
+                    });
+                });
+        }
+
         if let Some(a) = action {
-            self.handle(a, ctx);
+            match a {
+                // The toast can always be dismissed, even mid-job.
+                Action::DismissToast => self.toast = None,
+                _ if !busy => self.dispatch(a, ctx),
+                _ => {}
+            }
         }
     }
 }
@@ -257,28 +402,260 @@ impl App {
         });
     }
 
-    fn handle(&mut self, action: Action, ctx: &egui::Context) {
+    fn store_arc(&self) -> Option<Arc<Store>> {
+        self.store.clone()
+    }
+
+    fn ident_arc(&self) -> Option<Arc<Identity>> {
+        if let State::Unlocked(s) = &self.state {
+            Some(s.identity.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Snapshot the open vault for a *mutating* worker: id + a cheap clone of the
+    /// metadata-only reader + a clone of the registry. The session keeps its
+    /// reader; on success a fresh reader is swapped in via `ReplaceOpen`.
+    fn open_ctx(&self) -> Option<(String, VaultReader, Registry)> {
+        if let State::Unlocked(s) = &self.state {
+            if let Some(o) = &s.open {
+                return Some((o.id.clone(), o.reader.clone(), s.registry.clone()));
+            }
+        }
+        None
+    }
+
+    /// Snapshot the open vault for a *read-only* worker.
+    fn open_reader(&self) -> Option<(String, VaultReader)> {
+        if let State::Unlocked(s) = &self.state {
+            if let Some(o) = &s.open {
+                return Some((o.id.clone(), o.reader.clone()));
+            }
+        }
+        None
+    }
+
+    /// Spawn `work` on a background thread and show a spinner labelled `label`.
+    fn spawn_job(
+        &mut self,
+        ctx: &egui::Context,
+        label: impl Into<String>,
+        work: impl FnOnce() -> JobReport + Send + 'static,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let report = work();
+            let _ = tx.send(report);
+            ctx.request_repaint();
+        });
+        self.job = Some(Job {
+            rx,
+            label: label.into(),
+        });
+    }
+
+    fn apply(&mut self, report: JobReport) {
+        if let Some((msg, error)) = report.toast {
+            self.toast = Some(Toast { msg, error });
+        }
+        match report.outcome {
+            Outcome::Noop => {}
+            Outcome::Unlocked(init) => {
+                let SessionInit {
+                    identity,
+                    contacts,
+                    registry,
+                    data_dir,
+                } = *init;
+                self.state = State::Unlocked(Box::new(Session::new(
+                    Arc::new(identity),
+                    contacts,
+                    registry,
+                    data_dir,
+                )));
+            }
+            Outcome::FirstRunFailed(msg) => {
+                if let State::FirstRun(f) = &mut self.state {
+                    f.error = Some(msg);
+                }
+            }
+            Outcome::UnlockFailed(msg) => {
+                if let State::Unlock(u) = &mut self.state {
+                    u.error = Some(msg);
+                }
+            }
+            Outcome::Created {
+                registry,
+                id,
+                reader,
+            } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.registry = registry;
+                    s.new_vault_name.clear();
+                    s.show_new_vault = false;
+                    s.open = Some(OpenVault {
+                        id,
+                        reader: *reader,
+                    });
+                }
+            }
+            Outcome::SetOpen { id, reader } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.open = Some(OpenVault {
+                        id,
+                        reader: *reader,
+                    });
+                }
+            }
+            Outcome::ReplaceOpen {
+                id,
+                reader,
+                registry,
+            } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.registry = registry;
+                    s.open = Some(OpenVault {
+                        id,
+                        reader: *reader,
+                    });
+                }
+            }
+            Outcome::Deleted {
+                registry,
+                closed_id,
+            } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.registry = registry;
+                    if s.open.as_ref().map(|o| o.id == closed_id).unwrap_or(false) {
+                        s.open = None;
+                    }
+                }
+            }
+            Outcome::Imported(data) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    let contact = s.contacts.find(&data.sender_fpr);
+                    let sender_name = contact.map(|c| c.identity.name.clone());
+                    let verified = matches!(contact.map(|c| c.trust), Some(Trust::Verified));
+                    s.registry = data.registry;
+                    s.last_import = Some(ImportInfo {
+                        sender_fpr_hex: hex(&data.sender_fpr),
+                        sender_name,
+                        verified,
+                        vault_name: data.vault_name,
+                        file_count: data.file_count,
+                    });
+                }
+            }
+            Outcome::Contacts(book) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.contacts = book;
+                }
+            }
+        }
+    }
+
+    fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         match action {
-            Action::CreateIdentity => self.do_create_identity(),
-            Action::Unlock => self.do_unlock(),
+            // --- instant, UI-only actions ---
             Action::Lock => {
                 self.state = State::Unlock(Unlock::default());
                 self.toast = None;
             }
-            Action::DismissToast => {
-                self.toast = None;
-            }
+            Action::DismissToast => self.toast = None,
             Action::DismissImportInfo => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.last_import = None;
                 }
             }
-            other => self.handle_session(other, ctx),
+            Action::Nav(n) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.nav = n;
+                    s.open = None;
+                }
+            }
+            Action::ToggleNewVault(b) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.show_new_vault = b;
+                    if !b {
+                        s.new_vault_name.clear();
+                    }
+                }
+            }
+            Action::CloseVault => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.open = None;
+                }
+            }
+            Action::CancelExport => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.export = None;
+                }
+            }
+            Action::BeginExport(id) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.export = Some(ExportForm {
+                        vault_id: id,
+                        selected: HashSet::new(),
+                        include_self: false,
+                    });
+                }
+            }
+            Action::ToggleRecipient(fpr) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(e) = &mut s.export {
+                        if !e.selected.insert(fpr.clone()) {
+                            e.selected.remove(&fpr);
+                        }
+                    }
+                }
+            }
+            Action::ToggleIncludeSelf => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(e) = &mut s.export {
+                        e.include_self = !e.include_self;
+                    }
+                }
+            }
+            Action::CopyPubKey => {
+                let armored = if let State::Unlocked(s) = &self.state {
+                    Some(s.identity.public().to_armored())
+                } else {
+                    None
+                };
+                match armored {
+                    Some(Ok(text)) => {
+                        ctx.copy_text(text);
+                        self.set_toast("Public key copied to clipboard.", false);
+                    }
+                    Some(Err(e)) => self.set_toast(e.to_string(), true),
+                    None => {}
+                }
+            }
+            // --- background jobs ---
+            Action::CreateIdentity => self.spawn_create_identity(ctx),
+            Action::Unlock => self.spawn_unlock(ctx),
+            Action::CreateVault => self.spawn_create_vault(ctx),
+            Action::OpenVault(id) => self.spawn_open_vault(ctx, id),
+            Action::DeleteVault(id) => self.spawn_delete_vault(ctx, id),
+            Action::AddFiles => self.spawn_add_files(ctx),
+            Action::AddFolder => self.spawn_add_folder(ctx),
+            Action::NewFolder => self.spawn_new_folder(ctx),
+            Action::DeleteEntry(p) => self.spawn_delete_entry(ctx, p),
+            Action::ExtractAll => self.spawn_extract_all(ctx),
+            Action::SaveEntryAs(p) => self.spawn_save_entry_as(ctx, p),
+            Action::ImportContainer => self.spawn_import(ctx),
+            Action::DoExport => self.spawn_export(ctx),
+            Action::ImportContactPaste => self.spawn_import_contact_paste(ctx),
+            Action::ImportContactFile => self.spawn_import_contact_file(ctx),
+            Action::SetTrust(fpr, t) => self.spawn_set_trust(ctx, fpr, t),
+            Action::RemoveContact(fpr) => self.spawn_remove_contact(ctx, fpr),
+            Action::SavePubKey => self.spawn_save_pubkey(ctx),
         }
     }
 
-    fn do_create_identity(&mut self) {
-        // Validate without touching the store.
+    fn spawn_create_identity(&mut self, ctx: &egui::Context) {
         let (name, pass) = {
             let f = match &mut self.state {
                 State::FirstRun(f) => f,
@@ -297,545 +674,773 @@ impl App {
                 f.error = Some("Passphrases do not match.".into());
                 return;
             }
-            (name, std::mem::take(&mut f.pass))
+            f.error = None;
+            f.pass2.zeroize();
+            // Move the passphrase into a zeroizing buffer so it is wiped after the
+            // worker hands it to the keystore, not just dropped.
+            (name, Zeroizing::new(std::mem::take(&mut f.pass)))
         };
-
-        let identity = match Identity::generate(&name, now_unix()) {
-            Ok(i) => i,
-            Err(e) => {
-                self.fail_first_run(e.to_string());
-                return;
-            }
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
         };
-        let ks = match KeystoreFile::create(&identity, pass.as_bytes(), KdfParams::default()) {
-            Ok(k) => k,
-            Err(e) => {
-                self.fail_first_run(e.to_string());
-                return;
-            }
-        };
-        let data_dir = self
-            .store
-            .as_ref()
-            .map(|s| s.data_dir().display().to_string())
-            .unwrap_or_default();
-        if let Some(store) = &self.store {
+        self.spawn_job(ctx, "Creating identity…", move || {
+            let identity = match Identity::generate(&name, now_unix()) {
+                Ok(i) => i,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::FirstRunFailed(e.to_string()),
+                        toast: None,
+                    }
+                }
+            };
+            let ks = match KeystoreFile::create(&identity, pass.as_bytes(), KdfParams::default()) {
+                Ok(k) => k,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::FirstRunFailed(e.to_string()),
+                        toast: None,
+                    }
+                }
+            };
             if let Err(e) = store.save_keystore(&ks) {
-                self.fail_first_run(e);
-                return;
+                return JobReport {
+                    outcome: Outcome::FirstRunFailed(e),
+                    toast: None,
+                };
             }
-        }
-        self.state = State::Unlocked(Box::new(Session::new(
-            identity,
-            ContactBook::default(),
-            Registry::default(),
-            data_dir,
-        )));
-        self.set_toast(
-            "Identity created. Your keys are protected by your passphrase.",
-            false,
-        );
+            let data_dir = store.data_dir().display().to_string();
+            JobReport::ok(
+                Outcome::Unlocked(Box::new(SessionInit {
+                    identity,
+                    contacts: ContactBook::default(),
+                    registry: Registry::default(),
+                    data_dir,
+                })),
+                "Identity created. Your keys are protected by your passphrase.",
+            )
+        });
     }
 
-    fn fail_first_run(&mut self, msg: String) {
-        if let State::FirstRun(f) = &mut self.state {
-            f.error = Some(msg);
-        }
-    }
-
-    fn do_unlock(&mut self) {
+    fn spawn_unlock(&mut self, ctx: &egui::Context) {
         let pass = match &mut self.state {
-            State::Unlock(u) => std::mem::take(&mut u.pass),
+            State::Unlock(u) => {
+                u.error = None;
+                // Wiped after the worker uses it (see `spawn_create_identity`).
+                Zeroizing::new(std::mem::take(&mut u.pass))
+            }
             _ => return,
         };
-        let store = match &self.store {
+        let store = match self.store_arc() {
             Some(s) => s,
             None => return,
         };
-        let ks = match store.load_keystore() {
-            Ok(k) => k,
-            Err(e) => {
-                self.fail_unlock(e);
-                return;
-            }
-        };
-        let identity = match ks.unlock(pass.as_bytes()) {
-            Ok(i) => i,
-            Err(e) => {
-                self.fail_unlock(e.to_string());
-                return;
-            }
-        };
-        let contacts = store.load_contacts(&identity).unwrap_or_default();
-        let registry = store.load_registry(&identity).unwrap_or_default();
-        let data_dir = store.data_dir().display().to_string();
-        self.state = State::Unlocked(Box::new(Session::new(
-            identity, contacts, registry, data_dir,
-        )));
-        self.set_toast("Unlocked.", false);
+        self.spawn_job(ctx, "Unlocking…", move || {
+            let ks = match store.load_keystore() {
+                Ok(k) => k,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
+            let identity = match ks.unlock(pass.as_bytes()) {
+                Ok(i) => i,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e.to_string()),
+                        toast: None,
+                    }
+                }
+            };
+            let contacts = store.load_contacts(&identity).unwrap_or_default();
+            let registry = store.load_registry(&identity).unwrap_or_default();
+            let data_dir = store.data_dir().display().to_string();
+            JobReport::ok(
+                Outcome::Unlocked(Box::new(SessionInit {
+                    identity,
+                    contacts,
+                    registry,
+                    data_dir,
+                })),
+                "Unlocked.",
+            )
+        });
     }
 
-    fn fail_unlock(&mut self, msg: String) {
-        if let State::Unlock(u) = &mut self.state {
-            u.error = Some(msg);
-        }
-    }
-
-    fn handle_session(&mut self, action: Action, ctx: &egui::Context) {
-        let store = match &self.store {
-            Some(s) => s,
-            None => return,
-        };
-        let session = match &mut self.state {
-            State::Unlocked(s) => s,
+    fn spawn_create_vault(&mut self, ctx: &egui::Context) {
+        let (name, registry) = match &self.state {
+            State::Unlocked(s) => (s.new_vault_name.trim().to_string(), s.registry.clone()),
             _ => return,
         };
-        let mut toast: Option<(String, bool)> = None;
-
-        match action {
-            Action::Nav(n) => {
-                session.nav = n;
-                session.open = None;
-            }
-            Action::ToggleNewVault(b) => {
-                session.show_new_vault = b;
-                if !b {
-                    session.new_vault_name.clear();
-                }
-            }
-            Action::CreateVault => report(&mut toast, session.create_vault(store)),
-            Action::OpenVault(id) => report(&mut toast, session.open_vault(store, &id)),
-            Action::CloseVault => session.open = None,
-            Action::DeleteVault(id) => report(&mut toast, session.delete_vault(store, &id)),
-            Action::ImportContainer => report(&mut toast, session.import_container(store)),
-            Action::AddFiles => report(&mut toast, session.add_files(store)),
-            Action::AddFolder => report(&mut toast, session.add_folder(store)),
-            Action::NewFolder => report(&mut toast, session.new_folder(store)),
-            Action::DeleteEntry(p) => report(&mut toast, session.delete_entry(store, &p)),
-            Action::SaveEntryAs(p) => report(&mut toast, session.save_entry_as(&p)),
-            Action::ExtractAll => report(&mut toast, session.extract_all()),
-            Action::BeginExport(id) => session.begin_export(id),
-            Action::CancelExport => session.export = None,
-            Action::DoExport => report(&mut toast, session.do_export(store)),
-            Action::ToggleRecipient(fpr) => session.toggle_recipient(&fpr),
-            Action::ToggleIncludeSelf => {
-                if let Some(e) = &mut session.export {
-                    e.include_self = !e.include_self;
-                }
-            }
-            Action::ImportContactPaste => report(&mut toast, session.import_contact_paste(store)),
-            Action::ImportContactFile => report(&mut toast, session.import_contact_file(store)),
-            Action::SetTrust(fpr, t) => report(&mut toast, session.set_trust(store, &fpr, t)),
-            Action::RemoveContact(fpr) => report(&mut toast, session.remove_contact(store, &fpr)),
-            Action::SavePubKey => report(&mut toast, session.save_pubkey()),
-            Action::CopyPubKey => match session.identity.public().to_armored() {
-                Ok(s) => {
-                    ctx.copy_text(s);
-                    toast = Some(("Public key copied to clipboard.".into(), false));
-                }
-                Err(e) => toast = Some((e.to_string(), true)),
-            },
-            // Handled in `handle`.
-            Action::CreateIdentity
-            | Action::Unlock
-            | Action::Lock
-            | Action::DismissImportInfo
-            | Action::DismissToast => {}
-        }
-
-        if let Some((msg, error)) = toast {
-            self.toast = Some(Toast { msg, error });
-        }
-    }
-}
-
-fn report(slot: &mut Option<(String, bool)>, result: Result<String, String>) {
-    *slot = Some(match result {
-        Ok(msg) => (msg, false),
-        Err(e) => (e, true),
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Session operations (perform crypto + I/O, return a user-facing message).
-// ---------------------------------------------------------------------------
-
-impl Session {
-    fn persist_open(&mut self, store: &Store) -> Result<(), String> {
-        if let Some(open) = &self.open {
-            store.save_vault(&self.identity, &open.id, &open.vault)?;
-            self.registry.upsert(VaultMeta {
-                id: open.id.clone(),
-                name: open.vault.name.clone(),
-                created_at: open.vault.created_at,
-                modified_at: now_unix(),
-                file_count: open.vault.file_count() as u64,
-                total_size: open.vault.total_size(),
-            });
-            store.save_registry(&self.identity, &self.registry)?;
-        }
-        Ok(())
-    }
-
-    fn create_vault(&mut self, store: &Store) -> Result<String, String> {
-        let name = self.new_vault_name.trim().to_string();
         if name.is_empty() {
-            return Err("Enter a vault name.".into());
+            self.set_toast("Enter a vault name.", true);
+            return;
         }
-        let id = new_vault_id();
-        let vault = Vault::new(&name, now_unix());
-        store.save_vault(&self.identity, &id, &vault)?;
-        self.registry.upsert(VaultMeta {
-            id: id.clone(),
-            name: name.clone(),
-            created_at: vault.created_at,
-            modified_at: now_unix(),
-            file_count: 0,
-            total_size: 0,
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Creating vault…", move || {
+            let id = new_vault_id();
+            let vault = Vault::new(&name, now_unix());
+            if let Err(e) = store.save_vault(&identity, &id, &vault) {
+                return JobReport::err(e);
+            }
+            let reader = match store.open_vault(&identity, &id) {
+                Ok(r) => r,
+                Err(e) => return JobReport::err(e),
+            };
+            let mut registry = registry;
+            registry.upsert(VaultMeta {
+                id: id.clone(),
+                name: name.clone(),
+                created_at: reader.created_at(),
+                modified_at: now_unix(),
+                file_count: 0,
+                total_size: 0,
+            });
+            if let Err(e) = store.save_registry(&identity, &registry) {
+                return JobReport::err(e);
+            }
+            JobReport::ok(
+                Outcome::Created {
+                    registry,
+                    id,
+                    reader: Box::new(reader),
+                },
+                format!("Created vault \"{name}\"."),
+            )
         });
-        store.save_registry(&self.identity, &self.registry)?;
-        self.new_vault_name.clear();
-        self.show_new_vault = false;
-        self.open = Some(OpenVault { id, vault });
-        Ok(format!("Created vault \"{name}\"."))
     }
 
-    fn open_vault(&mut self, store: &Store, id: &str) -> Result<String, String> {
-        let vault = store.load_vault(&self.identity, id)?;
-        let name = vault.name.clone();
-        self.open = Some(OpenVault {
-            id: id.to_string(),
-            vault,
+    fn spawn_open_vault(&mut self, ctx: &egui::Context, id: String) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Opening vault…", move || {
+            match store.open_vault(&identity, &id) {
+                Ok(reader) => {
+                    let name = reader.name().to_string();
+                    JobReport::ok(
+                        Outcome::SetOpen {
+                            id,
+                            reader: Box::new(reader),
+                        },
+                        format!("Opened \"{name}\"."),
+                    )
+                }
+                Err(e) => JobReport::err(e),
+            }
         });
-        Ok(format!("Opened \"{name}\"."))
     }
 
-    fn delete_vault(&mut self, store: &Store, id: &str) -> Result<String, String> {
-        store.delete_vault_file(id)?;
-        self.registry.remove(id);
-        store.save_registry(&self.identity, &self.registry)?;
-        if self.open.as_ref().map(|o| o.id == id).unwrap_or(false) {
-            self.open = None;
+    fn spawn_delete_vault(&mut self, ctx: &egui::Context, id: String) {
+        let registry = match &self.state {
+            State::Unlocked(s) => s.registry.clone(),
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Deleting vault…", move || {
+            if let Err(e) = store.delete_vault_file(&id) {
+                return JobReport::err(e);
+            }
+            let mut registry = registry;
+            registry.remove(&id);
+            if let Err(e) = store.save_registry(&identity, &registry) {
+                return JobReport::err(e);
+            }
+            JobReport::ok(
+                Outcome::Deleted {
+                    registry,
+                    closed_id: id,
+                },
+                "Vault deleted.",
+            )
+        });
+    }
+
+    fn spawn_add_files(&mut self, ctx: &egui::Context) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let files = match rfd::FileDialog::new().pick_files() {
+            Some(f) => f,
+            None => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Encrypting…", move || {
+            // Stream each picked file straight from disk into the vault — neither
+            // the files nor the existing vault are loaded into memory.
+            let mut existing: HashSet<String> =
+                reader.entries().iter().map(|e| e.path.clone()).collect();
+            let mut added = Vec::new();
+            let mut failed = 0usize;
+            for path in files {
+                if std::fs::File::open(&path).is_err() {
+                    failed += 1;
+                    continue;
+                }
+                let base = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".into());
+                let name = unique_name_in(&existing, &base);
+                existing.insert(name.clone());
+                let mtime = file_mtime(&path);
+                added.push(format::AddedFile {
+                    vault_path: name,
+                    source: path,
+                    mtime,
+                    mode: None,
+                });
+            }
+            if added.is_empty() {
+                return JobReport::err(if failed > 0 {
+                    format!("{failed} file(s) could not be read.")
+                } else {
+                    "No files to add.".into()
+                });
+            }
+            let n = added.len();
+            if let Err(e) = store.append_files_to_vault(&identity, &id, &reader, &added, &[]) {
+                return JobReport::err(e);
+            }
+            let msg = if failed > 0 {
+                format!("Added {n} file(s); {failed} could not be read.")
+            } else {
+                format!("Added {n} file(s).")
+            };
+            finalize_after_save(&store, &identity, id, registry, msg)
+        });
+    }
+
+    fn spawn_add_folder(&mut self, ctx: &egui::Context) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let base = match rfd::FileDialog::new().pick_folder() {
+            Some(p) => p,
+            None => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Encrypting…", move || {
+            // Walk the folder and stream every file straight from disk — the
+            // tree's contents are never held in memory at once.
+            let root = base
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "folder".into());
+            let existing: HashSet<String> =
+                reader.entries().iter().map(|e| e.path.clone()).collect();
+            let mut added = Vec::new();
+            let mut dirs = Vec::new();
+            for entry in walkdir::WalkDir::new(&base).into_iter().flatten() {
+                let rel = match entry.path().strip_prefix(&base) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let vault_path = format!("{root}/{}", rel.to_string_lossy());
+                if existing.contains(&vault_path) {
+                    continue; // skip collisions, as the old in-memory path did
+                }
+                if entry.file_type().is_dir() {
+                    dirs.push(vault_path);
+                } else if entry.file_type().is_file() && std::fs::File::open(entry.path()).is_ok() {
+                    added.push(format::AddedFile {
+                        vault_path,
+                        source: entry.path().to_path_buf(),
+                        mtime: file_mtime(entry.path()),
+                        mode: None,
+                    });
+                }
+            }
+            let n = added.len();
+            if let Err(e) = store.append_files_to_vault(&identity, &id, &reader, &added, &dirs) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Added folder \"{root}\" ({n} file(s))."),
+            )
+        });
+    }
+
+    fn spawn_new_folder(&mut self, ctx: &egui::Context) {
+        let name = match &self.state {
+            State::Unlocked(s) => s.new_folder_name.trim().to_string(),
+            _ => return,
+        };
+        if name.is_empty() {
+            self.set_toast("Enter a folder name.", true);
+            return;
         }
-        Ok("Vault deleted.".into())
+        if let State::Unlocked(s) = &mut self.state {
+            s.new_folder_name.clear();
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Saving…", move || {
+            // Stream the existing data through unchanged and just add the dir entry
+            // — no need to decrypt the whole vault into memory.
+            if let Err(e) = store.append_files_to_vault(&identity, &id, &reader, &[], &[name.clone()]) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(&store, &identity, id, registry, format!("Created folder \"{name}\"."))
+        });
     }
 
-    fn import_container(&mut self, store: &Store) -> Result<String, String> {
+    fn spawn_delete_entry(&mut self, ctx: &egui::Context, path: String) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Saving…", move || {
+            // Stream the surviving data through and drop the removed entry — the
+            // vault is never decrypted into memory.
+            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, &[path.clone()]) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(&store, &identity, id, registry, "Removed.".into())
+        });
+    }
+
+    fn spawn_extract_all(&mut self, ctx: &egui::Context) {
+        let (_, reader) = match self.open_reader() {
+            Some(x) => x,
+            None => return,
+        };
+        let dest = match rfd::FileDialog::new().pick_folder() {
+            Some(p) => p,
+            None => return,
+        };
+        self.spawn_job(ctx, "Decrypting…", move || {
+            match reader.extract_to(&dest) {
+                Ok(()) => JobReport::ok(Outcome::Noop, format!("Extracted to {}", dest.display())),
+                Err(e) => JobReport::err(e.to_string()),
+            }
+        });
+    }
+
+    fn spawn_save_entry_as(&mut self, ctx: &egui::Context, path: String) {
+        // Validate the entry kind from metadata (no decryption) on the UI thread.
+        let kind = match &self.state {
+            State::Unlocked(s) => match &s.open {
+                Some(o) => o
+                    .reader
+                    .entries()
+                    .iter()
+                    .find(|e| e.path == path)
+                    .map(|e| e.kind),
+                None => return,
+            },
+            _ => return,
+        };
+        match kind {
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Dir) => {
+                self.set_toast("Only files can be saved.", true);
+                return;
+            }
+            None => {
+                self.set_toast("Entry not found.", true);
+                return;
+            }
+        }
+        let (_, reader) = match self.open_reader() {
+            Some(x) => x,
+            None => return,
+        };
+        let suggested = path.rsplit('/').next().unwrap_or("file").to_string();
+        let target = match rfd::FileDialog::new().set_file_name(&suggested).save_file() {
+            Some(p) => p,
+            None => return,
+        };
+        self.spawn_job(ctx, "Decrypting file…", move || {
+            // Stream this file's chunks straight to disk: peak memory is one
+            // chunk, not the whole file.
+            let out = match std::fs::File::create(&target) {
+                Ok(f) => f,
+                Err(e) => return JobReport::err(e.to_string()),
+            };
+            let mut out = std::io::BufWriter::new(out);
+            if let Err(e) = reader.read_entry_to_writer(&path, &mut out) {
+                return JobReport::err(e.to_string());
+            }
+            match std::io::Write::flush(&mut out) {
+                Ok(()) => JobReport::ok(Outcome::Noop, format!("Saved to {}", target.display())),
+                Err(e) => JobReport::err(e.to_string()),
+            }
+        });
+    }
+
+    fn spawn_import(&mut self, ctx: &egui::Context) {
         let path = match rfd::FileDialog::new()
             .add_filter("FileSec container", &["fsec"])
             .pick_file()
         {
             Some(p) => p,
-            None => return Ok(String::new()),
+            None => return,
         };
-        let imported =
-            format::import_vault_from_path(&path, &self.identity).map_err(|e| e.to_string())?;
-
-        // Resolve the (verified) sender against our contacts.
-        let fpr = imported.sender_fingerprint;
-        let contact = self.contacts.find(&fpr);
-        let sender_name = contact.map(|c| c.identity.name.clone());
-        let verified = matches!(contact.map(|c| c.trust), Some(Trust::Verified));
-
-        let id = new_vault_id();
-        store.save_vault(&self.identity, &id, &imported.vault)?;
-        self.registry.upsert(VaultMeta {
-            id: id.clone(),
-            name: imported.vault.name.clone(),
-            created_at: imported.vault.created_at,
-            modified_at: now_unix(),
-            file_count: imported.vault.file_count() as u64,
-            total_size: imported.vault.total_size(),
-        });
-        store.save_registry(&self.identity, &self.registry)?;
-
-        self.last_import = Some(ImportInfo {
-            sender_fpr_hex: hex(&fpr),
-            sender_name,
-            verified,
-            vault_name: imported.vault.name.clone(),
-            file_count: imported.vault.file_count(),
-        });
-        Ok(String::new())
-    }
-
-    fn add_files(&mut self, store: &Store) -> Result<String, String> {
-        let files = match rfd::FileDialog::new().pick_files() {
-            Some(f) => f,
-            None => return Ok(String::new()),
+        let registry = match &self.state {
+            State::Unlocked(s) => s.registry.clone(),
+            _ => return,
         };
-        let open = self.open.as_mut().ok_or("No vault open.")?;
-        let mut added = 0usize;
-        let mut last_err = None;
-        for path in files {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let base = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "file".into());
-                    let name = unique_name(&open.vault, &base);
-                    let mtime = file_mtime(&path);
-                    if open.vault.add_file(&name, bytes, mtime, None).is_ok() {
-                        added += 1;
-                    }
-                }
-                Err(e) => last_err = Some(format!("Could not read {}: {e}", path.display())),
-            }
-        }
-        if added > 0 {
-            self.persist_open(store)?;
-        }
-        if let Some(e) = last_err {
-            return Err(e);
-        }
-        Ok(format!("Added {added} file(s)."))
-    }
-
-    fn add_folder(&mut self, store: &Store) -> Result<String, String> {
-        let base = match rfd::FileDialog::new().pick_folder() {
-            Some(p) => p,
-            None => return Ok(String::new()),
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
         };
-        let root = base
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "folder".into());
-        let open = self.open.as_mut().ok_or("No vault open.")?;
-        let mut added = 0usize;
-        for entry in walkdir::WalkDir::new(&base).into_iter().flatten() {
-            let rel = match entry.path().strip_prefix(&base) {
-                Ok(r) => r,
-                Err(_) => continue,
+        self.spawn_job(ctx, "Verifying & decrypting…", move || {
+            // Verify the signature by streaming the body (no full load), then
+            // transcode straight into the local store — also streaming. A huge
+            // imported file never lands in memory.
+            let (reader, sender) = match format::verify_and_open(&path, &identity) {
+                Ok(x) => x,
+                Err(e) => return JobReport::err(e.to_string()),
             };
-            if rel.as_os_str().is_empty() {
-                continue;
+            let id = new_vault_id();
+            if let Err(e) = store.import_reader_to_vault(&identity, &id, &reader) {
+                return JobReport::err(e);
             }
-            let vault_path = format!("{root}/{}", rel.to_string_lossy());
-            if entry.file_type().is_dir() {
-                let _ = open.vault.add_dir(&vault_path);
-            } else if entry.file_type().is_file() {
-                if let Ok(bytes) = std::fs::read(entry.path()) {
-                    let mtime = file_mtime(entry.path());
-                    if open.vault.add_file(&vault_path, bytes, mtime, None).is_ok() {
-                        added += 1;
-                    }
-                }
+            let mut registry = registry;
+            registry.upsert(VaultMeta {
+                id,
+                name: reader.name().to_string(),
+                created_at: reader.created_at(),
+                modified_at: now_unix(),
+                file_count: reader.file_count() as u64,
+                total_size: reader.total_size(),
+            });
+            if let Err(e) = store.save_registry(&identity, &registry) {
+                return JobReport::err(e);
             }
-        }
-        self.persist_open(store)?;
-        Ok(format!("Added folder \"{root}\" ({added} file(s))."))
-    }
-
-    fn new_folder(&mut self, store: &Store) -> Result<String, String> {
-        let name = self.new_folder_name.trim().to_string();
-        if name.is_empty() {
-            return Err("Enter a folder name.".into());
-        }
-        {
-            let open = self.open.as_mut().ok_or("No vault open.")?;
-            open.vault.add_dir(&name).map_err(|e| e.to_string())?;
-        }
-        self.new_folder_name.clear();
-        self.persist_open(store)?;
-        Ok(format!("Created folder \"{name}\"."))
-    }
-
-    fn delete_entry(&mut self, store: &Store, path: &str) -> Result<String, String> {
-        {
-            let open = self.open.as_mut().ok_or("No vault open.")?;
-            open.vault.remove(path);
-        }
-        self.persist_open(store)?;
-        Ok("Removed.".into())
-    }
-
-    fn save_entry_as(&self, path: &str) -> Result<String, String> {
-        let open = self.open.as_ref().ok_or("No vault open.")?;
-        let entry = open.vault.get(path).ok_or("Entry not found.")?;
-        if entry.kind != EntryKind::File {
-            return Err("Only files can be saved.".into());
-        }
-        let suggested = path.rsplit('/').next().unwrap_or("file");
-        let target = match rfd::FileDialog::new().set_file_name(suggested).save_file() {
-            Some(p) => p,
-            None => return Ok(String::new()),
-        };
-        std::fs::write(&target, &entry.content).map_err(|e| e.to_string())?;
-        Ok(format!("Saved to {}", target.display()))
-    }
-
-    fn extract_all(&self) -> Result<String, String> {
-        let open = self.open.as_ref().ok_or("No vault open.")?;
-        let dest = match rfd::FileDialog::new().pick_folder() {
-            Some(p) => p,
-            None => return Ok(String::new()),
-        };
-        extract_vault(&open.vault, &dest)?;
-        Ok(format!("Extracted to {}", dest.display()))
-    }
-
-    fn begin_export(&mut self, vault_id: String) {
-        self.export = Some(ExportForm {
-            vault_id,
-            selected: HashSet::new(),
-            include_self: false,
+            JobReport {
+                outcome: Outcome::Imported(Box::new(ImportData {
+                    registry,
+                    sender_fpr: sender.fingerprint,
+                    vault_name: reader.name().to_string(),
+                    file_count: reader.file_count(),
+                })),
+                toast: None,
+            }
         });
     }
 
-    fn toggle_recipient(&mut self, fpr_hex: &str) {
-        if let Some(e) = &mut self.export {
-            if !e.selected.insert(fpr_hex.to_string()) {
-                e.selected.remove(fpr_hex);
-            }
-        }
-    }
-
-    fn do_export(&mut self, store: &Store) -> Result<String, String> {
-        let form = self.export.as_ref().ok_or("No export in progress.")?;
-        if form.selected.is_empty() && !form.include_self {
-            return Err("Select at least one recipient.".into());
-        }
-
-        // Resolve selected recipients to public identities.
-        let mut recipients = Vec::new();
-        for c in &self.contacts.contacts {
-            if form.selected.contains(&hex(&c.fingerprint())) {
-                recipients.push(c.identity.clone());
-            }
-        }
-        if form.include_self {
-            recipients.push(self.identity.public());
-        }
-        if recipients.is_empty() {
-            return Err("No matching recipients found.".into());
-        }
-
-        // Load the vault to export (use the open copy if it matches).
-        let vault = match &self.open {
-            Some(o) if o.id == form.vault_id => o.vault_ref(),
-            _ => &store.load_vault(&self.identity, &form.vault_id)?,
+    fn spawn_export(&mut self, ctx: &egui::Context) {
+        let gathered = if let State::Unlocked(s) = &self.state {
+            s.export.as_ref().map(|form| {
+                let mut recipients = Vec::new();
+                for c in &s.contacts.contacts {
+                    if form.selected.contains(&hex(&c.fingerprint())) {
+                        recipients.push(c.identity.clone());
+                    }
+                }
+                if form.include_self {
+                    recipients.push(s.identity.public());
+                }
+                let name = s
+                    .registry
+                    .vaults
+                    .iter()
+                    .find(|v| v.id == form.vault_id)
+                    .map(|v| v.name.clone())
+                    .unwrap_or_else(|| "vault".into());
+                (form.vault_id.clone(), recipients, name)
+            })
+        } else {
+            None
         };
-
-        let suggested = format!("{}.fsec", sanitize_filename(&vault.name));
+        let (vault_id, recipients, name) = match gathered {
+            Some(x) => x,
+            None => return,
+        };
+        if recipients.is_empty() {
+            self.set_toast("Select at least one recipient.", true);
+            return;
+        }
+        let suggested = format!("{}.fsec", sanitize_filename(&name));
         let target = match rfd::FileDialog::new()
             .add_filter("FileSec container", &["fsec"])
             .set_file_name(&suggested)
             .save_file()
         {
             Some(p) => p,
-            None => return Ok(String::new()),
+            None => return,
         };
-
-        format::export_vault_to_path(
-            vault,
-            &self.identity,
-            &recipients,
-            &ExportOptions::default(),
-            &target,
-        )
-        .map_err(|e| e.to_string())?;
-
-        self.export = None;
-        Ok(format!(
-            "Exported to {} for {} recipient(s).",
-            target.display(),
-            recipients.len()
-        ))
-    }
-
-    fn import_contact_from_bytes_or_text(
-        &mut self,
-        store: &Store,
-        pubid: filesec_core::PublicIdentity,
-    ) -> Result<String, String> {
-        let name = if pubid.name.is_empty() {
-            "(unnamed)".to_string()
-        } else {
-            pubid.name.clone()
-        };
-        self.contacts.upsert(pubid, now_unix());
-        store.save_contacts(&self.identity, &self.contacts)?;
-        Ok(format!(
-            "Imported contact \"{name}\". Verify their safety number before trusting."
-        ))
-    }
-
-    fn import_contact_paste(&mut self, store: &Store) -> Result<String, String> {
-        let text = self.contact_paste.trim().to_string();
-        if text.is_empty() {
-            return Err("Paste an armored public key first.".into());
+        if let State::Unlocked(s) = &mut self.state {
+            s.export = None;
         }
-        let pubid = filesec_core::PublicIdentity::from_armored(&text).map_err(|e| e.to_string())?;
-        self.contact_paste.clear();
-        self.import_contact_from_bytes_or_text(store, pubid)
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let count = recipients.len();
+        self.spawn_job(ctx, "Encrypting & exporting…", move || {
+            // Stream straight from the encrypted source to the new container so
+            // the whole vault is never held in memory at once.
+            let reader = match store.open_vault(&identity, &vault_id) {
+                Ok(r) => r,
+                Err(e) => return JobReport::err(e),
+            };
+            match reader.reexport_to_path(
+                &identity,
+                &recipients,
+                &ExportOptions::default(),
+                &target,
+            ) {
+                Ok(()) => JobReport::ok(
+                    Outcome::Noop,
+                    format!("Exported to {} for {count} recipient(s).", target.display()),
+                ),
+                Err(e) => JobReport::err(e.to_string()),
+            }
+        });
     }
 
-    fn import_contact_file(&mut self, store: &Store) -> Result<String, String> {
+    fn spawn_import_contact_paste(&mut self, ctx: &egui::Context) {
+        let text = match &self.state {
+            State::Unlocked(s) => s.contact_paste.trim().to_string(),
+            _ => return,
+        };
+        if text.is_empty() {
+            self.set_toast("Paste an armored public key first.", true);
+            return;
+        }
+        let pubid = match filesec_core::PublicIdentity::from_armored(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_toast(e.to_string(), true);
+                return;
+            }
+        };
+        if let State::Unlocked(s) = &mut self.state {
+            s.contact_paste.clear();
+        }
+        let contacts = match &self.state {
+            State::Unlocked(s) => s.contacts.clone(),
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Saving contact…", move || {
+            import_contact_job(&store, &identity, contacts, pubid)
+        });
+    }
+
+    fn spawn_import_contact_file(&mut self, ctx: &egui::Context) {
         let path = match rfd::FileDialog::new()
             .add_filter("FileSec public key", &["fsecpub"])
             .pick_file()
         {
             Some(p) => p,
-            None => return Ok(String::new()),
+            None => return,
         };
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let pubid = filesec_core::PublicIdentity::from_bytes(&bytes)
-            .or_else(|_| {
+        let contacts = match &self.state {
+            State::Unlocked(s) => s.contacts.clone(),
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Importing contact…", move || {
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => return JobReport::err(e.to_string()),
+            };
+            let pubid = filesec_core::PublicIdentity::from_bytes(&bytes).or_else(|_| {
                 String::from_utf8(bytes.clone())
                     .map_err(|_| filesec_core::Error::Format("not a public key"))
                     .and_then(|t| filesec_core::PublicIdentity::from_armored(&t))
-            })
-            .map_err(|e| e.to_string())?;
-        self.import_contact_from_bytes_or_text(store, pubid)
+            });
+            match pubid {
+                Ok(p) => import_contact_job(&store, &identity, contacts, p),
+                Err(e) => JobReport::err(e.to_string()),
+            }
+        });
     }
 
-    fn set_trust(&mut self, store: &Store, fpr_hex: &str, trust: Trust) -> Result<String, String> {
-        let fpr = match decode_fpr(fpr_hex) {
+    fn spawn_set_trust(&mut self, ctx: &egui::Context, fpr_hex: String, trust: Trust) {
+        let fpr = match decode_fpr(&fpr_hex) {
             Some(f) => f,
-            None => return Err("Bad fingerprint.".into()),
+            None => {
+                self.set_toast("Bad fingerprint.", true);
+                return;
+            }
         };
-        self.contacts.set_trust(&fpr, trust);
-        store.save_contacts(&self.identity, &self.contacts)?;
-        Ok(match trust {
-            Trust::Verified => "Marked as verified.".into(),
-            Trust::Unverified => "Marked as unverified.".into(),
-        })
+        let contacts = match &self.state {
+            State::Unlocked(s) => s.contacts.clone(),
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Saving…", move || {
+            let mut contacts = contacts;
+            contacts.set_trust(&fpr, trust);
+            match store.save_contacts(&identity, &contacts) {
+                Ok(()) => JobReport::ok(
+                    Outcome::Contacts(contacts),
+                    match trust {
+                        Trust::Verified => "Marked as verified.",
+                        Trust::Unverified => "Marked as unverified.",
+                    },
+                ),
+                Err(e) => JobReport::err(e),
+            }
+        });
     }
 
-    fn remove_contact(&mut self, store: &Store, fpr_hex: &str) -> Result<String, String> {
-        let fpr = match decode_fpr(fpr_hex) {
+    fn spawn_remove_contact(&mut self, ctx: &egui::Context, fpr_hex: String) {
+        let fpr = match decode_fpr(&fpr_hex) {
             Some(f) => f,
-            None => return Err("Bad fingerprint.".into()),
+            None => {
+                self.set_toast("Bad fingerprint.", true);
+                return;
+            }
         };
-        self.contacts.remove(&fpr);
-        store.save_contacts(&self.identity, &self.contacts)?;
-        Ok("Contact removed.".into())
+        let contacts = match &self.state {
+            State::Unlocked(s) => s.contacts.clone(),
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        self.spawn_job(ctx, "Saving…", move || {
+            let mut contacts = contacts;
+            contacts.remove(&fpr);
+            match store.save_contacts(&identity, &contacts) {
+                Ok(()) => JobReport::ok(Outcome::Contacts(contacts), "Contact removed."),
+                Err(e) => JobReport::err(e),
+            }
+        });
     }
 
-    fn save_pubkey(&self) -> Result<String, String> {
-        let bytes = self
-            .identity
-            .public()
-            .to_bytes()
-            .map_err(|e| e.to_string())?;
-        let suggested = format!("{}.fsecpub", sanitize_filename(&self.identity.name));
+    fn spawn_save_pubkey(&mut self, ctx: &egui::Context) {
+        let prepared = if let State::Unlocked(s) = &self.state {
+            Some((s.identity.public().to_bytes(), s.identity.name.clone()))
+        } else {
+            None
+        };
+        let (bytes_res, name) = match prepared {
+            Some(x) => x,
+            None => return,
+        };
+        let bytes = match bytes_res {
+            Ok(b) => b,
+            Err(e) => {
+                self.set_toast(e.to_string(), true);
+                return;
+            }
+        };
+        let suggested = format!("{}.fsecpub", sanitize_filename(&name));
         let target = match rfd::FileDialog::new()
             .add_filter("FileSec public key", &["fsecpub"])
             .set_file_name(&suggested)
             .save_file()
         {
             Some(p) => p,
-            None => return Ok(String::new()),
+            None => return,
         };
-        std::fs::write(&target, &bytes).map_err(|e| e.to_string())?;
-        Ok(format!("Public key saved to {}", target.display()))
+        self.spawn_job(ctx, "Saving…", move || {
+            match std::fs::write(&target, &bytes) {
+                Ok(()) => JobReport::ok(
+                    Outcome::Noop,
+                    format!("Public key saved to {}", target.display()),
+                ),
+                Err(e) => JobReport::err(e.to_string()),
+            }
+        });
     }
 }
 
-impl OpenVault {
-    fn vault_ref(&self) -> &Vault {
-        &self.vault
+/// Re-open a freshly-saved vault (metadata only), refresh its registry entry,
+/// persist the registry, and produce the `ReplaceOpen` outcome. Shared by the
+/// in-memory mutate path and the streaming add path.
+fn finalize_after_save(
+    store: &Store,
+    identity: &Identity,
+    id: String,
+    mut registry: Registry,
+    msg: String,
+) -> JobReport {
+    let new_reader = match store.open_vault(identity, &id) {
+        Ok(r) => r,
+        Err(e) => return JobReport::err(e),
+    };
+    registry.upsert(VaultMeta {
+        id: id.clone(),
+        name: new_reader.name().to_string(),
+        created_at: new_reader.created_at(),
+        modified_at: now_unix(),
+        file_count: new_reader.file_count() as u64,
+        total_size: new_reader.total_size(),
+    });
+    if let Err(e) = store.save_registry(identity, &registry) {
+        return JobReport::err(e);
+    }
+    JobReport::ok(
+        Outcome::ReplaceOpen {
+            id,
+            reader: Box::new(new_reader),
+            registry,
+        },
+        msg,
+    )
+}
+
+/// Upsert a contact and persist the book (worker side).
+fn import_contact_job(
+    store: &Store,
+    identity: &Identity,
+    mut contacts: ContactBook,
+    pubid: filesec_core::PublicIdentity,
+) -> JobReport {
+    let name = if pubid.name.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        pubid.name.clone()
+    };
+    contacts.upsert(pubid, now_unix());
+    match store.save_contacts(identity, &contacts) {
+        Ok(()) => JobReport::ok(
+            Outcome::Contacts(contacts),
+            format!("Imported contact \"{name}\". Verify their safety number before trusting."),
+        ),
+        Err(e) => JobReport::err(e),
     }
 }
 
@@ -996,7 +1601,7 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
 fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let (name, id) = match &s.open {
-        Some(o) => (o.vault.name.clone(), o.id.clone()),
+        Some(o) => (o.reader.name().to_string(), o.id.clone()),
         None => return,
     };
     ui.horizontal(|ui| {
@@ -1031,17 +1636,17 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         Some(o) => o,
         None => return,
     };
-    if open.vault.entries().is_empty() {
+    if open.reader.is_empty() {
         ui.add_space(16.0);
         ui.colored_label(MUTED, "Empty vault. Add files or folders above.");
         return;
     }
 
     let mut rows: Vec<(String, EntryKind, u64)> = open
-        .vault
+        .reader
         .entries()
         .iter()
-        .map(|e| (e.path.clone(), e.kind, e.size()))
+        .map(|e| (e.path.clone(), e.kind, e.size))
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -1300,27 +1905,16 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
 // ---------------------------------------------------------------------------
 
 fn decode_fpr(hex_str: &str) -> Option<[u8; 32]> {
-    let bytes = data_encoding_hex_decode(hex_str)?;
-    if bytes.len() != 32 {
+    if hex_str.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
-
-fn data_encoding_hex_decode(s: &str) -> Option<Vec<u8>> {
-    // Mirror of core's hex encoding (lowercase, no separators).
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
+    let bytes = hex_str.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let hi = (bytes[i] as char).to_digit(16)?;
         let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
+        out[i / 2] = (hi * 16 + lo) as u8;
         i += 2;
     }
     Some(out)
@@ -1334,8 +1928,10 @@ fn file_mtime(path: &std::path::Path) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
-fn unique_name(vault: &Vault, base: &str) -> String {
-    if !vault.contains(base) {
+/// Pick a vault path for `base` that does not collide with any path in
+/// `existing`, appending " (n)" before the extension if needed.
+fn unique_name_in(existing: &HashSet<String>, base: &str) -> String {
+    if !existing.contains(base) {
         return base.to_string();
     }
     let (stem, ext) = match base.rsplit_once('.') {
@@ -1344,7 +1940,7 @@ fn unique_name(vault: &Vault, base: &str) -> String {
     };
     for i in 1..10_000 {
         let candidate = format!("{stem} ({i}){ext}");
-        if !vault.contains(&candidate) {
+        if !existing.contains(&candidate) {
             return candidate;
         }
     }

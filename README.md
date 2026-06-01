@@ -100,6 +100,17 @@ as a container encrypted to your own identity, so they are confidential on disk.
 Only the keystore differs — it is sealed with your Argon2id-derived passphrase
 key, since it bootstraps everything else.
 
+**Lazy opening.** Opening a vault decrypts only the small, authenticated manifest
+(the folder tree and per-entry metadata) — *not* the file data — so opening a
+multi-gigabyte vault is cheap and uses negligible memory. Individual files are
+decrypted from disk **on demand** via random-access chunk decryption (only the
+chunks covering the requested file are read and decrypted). Extraction streams
+one file at a time, so peak memory is the size of the largest single file, not
+the whole vault. Operations that inherently need the full plaintext (re-encrypt
+after add/delete, or exporting to others) load it transiently on the worker
+thread and drop it immediately. Each chunk is individually AEAD-authenticated, so
+on-demand reads remain tamper-evident.
+
 Data lives in the per-OS application directory (override with the
 `FILESEC_DATA_DIR` environment variable):
 
@@ -178,15 +189,16 @@ development packages for those.
 Implemented (this MVP): identity & keystore, contacts with trust/verification,
 create/manage vaults, add files & folders, extract/save, export to one or more
 recipients (with "include self"), import + signature verification, and an
-encrypted-at-rest local store.
+encrypted-at-rest local store. All crypto and I/O run on a **background worker
+thread**, so the UI stays responsive even for very large vaults (a spinner shows
+while a job runs).
 
 Planned, in dependency order:
 
 1. **Check-out / check-in editing** — decrypt to a restricted temp file, edit in
    your normal editor, re-encrypt on check-in, secure-wipe the temp (with honest
    SSD/CoW caveats).
-2. **Trust-UX polish** and background worker threads (current crypto runs
-   synchronously, so very large vaults briefly pause the UI).
+2. **Trust-UX polish** — richer verification flow and armored-key paste niceties.
 3. **Opt-in hybrid post-quantum suite** (ML-KEM-768 + ML-DSA-65) and an
    AES-256-GCM suite — the format and dispatch are already designed for this.
 4. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
