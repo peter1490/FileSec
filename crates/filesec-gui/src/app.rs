@@ -95,6 +95,24 @@ struct OpenVault {
     reader: VaultReader,
 }
 
+/// An in-progress check-out: one file decrypted to a private temp file and
+/// (best-effort) opened in the OS editor, awaiting check-in or discard. At most
+/// one is active per session.
+struct Checkout {
+    /// Vault the file belongs to (matches the open vault's id).
+    vault_id: String,
+    /// The file's normalized path inside the vault.
+    entry_path: String,
+    /// Display leaf shown in the editing banner.
+    leaf: String,
+    /// The decrypted plaintext temp file on disk.
+    temp_path: std::path::PathBuf,
+    /// Plaintext BLAKE3 at check-out, to detect "no changes" on check-in.
+    orig_blake3: [u8; 32],
+    /// Advisory mode bits to preserve on the re-encrypted entry.
+    mode: Option<u32>,
+}
+
 struct ExportForm {
     vault_id: String,
     selected: HashSet<String>,
@@ -117,6 +135,7 @@ struct Session {
     registry: Registry,
     nav: Nav,
     open: Option<OpenVault>,
+    checkout: Option<Checkout>,
     new_vault_name: String,
     show_new_vault: bool,
     new_folder_name: String,
@@ -139,6 +158,7 @@ impl Session {
             registry,
             nav: Nav::Vaults,
             open: None,
+            checkout: None,
             new_vault_name: String::new(),
             show_new_vault: false,
             new_folder_name: String::new(),
@@ -167,6 +187,9 @@ enum Action {
     NewFolder,
     DeleteEntry(String),
     SaveEntryAs(String),
+    CheckOut(String),
+    CheckIn,
+    Discard,
     ExtractAll,
     BeginExport(String),
     CancelExport,
@@ -260,6 +283,14 @@ enum Outcome {
     Deleted {
         registry: Registry,
         closed_id: String,
+    },
+    /// Install a fresh check-out into the session after decrypting to temp.
+    StartCheckout(Box<Checkout>),
+    /// End the active check-out (clearing it). When `replace` is `Some`, also
+    /// swap in the re-encrypted vault's reader + registry — i.e. a check-in that
+    /// actually changed the file. `None` is a discard or a no-change check-in.
+    EndCheckout {
+        replace: Option<(String, Box<VaultReader>, Registry)>,
     },
     Imported(Box<ImportData>),
     Contacts(ContactBook),
@@ -365,6 +396,17 @@ impl eframe::App for App {
                 Action::DismissToast => self.toast = None,
                 _ if !busy => self.dispatch(a, ctx),
                 _ => {}
+            }
+        }
+    }
+
+    /// Best-effort wipe of an active check-out's temp file on a clean exit. A
+    /// hard crash (SIGKILL/power loss) bypasses this; the next-unlock
+    /// `clean_checkout_dir` is the backstop.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let State::Unlocked(s) = &self.state {
+            if let Some(c) = &s.checkout {
+                let _ = crate::store::secure_wipe(&c.temp_path);
             }
         }
     }
@@ -533,6 +575,23 @@ impl App {
                     }
                 }
             }
+            Outcome::StartCheckout(c) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.checkout = Some(*c);
+                }
+            }
+            Outcome::EndCheckout { replace } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.checkout = None;
+                    if let Some((id, reader, registry)) = replace {
+                        s.registry = registry;
+                        s.open = Some(OpenVault {
+                            id,
+                            reader: *reader,
+                        });
+                    }
+                }
+            }
             Outcome::Imported(data) => {
                 if let State::Unlocked(s) = &mut self.state {
                     let contact = s.contacts.find(&data.sender_fpr);
@@ -556,10 +615,21 @@ impl App {
         }
     }
 
+    /// Whether a file is currently checked out for editing. Leaving the vault,
+    /// locking, or navigating away would orphan the temp file and lose the
+    /// in-flight edit, so those actions are blocked while this is true.
+    fn checkout_active(&self) -> bool {
+        matches!(&self.state, State::Unlocked(s) if s.checkout.is_some())
+    }
+
     fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             // --- instant, UI-only actions ---
             Action::Lock => {
+                if self.checkout_active() {
+                    self.set_toast("Check in or discard your edit first.", true);
+                    return;
+                }
                 self.state = State::Unlock(Unlock::default());
                 self.toast = None;
             }
@@ -570,6 +640,10 @@ impl App {
                 }
             }
             Action::Nav(n) => {
+                if self.checkout_active() {
+                    self.set_toast("Check in or discard your edit first.", true);
+                    return;
+                }
                 if let State::Unlocked(s) = &mut self.state {
                     s.nav = n;
                     s.open = None;
@@ -584,6 +658,10 @@ impl App {
                 }
             }
             Action::CloseVault => {
+                if self.checkout_active() {
+                    self.set_toast("Check in or discard your edit first.", true);
+                    return;
+                }
                 if let State::Unlocked(s) = &mut self.state {
                     s.open = None;
                 }
@@ -645,6 +723,9 @@ impl App {
             Action::DeleteEntry(p) => self.spawn_delete_entry(ctx, p),
             Action::ExtractAll => self.spawn_extract_all(ctx),
             Action::SaveEntryAs(p) => self.spawn_save_entry_as(ctx, p),
+            Action::CheckOut(p) => self.spawn_check_out(ctx, p),
+            Action::CheckIn => self.spawn_check_in(ctx),
+            Action::Discard => self.spawn_discard(ctx),
             Action::ImportContainer => self.spawn_import(ctx),
             Action::DoExport => self.spawn_export(ctx),
             Action::ImportContactPaste => self.spawn_import_contact_paste(ctx),
@@ -757,6 +838,8 @@ impl App {
             let contacts = store.load_contacts(&identity).unwrap_or_default();
             let registry = store.load_registry(&identity).unwrap_or_default();
             let data_dir = store.data_dir().display().to_string();
+            // Securely wipe any checkout temp files orphaned by a prior crash.
+            store.clean_checkout_dir();
             JobReport::ok(
                 Outcome::Unlocked(Box::new(SessionInit {
                     identity,
@@ -1008,10 +1091,18 @@ impl App {
         self.spawn_job(ctx, "Saving…", move || {
             // Stream the existing data through unchanged and just add the dir entry
             // — no need to decrypt the whole vault into memory.
-            if let Err(e) = store.append_files_to_vault(&identity, &id, &reader, &[], &[name.clone()]) {
+            if let Err(e) =
+                store.append_files_to_vault(&identity, &id, &reader, &[], &[name.clone()])
+            {
                 return JobReport::err(e);
             }
-            finalize_after_save(&store, &identity, id, registry, format!("Created folder \"{name}\"."))
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Created folder \"{name}\"."),
+            )
         });
     }
 
@@ -1027,7 +1118,8 @@ impl App {
         self.spawn_job(ctx, "Saving…", move || {
             // Stream the surviving data through and drop the removed entry — the
             // vault is never decrypted into memory.
-            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, &[path.clone()]) {
+            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, &[path.clone()])
+            {
                 return JobReport::err(e);
             }
             finalize_after_save(&store, &identity, id, registry, "Removed.".into())
@@ -1100,6 +1192,191 @@ impl App {
                 Ok(()) => JobReport::ok(Outcome::Noop, format!("Saved to {}", target.display())),
                 Err(e) => JobReport::err(e.to_string()),
             }
+        });
+    }
+
+    /// Check out a file: decrypt it to a private temp file and (best-effort) open
+    /// it in the OS default editor. The user then edits in their own app and
+    /// comes back to check in or discard.
+    fn spawn_check_out(&mut self, ctx: &egui::Context, path: String) {
+        // Validate kind + snapshot the entry's hash/mode from the manifest (no
+        // decryption) on the UI thread.
+        let (orig_blake3, mode, leaf) = {
+            let s = match &self.state {
+                State::Unlocked(s) => s,
+                _ => return,
+            };
+            if s.checkout.is_some() {
+                self.set_toast("Finish your current edit first.", true);
+                return;
+            }
+            let open = match &s.open {
+                Some(o) => o,
+                None => return,
+            };
+            match open.reader.entries().iter().find(|e| e.path == path) {
+                Some(e) if e.kind == EntryKind::File => (
+                    e.blake3,
+                    e.mode,
+                    path.rsplit('/').next().unwrap_or("file").to_string(),
+                ),
+                Some(_) => {
+                    self.set_toast("Only files can be edited.", true);
+                    return;
+                }
+                None => {
+                    self.set_toast("Entry not found.", true);
+                    return;
+                }
+            }
+        };
+        let (id, reader) = match self.open_reader() {
+            Some(x) => x,
+            None => return,
+        };
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        let leaf_clean = sanitize_leaf(&leaf);
+        self.spawn_job(ctx, "Checking out…", move || {
+            // Create the private (0600-from-creation) temp file, then stream the
+            // one file's plaintext into it. Wipe on any failure so no partial
+            // plaintext is left behind.
+            let temp_path = match store.create_private_checkout_file(&leaf_clean) {
+                Ok(p) => p,
+                Err(e) => return JobReport::err(e),
+            };
+            let out = match std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = crate::store::secure_wipe(&temp_path);
+                    return JobReport::err(e.to_string());
+                }
+            };
+            let mut out = std::io::BufWriter::new(out);
+            if let Err(e) = reader.read_entry_to_writer(&path, &mut out) {
+                let _ = std::io::Write::flush(&mut out);
+                drop(out);
+                let _ = crate::store::secure_wipe(&temp_path);
+                return JobReport::err(e.to_string());
+            }
+            if let Err(e) = std::io::Write::flush(&mut out) {
+                drop(out);
+                let _ = crate::store::secure_wipe(&temp_path);
+                return JobReport::err(e.to_string());
+            }
+            drop(out);
+            // Best-effort: launch the OS editor. Failure is non-fatal — the temp
+            // exists and we tell the user where it is.
+            let launched = open_in_default_app(&temp_path).is_ok();
+            let msg = if launched {
+                format!("Editing {leaf} — check in or discard when done.")
+            } else {
+                format!(
+                    "Decrypted to {} (couldn't launch an editor — open it manually).",
+                    temp_path.display()
+                )
+            };
+            JobReport::ok(
+                Outcome::StartCheckout(Box::new(Checkout {
+                    vault_id: id,
+                    entry_path: path,
+                    leaf,
+                    temp_path,
+                    orig_blake3,
+                    mode,
+                })),
+                msg,
+            )
+        });
+    }
+
+    /// Check in the active edit: if the temp file actually changed, re-encrypt it
+    /// back into the vault; either way securely wipe the temp file.
+    fn spawn_check_in(&mut self, ctx: &egui::Context) {
+        let (vault_id, entry_path, temp_path, orig_blake3, mode) = match &self.state {
+            State::Unlocked(s) => match &s.checkout {
+                Some(c) => (
+                    c.vault_id.clone(),
+                    c.entry_path.clone(),
+                    c.temp_path.clone(),
+                    c.orig_blake3,
+                    c.mode,
+                ),
+                None => return,
+            },
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        // The open vault must still be the one we checked out from (the Nav/Close
+        // guards should guarantee this, but verify before re-encrypting).
+        if id != vault_id {
+            self.set_toast("The checked-out vault is no longer open.", true);
+            return;
+        }
+        self.spawn_job(ctx, "Checking in…", move || {
+            // Hash the edited temp; if unchanged, skip the re-encrypt entirely.
+            let new_hash = match format::hash_path(&temp_path) {
+                Ok((h, _)) => h,
+                Err(e) => return JobReport::err(e.to_string()),
+            };
+            if new_hash == orig_blake3 {
+                let _ = crate::store::secure_wipe(&temp_path);
+                return JobReport::ok(
+                    Outcome::EndCheckout { replace: None },
+                    "No changes — edit discarded.",
+                );
+            }
+            let mtime = file_mtime(&temp_path);
+            if let Err(e) = store.replace_file_in_vault(
+                &identity,
+                &id,
+                &reader,
+                &entry_path,
+                &temp_path,
+                mtime,
+                mode,
+            ) {
+                // Keep the temp so the user can retry or discard.
+                return JobReport::err(e);
+            }
+            let _ = crate::store::secure_wipe(&temp_path);
+            match reopen_after_save(&store, &identity, id, registry) {
+                Ok((id, reader, registry)) => JobReport::ok(
+                    Outcome::EndCheckout {
+                        replace: Some((id, Box::new(reader), registry)),
+                    },
+                    "Checked in.",
+                ),
+                Err(e) => JobReport::err(e),
+            }
+        });
+    }
+
+    /// Discard the active edit: securely wipe the temp file, vault untouched.
+    fn spawn_discard(&mut self, ctx: &egui::Context) {
+        let temp_path = match &self.state {
+            State::Unlocked(s) => match &s.checkout {
+                Some(c) => c.temp_path.clone(),
+                None => return,
+            },
+            _ => return,
+        };
+        self.spawn_job(ctx, "Discarding…", move || {
+            let _ = crate::store::secure_wipe(&temp_path);
+            JobReport::ok(Outcome::EndCheckout { replace: None }, "Edit discarded.")
         });
     }
 
@@ -1388,19 +1665,16 @@ impl App {
 }
 
 /// Re-open a freshly-saved vault (metadata only), refresh its registry entry,
-/// persist the registry, and produce the `ReplaceOpen` outcome. Shared by the
-/// in-memory mutate path and the streaming add path.
-fn finalize_after_save(
+/// and persist the registry, returning the new reader + registry. Shared by the
+/// streaming mutate paths and the check-in path (which wrap the result in
+/// different outcomes).
+fn reopen_after_save(
     store: &Store,
     identity: &Identity,
     id: String,
     mut registry: Registry,
-    msg: String,
-) -> JobReport {
-    let new_reader = match store.open_vault(identity, &id) {
-        Ok(r) => r,
-        Err(e) => return JobReport::err(e),
-    };
+) -> Result<(String, VaultReader, Registry), String> {
+    let new_reader = store.open_vault(identity, &id)?;
     registry.upsert(VaultMeta {
         id: id.clone(),
         name: new_reader.name().to_string(),
@@ -1409,17 +1683,30 @@ fn finalize_after_save(
         file_count: new_reader.file_count() as u64,
         total_size: new_reader.total_size(),
     });
-    if let Err(e) = store.save_registry(identity, &registry) {
-        return JobReport::err(e);
+    store.save_registry(identity, &registry)?;
+    Ok((id, new_reader, registry))
+}
+
+/// Re-open a freshly-saved vault and produce the `ReplaceOpen` outcome. Shared
+/// by the streaming add/remove paths.
+fn finalize_after_save(
+    store: &Store,
+    identity: &Identity,
+    id: String,
+    registry: Registry,
+    msg: String,
+) -> JobReport {
+    match reopen_after_save(store, identity, id, registry) {
+        Ok((id, reader, registry)) => JobReport::ok(
+            Outcome::ReplaceOpen {
+                id,
+                reader: Box::new(reader),
+                registry,
+            },
+            msg,
+        ),
+        Err(e) => JobReport::err(e),
     }
-    JobReport::ok(
-        Outcome::ReplaceOpen {
-            id,
-            reader: Box::new(new_reader),
-            registry,
-        },
-        msg,
-    )
 }
 
 /// Upsert a contact and persist the book (worker side).
@@ -1604,31 +1891,57 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         Some(o) => (o.reader.name().to_string(), o.id.clone()),
         None => return,
     };
+    // Leaf of the file currently checked out for editing (if any). While set,
+    // all other vault mutations are disabled and the user must check in/discard.
+    let editing = s.checkout.as_ref().map(|c| c.leaf.clone());
+
     ui.horizontal(|ui| {
         if ui.button("← Vaults").clicked() {
             *action = Some(Action::CloseVault);
         }
         ui.heading(&name);
     });
-    ui.horizontal_wrapped(|ui| {
-        if ui.button("➕ Add files…").clicked() {
-            *action = Some(Action::AddFiles);
-        }
-        if ui.button("📁 Add folder…").clicked() {
-            *action = Some(Action::AddFolder);
-        }
-        ui.label("New folder:");
-        ui.add(egui::TextEdit::singleline(&mut s.new_folder_name).desired_width(120.0));
-        if ui.button("Create").clicked() {
-            *action = Some(Action::NewFolder);
-        }
-        ui.separator();
-        if ui.button("⬇ Extract all…").clicked() {
-            *action = Some(Action::ExtractAll);
-        }
-        if ui.button("📤 Send…").clicked() {
-            *action = Some(Action::BeginExport(id.clone()));
-        }
+
+    if let Some(leaf) = &editing {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(ACCENT, format!("✏ Editing {leaf}"));
+                ui.label(
+                    RichText::new("— edit in your app, then:")
+                        .color(MUTED)
+                        .small(),
+                );
+                if ui.button("Check in").clicked() {
+                    *action = Some(Action::CheckIn);
+                }
+                if ui.button("Discard").clicked() {
+                    *action = Some(Action::Discard);
+                }
+            });
+        });
+    }
+
+    ui.add_enabled_ui(editing.is_none(), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("➕ Add files…").clicked() {
+                *action = Some(Action::AddFiles);
+            }
+            if ui.button("📁 Add folder…").clicked() {
+                *action = Some(Action::AddFolder);
+            }
+            ui.label("New folder:");
+            ui.add(egui::TextEdit::singleline(&mut s.new_folder_name).desired_width(120.0));
+            if ui.button("Create").clicked() {
+                *action = Some(Action::NewFolder);
+            }
+            ui.separator();
+            if ui.button("⬇ Extract all…").clicked() {
+                *action = Some(Action::ExtractAll);
+            }
+            if ui.button("📤 Send…").clicked() {
+                *action = Some(Action::BeginExport(id.clone()));
+            }
+        });
     });
     ui.separator();
 
@@ -1665,11 +1978,24 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
                     ui.colored_label(MUTED, human_size(size));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("🗑").on_hover_text("Remove").clicked() {
+                    let idle = editing.is_none();
+                    if ui
+                        .add_enabled(idle, egui::Button::new("🗑").small())
+                        .on_hover_text("Remove")
+                        .clicked()
+                    {
                         *action = Some(Action::DeleteEntry(path.clone()));
                     }
                     if kind == EntryKind::File && ui.small_button("Save as…").clicked() {
                         *action = Some(Action::SaveEntryAs(path.clone()));
+                    }
+                    if kind == EntryKind::File
+                        && ui
+                            .add_enabled(idle, egui::Button::new("✏").small())
+                            .on_hover_text("Check out & edit")
+                            .clicked()
+                    {
+                        *action = Some(Action::CheckOut(path.clone()));
                     }
                 });
             });
@@ -1963,6 +2289,52 @@ fn sanitize_filename(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Sanitize a filename leaf for a checkout temp file, **preserving the extension**
+/// (dots are kept) so the OS opens it with the right application. Path separators
+/// and other oddities become `_`; the store always prepends a random prefix, so
+/// the result can never traverse or collide.
+fn sanitize_leaf(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Best-effort: open `path` in the OS default application, detached (we do not
+/// wait for it to close). Uses platform launchers via `std::process::Command`
+/// to avoid pulling an extra dependency.
+fn open_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // The empty "" is the window title arg so a path with spaces isn't
+        // swallowed as the title.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn()?;
+    }
+    Ok(())
 }
 
 fn human_size(bytes: u64) -> String {

@@ -75,6 +75,7 @@ impl Registry {
 pub struct Store {
     data_dir: PathBuf,
     vaults_dir: PathBuf,
+    checkout_dir: PathBuf,
 }
 
 impl Store {
@@ -96,12 +97,16 @@ impl Store {
     pub fn at(data_dir: impl Into<PathBuf>) -> StoreResult<Self> {
         let data_dir = data_dir.into();
         let vaults_dir = data_dir.join("vaults");
+        let checkout_dir = data_dir.join("checkout");
         std::fs::create_dir_all(&vaults_dir).map_err(err)?;
+        std::fs::create_dir_all(&checkout_dir).map_err(err)?;
         harden_dir(&data_dir);
         harden_dir(&vaults_dir);
+        harden_dir(&checkout_dir);
         Ok(Self {
             data_dir,
             vaults_dir,
+            checkout_dir,
         })
     }
 
@@ -296,6 +301,41 @@ impl Store {
         Ok(())
     }
 
+    /// Replace a single file's contents inside an existing vault **without**
+    /// decrypting it into memory: the new container is streamed from `reader`
+    /// (the old file's bytes dropped, the new file appended from disk) to a temp
+    /// file that atomically replaces the vault. Peak memory is a couple of chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_in_vault(
+        &self,
+        identity: &Identity,
+        id: &str,
+        reader: &format::VaultReader,
+        vault_path: &str,
+        new_source: &Path,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> StoreResult<()> {
+        let final_path = self.vault_path(id);
+        let tmp = self.vaults_dir.join(format!("{id}.fsec.tmp"));
+        if let Err(e) = reader.replace_file_to_path(
+            identity,
+            &[identity.public()],
+            &ExportOptions::default(),
+            vault_path,
+            new_source,
+            mtime,
+            mode,
+            &tmp,
+        ) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(e));
+        }
+        std::fs::rename(&tmp, &final_path).map_err(err)?;
+        harden_file(&final_path);
+        Ok(())
+    }
+
     /// Transcode a just-verified incoming container straight into the local
     /// self-encrypted store, **streaming** from `reader` so a huge imported file
     /// is never held in memory. Writes to the (new) vault path directly — there is
@@ -328,6 +368,41 @@ impl Store {
         }
         Ok(())
     }
+
+    /// The hardened directory holding checked-out plaintext temp files.
+    pub fn checkout_dir(&self) -> &Path {
+        &self.checkout_dir
+    }
+
+    /// Create an empty checkout temp file under the hardened `checkout/` dir and
+    /// return its path. On Unix the file is created with mode 0600 from the
+    /// outset (via [`open_private_truncating`]) so decrypted plaintext never
+    /// exists with loose permissions. A random hex prefix guarantees uniqueness;
+    /// `leaf` (a sanitized display name, extension intact) is appended so the OS
+    /// opens it with the right application.
+    pub fn create_private_checkout_file(&self, leaf: &str) -> StoreResult<PathBuf> {
+        let stem = filesec_core::util::hex(
+            &filesec_core::secret::random_vec(8).unwrap_or_else(|_| vec![0u8; 8]),
+        );
+        let name = if leaf.is_empty() {
+            stem
+        } else {
+            format!("{stem}-{leaf}")
+        };
+        let path = self.checkout_dir.join(name);
+        open_private_truncating(&path)?;
+        Ok(path)
+    }
+
+    /// Best-effort secure-wipe of any leftover checkout temp files (e.g. from a
+    /// prior crash that bypassed check-in/discard). Called on unlock.
+    pub fn clean_checkout_dir(&self) {
+        if let Ok(rd) = std::fs::read_dir(&self.checkout_dir) {
+            for entry in rd.flatten() {
+                let _ = secure_wipe(&entry.path());
+            }
+        }
+    }
 }
 
 /// Generate a fresh random vault id (hex of 16 random bytes).
@@ -356,6 +431,69 @@ pub fn extract_vault(vault: &Vault, dest: &Path) -> StoreResult<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Best-effort secure deletion: overwrite the file's current length with random
+/// bytes, fsync, then unlink. A no-op if the file is absent.
+///
+/// LIMITATIONS — this is best-effort, **not** forensic-grade. On flash/SSD
+/// storage (wear leveling, block remapping, over-provisioning), copy-on-write
+/// filesystems (APFS, Btrfs, ZFS), and journaling filesystems, an in-place
+/// overwrite is **not guaranteed** to land on the same physical blocks that held
+/// the plaintext, so remnants may survive. It also cannot reach editor swap or
+/// backup files created elsewhere. This matches the README threat model
+/// (endpoint compromise and OS-level remnants are out of scope); it raises the
+/// bar against casual recovery only.
+pub fn secure_wipe(path: &Path) -> StoreResult<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    if !path.exists() {
+        return Ok(());
+    }
+    let len = std::fs::metadata(path).map_err(err)?.len();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(err)?;
+    f.seek(SeekFrom::Start(0)).map_err(err)?;
+    let block = 64 * 1024u64;
+    let mut written = 0u64;
+    while written < len {
+        let n = (len - written).min(block) as usize;
+        let buf = filesec_core::secret::random_vec(n).map_err(err)?;
+        f.write_all(&buf).map_err(err)?;
+        written += n as u64;
+    }
+    f.flush().map_err(err)?;
+    f.sync_all().map_err(err)?;
+    drop(f);
+    std::fs::remove_file(path).map_err(err)?;
+    Ok(())
+}
+
+/// Create (truncating) a file for writing with owner-only permissions from the
+/// outset where the OS supports it, so plaintext never exists with loose perms.
+#[cfg(unix)]
+fn open_private_truncating(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(err)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn open_private_truncating(path: &Path) -> StoreResult<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(err)?;
     Ok(())
 }
 

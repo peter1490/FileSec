@@ -353,6 +353,16 @@ fn hash_file(path: &Path) -> Result<([u8; 32], u64)> {
     Ok((*hasher.finalize().as_bytes(), total))
 }
 
+/// BLAKE3-hash a file on disk by path, returning its hash and byte length.
+///
+/// Streams the file in chunks (peak memory is one chunk); the read buffer is
+/// zeroizing because it briefly holds plaintext. Exposed so callers can cheaply
+/// detect whether an extracted-then-edited file actually changed before paying
+/// to re-encrypt it.
+pub fn hash_path(path: &Path) -> Result<([u8; 32], u64)> {
+    hash_file(path)
+}
+
 /// Append a directory entry (if not already present) to `entries`, tracking
 /// `seen` to avoid duplicates.
 fn push_dir_entry(path: String, seen: &mut BTreeSet<String>, entries: &mut Vec<Entry>) {
@@ -1117,10 +1127,139 @@ impl VaultReader {
         self.remove_paths(sender, recipients, options, remove, file)
     }
 
+    /// Write a **new** container identical to this vault except that the file at
+    /// `path` is replaced by the contents of `new_source` (streamed from disk).
+    ///
+    /// This is the fused form of [`Self::remove_paths`] + [`Self::append_files`]
+    /// in a single streaming pass: surviving files are decrypted-then-re-encrypted
+    /// on the fly, the old file's bytes are decrypted-then-discarded, and the new
+    /// file is hashed then streamed from disk. The replaced file moves to the end
+    /// of the data stream, so every surviving file's offset is recomputed to keep
+    /// the stream contiguous. Peak memory is a couple of chunks regardless of size.
+    ///
+    /// Errors if `path` is absent or names a directory (unlike `append_files`,
+    /// which collides, and `remove_paths`, which no-ops). The new source is read
+    /// twice (once to hash, once to encrypt); if it changes size in between, the
+    /// length check in [`write_container`] fails. The given `mtime`/`mode` are
+    /// recorded on the new entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file<W: Write>(
+        &self,
+        sender: &Identity,
+        recipients: &[PublicIdentity],
+        options: &ExportOptions,
+        path: &str,
+        new_source: &Path,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+        out: W,
+    ) -> Result<()> {
+        let target = normalize_path(path)?;
+
+        // Confirm the target is an existing file before changing anything.
+        let is_file = self
+            .manifest
+            .entries
+            .iter()
+            .any(|e| e.path == target && e.kind == EntryKind::File);
+        if !is_file {
+            return Err(Error::Vault(format!("not a file in vault: {target}")));
+        }
+
+        // Hash the replacement up front (also yields its byte length).
+        let (new_blake3, new_size) = hash_file(new_source)?;
+
+        // Build the surviving manifest (all file offsets recomputed) and the
+        // keep/drop segment list over the existing data stream, in existing
+        // order. The replaced file is dropped here and re-appended at the end.
+        let mut entries = Vec::with_capacity(self.manifest.entries.len());
+        let mut segments: Vec<(u64, bool)> = Vec::new();
+        let mut offset: u64 = 0;
+        for e in &self.manifest.entries {
+            let is_target = e.kind == EntryKind::File && e.path == target;
+            if e.kind == EntryKind::File {
+                segments.push((e.size, !is_target));
+            }
+            if is_target {
+                continue; // dropped here, re-appended below
+            }
+            let mut ne = e.clone();
+            if ne.kind == EntryKind::File {
+                ne.data_offset = offset;
+                offset = offset
+                    .checked_add(ne.size)
+                    .ok_or(Error::Format("size overflow"))?;
+            } else {
+                ne.data_offset = 0;
+            }
+            entries.push(ne);
+        }
+
+        // Re-append the replaced path as a new file entry at the end. Its
+        // ancestor dirs already exist (the path was present before), so there is
+        // no need to push them.
+        entries.push(Entry {
+            path: target,
+            kind: EntryKind::File,
+            size: new_size,
+            mtime,
+            mode,
+            blake3: new_blake3,
+            data_offset: offset,
+        });
+        offset = offset
+            .checked_add(new_size)
+            .ok_or(Error::Format("size overflow"))?;
+
+        let manifest = Manifest {
+            vault_name: self.manifest.vault_name.clone(),
+            created_at: self.manifest.created_at,
+            entries,
+        };
+
+        // Data = surviving plaintext (the old target's bytes discarded by
+        // SelectReader) followed by the new file streamed from disk.
+        let kept = SelectReader::new(self.plaintext_reader()?, segments);
+        let sources: Vec<Box<dyn Read>> = vec![
+            Box::new(kept),
+            Box::new(BufReader::new(fs_err::File::open(new_source)?)),
+        ];
+        write_container(
+            &manifest,
+            offset,
+            ChainReader::new(sources),
+            sender,
+            recipients,
+            options,
+            out,
+        )
+    }
+
+    /// Replace a file directly to a new file path. See [`Self::replace_file`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_to_path(
+        &self,
+        sender: &Identity,
+        recipients: &[PublicIdentity],
+        options: &ExportOptions,
+        path: &str,
+        new_source: &Path,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+        out_path: &Path,
+    ) -> Result<()> {
+        let file = fs_err::File::create(out_path)?;
+        self.replace_file(
+            sender, recipients, options, path, new_source, mtime, mode, file,
+        )
+    }
+
     /// A [`Read`] that yields this vault's full decrypted plaintext, streamed
     /// chunk-by-chunk from disk. Shared by [`Self::to_vault`] and
     /// [`Self::reexport`].
-    fn plaintext_reader(&self) -> Result<aead::StreamDecryptReader<std::io::Take<BufReader<fs_err::File>>>> {
+    fn plaintext_reader(
+        &self,
+    ) -> Result<aead::StreamDecryptReader<std::io::Take<BufReader<fs_err::File>>>> {
         let mut file = fs_err::File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.data_section_offset))?;
         let limited = BufReader::new(file).take(self.data_len());
@@ -1264,7 +1403,8 @@ pub fn verify_and_open(path: &Path, identity: &Identity) -> Result<(VaultReader,
     }
     let mut file = BufReader::new(fs_err::File::open(path)?);
     let mut hasher = blake3::Hasher::new();
-    let (reader, sender) = open_reader_inner(path, &mut file, file_len, identity, Some(&mut hasher))?;
+    let (reader, sender) =
+        open_reader_inner(path, &mut file, file_len, identity, Some(&mut hasher))?;
 
     // The cursor now sits at the start of the data section. Stream the ciphertext
     // through the hasher (one chunk at a time — never buffered), then read and

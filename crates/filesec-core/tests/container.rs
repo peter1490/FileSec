@@ -352,7 +352,10 @@ fn append_files_streams_without_materializing() {
         0
     );
     assert_eq!(imported.vault.get("added").unwrap().kind, EntryKind::Dir);
-    assert_eq!(imported.vault.get("spare/dir").unwrap().kind, EntryKind::Dir);
+    assert_eq!(
+        imported.vault.get("spare/dir").unwrap().kind,
+        EntryKind::Dir
+    );
 
     // Adding a path that already exists is refused.
     let dup = format::open_vault_from_path(&out_path, &alice).unwrap();
@@ -422,6 +425,142 @@ fn remove_paths_streams_and_recomputes_offsets() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn replace_file_streams_and_preserves_others() {
+    let alice = ident("Alice");
+    let orig = sample_vault();
+    let path = tmp_path("replace.fsec");
+    format::export_vault_to_path(
+        &orig,
+        &alice,
+        &[alice.public()],
+        &ExportOptions::default(),
+        &path,
+    )
+    .unwrap();
+
+    // New contents for the mid-stream, multi-chunk file (different size, so every
+    // surviving file after it must have its offset recomputed).
+    let new_big: Vec<u8> = (0..(64 * 1024 + 5)).map(|i| (i % 131) as u8).collect();
+    let new_src = tmp_path("replace-src.bin");
+    std::fs::write(&new_src, &new_big).unwrap();
+
+    let reader = format::open_vault_from_path(&path, &alice).unwrap();
+    let out = tmp_path("replace-out.fsec");
+    reader
+        .replace_file_to_path(
+            &alice,
+            &[alice.public()],
+            &ExportOptions::default(),
+            "data/big.bin",
+            &new_src,
+            Some(99),
+            Some(0o600),
+            &out,
+        )
+        .unwrap();
+
+    let imported = format::import_vault_from_path(&out, &alice).expect("import after replace");
+    // Entry count is unchanged (the file is dropped then re-appended).
+    assert_eq!(imported.vault.entries().len(), orig.entries().len());
+    // The replaced file has the new content + metadata.
+    let got = imported
+        .vault
+        .get("data/big.bin")
+        .expect("replaced present");
+    assert_eq!(&got.content[..], &new_big[..]);
+    assert_eq!(got.mtime, Some(99));
+    assert_eq!(got.mode, Some(0o600));
+    // Every other entry is byte-identical (offsets recomputed correctly).
+    for e in orig.entries() {
+        if e.path == "data/big.bin" {
+            continue;
+        }
+        let s = imported.vault.get(&e.path).expect("survivor present");
+        assert_eq!(s.kind, e.kind, "kind for {}", e.path);
+        assert_eq!(&s.content[..], &e.content[..], "content for {}", e.path);
+    }
+
+    // Replacing a directory or a missing path is refused.
+    let reader = format::open_vault_from_path(&path, &alice).unwrap();
+    let bad = tmp_path("replace-bad.fsec");
+    assert!(reader
+        .replace_file_to_path(
+            &alice,
+            &[alice.public()],
+            &ExportOptions::default(),
+            "emptydir",
+            &new_src,
+            None,
+            None,
+            &bad,
+        )
+        .is_err());
+    assert!(reader
+        .replace_file_to_path(
+            &alice,
+            &[alice.public()],
+            &ExportOptions::default(),
+            "nope.txt",
+            &new_src,
+            None,
+            None,
+            &bad,
+        )
+        .is_err());
+
+    for p in [&path, &new_src, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn replace_file_with_empty_source_roundtrips() {
+    let alice = ident("Alice");
+    let orig = sample_vault();
+    let path = tmp_path("replace-empty.fsec");
+    format::export_vault_to_path(
+        &orig,
+        &alice,
+        &[alice.public()],
+        &ExportOptions::default(),
+        &path,
+    )
+    .unwrap();
+
+    // Replace a non-empty file with an empty one: total plaintext shrinks and the
+    // new entry has size 0.
+    let empty_src = tmp_path("replace-empty-src.bin");
+    std::fs::write(&empty_src, b"").unwrap();
+    let reader = format::open_vault_from_path(&path, &alice).unwrap();
+    let out = tmp_path("replace-empty-out.fsec");
+    reader
+        .replace_file_to_path(
+            &alice,
+            &[alice.public()],
+            &ExportOptions::default(),
+            "readme.txt",
+            &empty_src,
+            None,
+            None,
+            &out,
+        )
+        .unwrap();
+
+    let imported =
+        format::import_vault_from_path(&out, &alice).expect("import after empty replace");
+    assert_eq!(imported.vault.get("readme.txt").unwrap().content.len(), 0);
+    // A survivor is still intact.
+    assert_eq!(
+        &imported.vault.get("data/big.bin").unwrap().content[..],
+        &sample_vault().get("data/big.bin").unwrap().content[..]
+    );
+
+    for p in [&path, &empty_src, &out] {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 #[test]

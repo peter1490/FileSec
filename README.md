@@ -187,23 +187,33 @@ development packages for those.
 ## Roadmap
 
 Implemented (this MVP): identity & keystore, contacts with trust/verification,
-create/manage vaults, add files & folders, extract/save, export to one or more
-recipients (with "include self"), import + signature verification, and an
-encrypted-at-rest local store. All crypto and I/O run on a **background worker
-thread**, so the UI stays responsive even for very large vaults (a spinner shows
-while a job runs).
+create/manage vaults, add files & folders, extract/save, **check-out / check-in
+editing**, export to one or more recipients (with "include self"), import +
+signature verification, and an encrypted-at-rest local store. All crypto and I/O
+run on a **background worker thread**, so the UI stays responsive even for very
+large vaults (a spinner shows while a job runs).
+
+**Check-out / check-in editing** (the ✏ button on a file): the file is decrypted
+to a temp file under a per-user `checkout/` directory (created with owner-only
+`0600` permissions where the OS supports it) and opened in your default editor.
+Edit and save in your own app, then **Check in** (the edited bytes are streamed
+back into the vault and re-encrypted — single-pass, no full decrypt into memory)
+or **Discard**. Either way the temp file is securely overwritten and deleted.
+This overwrite is **best-effort, not forensic-grade**: on SSDs (wear leveling),
+copy-on-write filesystems (APFS, Btrfs, ZFS), and journaling filesystems an
+in-place overwrite is not guaranteed to hit the original physical blocks, and it
+cannot reach editor swap/backup files (see the threat model). A crash that
+bypasses check-in/discard leaves the temp until the next unlock, which wipes the
+`checkout/` directory.
 
 Planned, in dependency order:
 
-1. **Check-out / check-in editing** — decrypt to a restricted temp file, edit in
-   your normal editor, re-encrypt on check-in, secure-wipe the temp (with honest
-   SSD/CoW caveats).
-2. **Trust-UX polish** — richer verification flow and armored-key paste niceties.
-3. **Opt-in hybrid post-quantum suite** (ML-KEM-768 + ML-DSA-65) and an
+1. **Trust-UX polish** — richer verification flow and armored-key paste niceties.
+2. **Opt-in hybrid post-quantum suite** (ML-KEM-768 + ML-DSA-65) and an
    AES-256-GCM suite — the format and dispatch are already designed for this.
-4. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
+3. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
    notarization, Windows Authenticode.
-5. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
+4. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
 
 ---
 
