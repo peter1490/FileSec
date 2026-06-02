@@ -6,3 +6,6 @@
 *.fsec
 *.fsecpub
 /scratch
+
+# macOS Finder metadata
+.DS_Store
