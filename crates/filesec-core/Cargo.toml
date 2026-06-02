@@ -9,9 +9,12 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Post-quantum opt-in. Wired but inert in the MVP (no PQC suite shipped yet);
-# enabling it today is a no-op so the API surface stays stable for later phases.
-pqc = []
+# Post-quantum opt-in (Phase 5). Enables the additional algorithm suites:
+#   * 0x0002 — AES-256-GCM (classical X25519/Ed25519, AES bulk cipher)
+#   * 0x0101 — Hybrid X25519+ML-KEM-768 KEM and Ed25519+ML-DSA-65 signatures
+# A build without this feature supports only the classical default suite 0x0001
+# and cleanly rejects (UnsupportedSuite) containers that name 0x0002/0x0101.
+pqc = ["dep:aes-gcm", "dep:ml-kem", "dep:ml-dsa"]
 
 [dependencies]
 argon2 = "0.5.3"
@@ -28,6 +31,14 @@ thiserror = "2.0.18"
 walkdir = "2.5.0"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
+
+# Post-quantum suites (opt-in via the `pqc` feature). `default-features = false`
+# plus the minimal feature set keeps these off the classical build entirely and
+# avoids pulling getrandom 0.3/0.4 (we source all entropy through getrandom 0.2,
+# using the seed/deterministic APIs of each crate). See the `pqc` feature above.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "stream"], optional = true }
+ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"], optional = true }
+ml-dsa = { version = "0.1.0", default-features = false, features = ["alloc", "zeroize"], optional = true }
 
 [dev-dependencies]
 insta = "1.47.2"

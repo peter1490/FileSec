@@ -22,12 +22,25 @@ const SALT_LEN: usize = 16;
 const AAD: &[u8] = b"FileSec keystore v1";
 
 /// The decrypted private identity bundle. Zeroized on drop.
+///
+/// The post-quantum fields are present only for a hybrid identity and are
+/// serialized only when set (`skip_serializing_if`), so a classical keystore is
+/// byte-for-byte unchanged and older keystores still unlock. Each PQC keypair is
+/// stored as its compact seed (re-expanded on use) plus the cached public key.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct SecretBundle {
     name: String,
     created_at: i64,
     sign_secret: [u8; sign::SECRET_LEN],
     kem_secret: [u8; kem::SECRET_LEN],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mldsa_seed: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mldsa_public: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mlkem_seed: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mlkem_public: Option<Vec<u8>>,
 }
 
 /// On-disk keystore: public envelope around the encrypted [`SecretBundle`].
@@ -52,6 +65,10 @@ impl KeystoreFile {
             created_at: identity.created_at,
             sign_secret: *identity.sign_secret(),
             kem_secret: *identity.kem_secret(),
+            mldsa_seed: identity.mldsa_secret().map(<[u8]>::to_vec),
+            mldsa_public: identity.mldsa_public().map(<[u8]>::to_vec),
+            mlkem_seed: identity.mlkem_secret().map(<[u8]>::to_vec),
+            mlkem_public: identity.mlkem_public().map(<[u8]>::to_vec),
         };
         let plaintext = Zeroizing::new(codec::to_vec(&bundle)?);
         let ciphertext = aead::seal(&master, &nonce, AAD, &plaintext)?;
@@ -88,11 +105,21 @@ impl KeystoreFile {
                 .map_err(|_| Error::BadPassphrase)?,
         );
         let mut bundle: SecretBundle = codec::from_slice(&plaintext)?;
-        let identity = Identity::from_secrets(
+        // Re-pair each PQC public with its seed; a half-present pair (which a
+        // well-formed keystore never produces) degrades to a classical identity.
+        let pair = |public: &Option<Vec<u8>>, seed: &Option<Vec<u8>>| match (public, seed) {
+            (Some(p), Some(s)) => Some((p.clone(), s.clone())),
+            _ => None,
+        };
+        let mldsa = pair(&bundle.mldsa_public, &bundle.mldsa_seed);
+        let mlkem = pair(&bundle.mlkem_public, &bundle.mlkem_seed);
+        let identity = Identity::from_parts(
             bundle.name.clone(),
             bundle.created_at,
             bundle.sign_secret,
             bundle.kem_secret,
+            mldsa,
+            mlkem,
         );
         bundle.zeroize();
         Ok(identity)

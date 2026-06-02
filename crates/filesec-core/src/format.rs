@@ -48,12 +48,21 @@ const MAX_HEADER_LEN: usize = 32 * 1024 * 1024;
 const MAX_MANIFEST_LEN: u64 = 512 * 1024 * 1024;
 
 /// Plaintext header. Everything here is bound as AAD and signed.
+///
+/// For a hybrid container the sender's ML-DSA-65 and ML-KEM-768 public keys are
+/// carried here too (so an importer can verify the post-quantum signature and
+/// recompute the hybrid fingerprint). They are serialized only when present, so
+/// a classical header is byte-for-byte identical to before.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Header {
     suite_id: u16,
     vault_id: [u8; 16],
     sender_sign_public: [u8; sign::PUBLIC_LEN],
     sender_kem_public: [u8; kem::PUBLIC_LEN],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_mldsa_public: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_mlkem_public: Option<Vec<u8>>,
     sender_fpr: [u8; 32],
     recipients: Vec<RecipientStanza>,
     manifest_nonce: Vec<u8>,
@@ -61,6 +70,27 @@ struct Header {
     data_stream_nonce: Vec<u8>,
     data_chunk_size: u32,
     data_len: u64,
+}
+
+/// Length of an ML-DSA-65 signature appended to a hybrid container's trailer.
+/// Zero in builds without the `pqc` feature (where no hybrid suite exists).
+#[cfg(feature = "pqc")]
+const fn hybrid_sig_len() -> usize {
+    crate::mldsa::SIGNATURE_LEN
+}
+#[cfg(not(feature = "pqc"))]
+const fn hybrid_sig_len() -> usize {
+    0
+}
+
+/// Total signature-trailer length for a suite: the Ed25519 signature, plus the
+/// ML-DSA-65 signature for a hybrid suite.
+fn trailer_len(suite: SuiteId) -> usize {
+    if suite.is_hybrid() {
+        sign::SIGNATURE_LEN + hybrid_sig_len()
+    } else {
+        sign::SIGNATURE_LEN
+    }
 }
 
 /// Options controlling how a vault is exported.
@@ -109,6 +139,10 @@ pub struct ImportedVault {
     pub sender_sign_public: [u8; sign::PUBLIC_LEN],
     /// Sender's X25519 agreement public key.
     pub sender_kem_public: [u8; kem::PUBLIC_LEN],
+    /// Sender's ML-DSA-65 verifying key (hybrid containers only).
+    pub sender_mldsa_public: Option<Vec<u8>>,
+    /// Sender's ML-KEM-768 encapsulation key (hybrid containers only).
+    pub sender_mlkem_public: Option<Vec<u8>>,
 }
 
 impl ImportedVault {
@@ -122,6 +156,8 @@ impl ImportedVault {
             created_at: 0,
             sign_public: self.sender_sign_public,
             kem_public: self.sender_kem_public,
+            mldsa_public: self.sender_mldsa_public.clone(),
+            mlkem_public: self.sender_mlkem_public.clone(),
         }
     }
 }
@@ -452,30 +488,50 @@ fn write_container<R: Read, W: Write>(
     if options.chunk_size == 0 {
         return Err(Error::Format("chunk size"));
     }
+    let suite = options.suite;
+    let alg = suite.aead_alg();
+
+    // A hybrid sender always advertises its post-quantum keys in the header,
+    // even in a classical/AES container: its canonical fingerprint commits to
+    // them, so an importer must recompute the same fingerprint to match the
+    // sender against its contacts. The Ed25519 signature covers the whole header
+    // (including these keys), so they are authenticated regardless of suite. A
+    // hybrid *suite* additionally requires them (to dual-sign), so fail early and
+    // explicitly if they are absent.
+    let sender_mldsa_public = sender.mldsa_public().map(<[u8]>::to_vec);
+    let sender_mlkem_public = sender.mlkem_public().map(<[u8]>::to_vec);
+    if suite.is_hybrid() && (sender_mldsa_public.is_none() || sender_mlkem_public.is_none()) {
+        return Err(Error::MissingPqcKey(
+            "hybrid container requires a sender with post-quantum keys",
+        ));
+    }
 
     // 1. Serialize the manifest and compute the on-disk section lengths.
     let manifest_plaintext = Zeroizing::new(codec::to_vec(manifest)?);
     let manifest_len = (manifest_plaintext.len() + aead::TAG_LEN) as u64;
     let data_len = data_ciphertext_len(data_plaintext_len, options.chunk_size as u64);
 
-    // 2. Fresh secrets.
+    // 2. Fresh secrets. Nonce sizes follow the suite's bulk AEAD.
     let cek = SymKey::random()?;
-    let manifest_nonce = random_vec(aead::NONCE_LEN)?;
-    let data_stream_nonce = random_vec(aead::STREAM_NONCE_LEN)?;
+    let manifest_nonce = random_vec(alg.nonce_len())?;
+    let data_stream_nonce = random_vec(alg.stream_nonce_len())?;
     let vault_id = random_array::<16>()?;
 
-    // 3. Wrap the content key to every recipient.
+    // 3. Wrap the content key to every recipient (hybrid suites also ML-KEM-
+    //    encapsulate to each recipient inside `wrap_for_recipient`).
     let mut stanzas = Vec::with_capacity(recipients.len());
     for r in recipients {
-        stanzas.push(envelope::wrap_for_recipient(&cek, r)?);
+        stanzas.push(envelope::wrap_for_recipient(&cek, r, suite)?);
     }
 
     // 4. Header, then bind it everywhere as AAD.
     let header = Header {
-        suite_id: options.suite.to_u16(),
+        suite_id: suite.to_u16(),
         vault_id,
         sender_sign_public: sender.sign_public(),
         sender_kem_public: sender.kem_public(),
+        sender_mldsa_public,
+        sender_mlkem_public,
         sender_fpr: sender.fingerprint(),
         recipients: stanzas,
         manifest_nonce: manifest_nonce.clone(),
@@ -496,13 +552,20 @@ fn write_container<R: Read, W: Write>(
     hw.write_all(&(header_bytes.len() as u32).to_be_bytes())?;
     hw.write_all(&header_bytes)?;
 
-    let enc_manifest = aead::seal(&cek, &manifest_nonce, &header_bytes, &manifest_plaintext)?;
+    let enc_manifest = aead::seal_with(
+        alg,
+        &cek,
+        &manifest_nonce,
+        &header_bytes,
+        &manifest_plaintext,
+    )?;
     if enc_manifest.len() as u64 != manifest_len {
         return Err(Error::Format("manifest length mismatch"));
     }
     hw.write_all(&enc_manifest)?;
 
-    let written = aead::encrypt_stream(
+    let written = aead::encrypt_stream_with(
+        alg,
         &cek,
         &data_stream_nonce,
         &header_bytes,
@@ -514,11 +577,18 @@ fn write_container<R: Read, W: Write>(
         return Err(Error::Format("data length mismatch"));
     }
 
-    // 6. Sign the hash of everything written, then append the signature.
+    // 6. Sign the hash of everything written, then append the trailer: the
+    //    Ed25519 signature, plus the ML-DSA-65 signature for a hybrid container.
+    //    Requiring both on import means forging needs breaking *both* schemes.
     let hash = hw.hasher.finalize();
     let signature = sender.sign(hash.as_bytes());
     let mut inner = hw.inner;
     inner.write_all(&signature)?;
+    #[cfg(feature = "pqc")]
+    if suite.is_hybrid() {
+        let pq_signature = sender.sign_pqc(hash.as_bytes())?;
+        inner.write_all(&pq_signature)?;
+    }
     inner.flush()?;
     Ok(())
 }
@@ -563,8 +633,9 @@ pub fn import_vault(bytes: &[u8], identity: &Identity) -> Result<ImportedVault> 
 
     // Validate header fields before trusting any length.
     let suite = SuiteId::from_u16(header.suite_id)?;
-    if header.manifest_nonce.len() != aead::NONCE_LEN
-        || header.data_stream_nonce.len() != aead::STREAM_NONCE_LEN
+    let alg = suite.aead_alg();
+    if header.manifest_nonce.len() != alg.nonce_len()
+        || header.data_stream_nonce.len() != alg.stream_nonce_len()
     {
         return Err(Error::Format("bad nonce length"));
     }
@@ -587,25 +658,36 @@ pub fn import_vault(bytes: &[u8], identity: &Identity) -> Result<ImportedVault> 
         .checked_add(data_len)
         .ok_or(Error::Format("length overflow"))?;
     let sig_end = data_end
-        .checked_add(sign::SIGNATURE_LEN)
+        .checked_add(trailer_len(suite))
         .ok_or(Error::Format("length overflow"))?;
     if len != sig_end {
         return Err(Error::Format("container length does not match header"));
     }
 
-    // Verify the sender signature over the entire body BEFORE decrypting.
+    // Verify the sender signature(s) over the entire body BEFORE decrypting. A
+    // hybrid container is dual-signed; both the Ed25519 and the ML-DSA signature
+    // must verify.
     let signed = &bytes[0..data_end];
-    let mut signature = [0u8; sign::SIGNATURE_LEN];
-    signature.copy_from_slice(&bytes[data_end..sig_end]);
     let body_hash = blake3::hash(signed);
+    let mut signature = [0u8; sign::SIGNATURE_LEN];
+    signature.copy_from_slice(&bytes[data_end..data_end + sign::SIGNATURE_LEN]);
     sign::verify(&header.sender_sign_public, body_hash.as_bytes(), &signature)?;
+    verify_hybrid_signature(
+        suite,
+        &header,
+        body_hash.as_bytes(),
+        &bytes[data_end..sig_end],
+    )?;
 
-    // The sender fingerprint in the header must match the signed public keys.
+    // The sender fingerprint in the header must match the signed public keys
+    // (including the post-quantum ones for a hybrid sender).
     let sender = PublicIdentity {
         name: String::new(),
         created_at: 0,
         sign_public: header.sender_sign_public,
         kem_public: header.sender_kem_public,
+        mldsa_public: header.sender_mldsa_public.clone(),
+        mlkem_public: header.sender_mlkem_public.clone(),
     };
     if !ct_eq(&sender.fingerprint(), &header.sender_fpr) {
         return Err(Error::Format("sender fingerprint mismatch"));
@@ -622,7 +704,8 @@ pub fn import_vault(bytes: &[u8], identity: &Identity) -> Result<ImportedVault> 
 
     // Decrypt + authenticate the manifest (AAD = header bytes).
     let enc_manifest = &bytes[manifest_start..manifest_end];
-    let manifest_plaintext = Zeroizing::new(aead::open(
+    let manifest_plaintext = Zeroizing::new(aead::open_with(
+        alg,
         &cek,
         &header.manifest_nonce,
         header_bytes,
@@ -638,7 +721,8 @@ pub fn import_vault(bytes: &[u8], identity: &Identity) -> Result<ImportedVault> 
     // file's bytes are read on demand, so the whole plaintext is never held in a
     // second buffer alongside the per-entry copies.
     let enc_data = &bytes[manifest_end..data_end];
-    let plaintext = aead::StreamDecryptReader::new(
+    let plaintext = aead::StreamDecryptReader::new_with(
+        alg,
         &cek,
         &header.data_stream_nonce,
         header_bytes,
@@ -653,7 +737,41 @@ pub fn import_vault(bytes: &[u8], identity: &Identity) -> Result<ImportedVault> 
         sender_fingerprint: header.sender_fpr,
         sender_sign_public: header.sender_sign_public,
         sender_kem_public: header.sender_kem_public,
+        sender_mldsa_public: header.sender_mldsa_public,
+        sender_mlkem_public: header.sender_mlkem_public,
     })
+}
+
+/// Verify the post-quantum half of a hybrid container's dual signature. For a
+/// classical suite this is a no-op (the Ed25519 signature is the whole trailer).
+/// `trailer` is the full signature trailer (`Ed25519 || ML-DSA`).
+fn verify_hybrid_signature(
+    suite: SuiteId,
+    header: &Header,
+    body_hash: &[u8],
+    trailer: &[u8],
+) -> Result<()> {
+    if !suite.is_hybrid() {
+        return Ok(());
+    }
+    #[cfg(feature = "pqc")]
+    {
+        let mldsa_public = header
+            .sender_mldsa_public
+            .as_deref()
+            .ok_or(Error::Format("hybrid container missing ML-DSA sender key"))?;
+        let pq_signature = trailer
+            .get(sign::SIGNATURE_LEN..)
+            .ok_or(Error::Format("truncated hybrid signature"))?;
+        crate::mldsa::verify(mldsa_public, body_hash, pq_signature)
+    }
+    // Unreachable without `pqc` (no hybrid suite exists), but keeps the function
+    // total and side-effect free.
+    #[cfg(not(feature = "pqc"))]
+    {
+        let _ = (header, body_hash, trailer);
+        Err(Error::UnsupportedSuite(suite.to_u16()))
+    }
 }
 
 /// Validate a decrypted manifest's plaintext layout against the declared
@@ -1263,7 +1381,8 @@ impl VaultReader {
         let mut file = fs_err::File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.data_section_offset))?;
         let limited = BufReader::new(file).take(self.data_len());
-        aead::StreamDecryptReader::new(
+        aead::StreamDecryptReader::new_with(
+            self.suite.aead_alg(),
             &self.cek,
             &self.data_stream_nonce,
             &self.header_bytes,
@@ -1320,7 +1439,8 @@ impl VaultReader {
             file.seek(SeekFrom::Start(ct_off))?;
             let mut ct = vec![0u8; ct_len];
             file.read_exact(&mut ct)?;
-            let pt = Zeroizing::new(aead::decrypt_chunk(
+            let pt = Zeroizing::new(aead::decrypt_chunk_with(
+                self.suite.aead_alg(),
                 &self.cek,
                 &self.data_stream_nonce,
                 &self.header_bytes,
@@ -1367,6 +1487,10 @@ pub struct VerifiedSender {
     pub sign_public: [u8; sign::PUBLIC_LEN],
     /// Sender X25519 agreement key.
     pub kem_public: [u8; kem::PUBLIC_LEN],
+    /// Sender ML-DSA-65 verifying key (hybrid containers only).
+    pub mldsa_public: Option<Vec<u8>>,
+    /// Sender ML-KEM-768 encapsulation key (hybrid containers only).
+    pub mlkem_public: Option<Vec<u8>>,
 }
 
 impl VerifiedSender {
@@ -1379,6 +1503,8 @@ impl VerifiedSender {
             created_at: 0,
             sign_public: self.sign_public,
             kem_public: self.kem_public,
+            mldsa_public: self.mldsa_public.clone(),
+            mlkem_public: self.mlkem_public.clone(),
         }
     }
 }
@@ -1408,7 +1534,8 @@ pub fn verify_and_open(path: &Path, identity: &Identity) -> Result<(VaultReader,
 
     // The cursor now sits at the start of the data section. Stream the ciphertext
     // through the hasher (one chunk at a time — never buffered), then read and
-    // verify the signature trailer over the whole body.
+    // verify the signature trailer over the whole body. A hybrid container is
+    // dual-signed (Ed25519 + ML-DSA); both signatures must verify.
     let mut remaining = reader.data_len();
     let mut buf = vec![0u8; aead::DEFAULT_CHUNK_SIZE];
     while remaining > 0 {
@@ -1417,12 +1544,44 @@ pub fn verify_and_open(path: &Path, identity: &Identity) -> Result<(VaultReader,
         hasher.update(&buf[..want]);
         remaining -= want as u64;
     }
-    let mut signature = [0u8; sign::SIGNATURE_LEN];
-    file.read_exact(&mut signature)?;
+    let mut trailer = vec![0u8; trailer_len(reader.suite)];
+    file.read_exact(&mut trailer)?;
     let body_hash = hasher.finalize();
+    let mut signature = [0u8; sign::SIGNATURE_LEN];
+    signature.copy_from_slice(&trailer[..sign::SIGNATURE_LEN]);
     sign::verify(&sender.sign_public, body_hash.as_bytes(), &signature)?;
+    verify_verified_sender_hybrid(reader.suite, &sender, body_hash.as_bytes(), &trailer)?;
 
     Ok((reader, sender))
+}
+
+/// The post-quantum half of [`verify_and_open`]'s signature check, mirroring
+/// [`verify_hybrid_signature`] but against a [`VerifiedSender`].
+fn verify_verified_sender_hybrid(
+    suite: SuiteId,
+    sender: &VerifiedSender,
+    body_hash: &[u8],
+    trailer: &[u8],
+) -> Result<()> {
+    if !suite.is_hybrid() {
+        return Ok(());
+    }
+    #[cfg(feature = "pqc")]
+    {
+        let mldsa_public = sender
+            .mldsa_public
+            .as_deref()
+            .ok_or(Error::Format("hybrid container missing ML-DSA sender key"))?;
+        let pq_signature = trailer
+            .get(sign::SIGNATURE_LEN..)
+            .ok_or(Error::Format("truncated hybrid signature"))?;
+        crate::mldsa::verify(mldsa_public, body_hash, pq_signature)
+    }
+    #[cfg(not(feature = "pqc"))]
+    {
+        let _ = (sender, body_hash, trailer);
+        Err(Error::UnsupportedSuite(suite.to_u16()))
+    }
 }
 
 /// Shared container parser: read the preamble, header, and encrypted manifest
@@ -1463,8 +1622,9 @@ fn open_reader_inner(
     }
     let header: Header = codec::from_slice(&header_bytes)?;
     let suite = SuiteId::from_u16(header.suite_id)?;
-    if header.manifest_nonce.len() != aead::NONCE_LEN
-        || header.data_stream_nonce.len() != aead::STREAM_NONCE_LEN
+    let alg = suite.aead_alg();
+    if header.manifest_nonce.len() != alg.nonce_len()
+        || header.data_stream_nonce.len() != alg.stream_nonce_len()
     {
         return Err(Error::Format("bad nonce length"));
     }
@@ -1484,7 +1644,7 @@ fn open_reader_inner(
         .ok_or(Error::Format("length overflow"))?;
     let sig_end = data_section_offset
         .checked_add(header.data_len)
-        .and_then(|x| x.checked_add(sign::SIGNATURE_LEN as u64))
+        .and_then(|x| x.checked_add(trailer_len(suite) as u64))
         .ok_or(Error::Format("length overflow"))?;
     if file_len != sig_end {
         return Err(Error::Format("container length does not match header"));
@@ -1497,11 +1657,14 @@ fn open_reader_inner(
         h.update(&enc_manifest);
     }
 
-    // The sender fingerprint in the header must match its signed public keys.
+    // The sender fingerprint in the header must match its signed public keys
+    // (including the post-quantum ones for a hybrid sender).
     let sender = VerifiedSender {
         fingerprint: header.sender_fpr,
         sign_public: header.sender_sign_public,
         kem_public: header.sender_kem_public,
+        mldsa_public: header.sender_mldsa_public.clone(),
+        mlkem_public: header.sender_mlkem_public.clone(),
     };
     if !ct_eq(&sender.public().fingerprint(), &header.sender_fpr) {
         return Err(Error::Format("sender fingerprint mismatch"));
@@ -1515,7 +1678,8 @@ fn open_reader_inner(
         .ok_or(Error::NotARecipient)?;
     let cek = envelope::unwrap_with_identity(stanza, identity)?;
 
-    let manifest_plaintext = Zeroizing::new(aead::open(
+    let manifest_plaintext = Zeroizing::new(aead::open_with(
+        alg,
         &cek,
         &header.manifest_nonce,
         &header_bytes,

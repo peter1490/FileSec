@@ -24,6 +24,7 @@ use filesec_core::keystore::KeystoreFile;
 use filesec_core::manifest::EntryKind;
 use filesec_core::util::{hex, now_unix};
 use filesec_core::vault::Vault;
+use filesec_core::SuiteId;
 
 use crate::store::{new_vault_id, Registry, Store, VaultMeta};
 
@@ -84,6 +85,22 @@ impl Drop for Unlock {
     }
 }
 
+/// The "Upgrade to post-quantum" confirmation dialog. Re-sealing the keystore
+/// needs the passphrase, so it is re-entered here (this also confirms intent).
+#[cfg(feature = "pqc")]
+#[derive(Default)]
+struct MigrateForm {
+    pass: String,
+    error: Option<String>,
+}
+
+#[cfg(feature = "pqc")]
+impl Drop for MigrateForm {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Nav {
     Vaults,
@@ -129,6 +146,9 @@ struct ExportForm {
     vault_id: String,
     selected: HashSet<String>,
     include_self: bool,
+    /// Algorithm suite to encrypt under (Classic by default; the post-quantum
+    /// suites are offered only in a `pqc` build).
+    suite: SuiteId,
 }
 
 struct ImportInfo {
@@ -199,6 +219,9 @@ struct Session {
     verify: Option<VerifyForm>,
     export: Option<ExportForm>,
     last_import: Option<ImportInfo>,
+    /// The open "upgrade to post-quantum" dialog, if any.
+    #[cfg(feature = "pqc")]
+    migrate: Option<MigrateForm>,
     data_dir: String,
 }
 
@@ -225,6 +248,8 @@ impl Session {
             verify: None,
             export: None,
             last_import: None,
+            #[cfg(feature = "pqc")]
+            migrate: None,
             data_dir,
         }
     }
@@ -257,6 +282,16 @@ enum Action {
     DoExport,
     ToggleRecipient(String),
     ToggleIncludeSelf,
+    /// Pick the algorithm suite to export under (pqc builds only).
+    #[cfg(feature = "pqc")]
+    SetExportSuite(SuiteId),
+    /// Open / cancel / confirm the "upgrade to post-quantum" dialog (pqc only).
+    #[cfg(feature = "pqc")]
+    BeginMigrate,
+    #[cfg(feature = "pqc")]
+    CancelMigrate,
+    #[cfg(feature = "pqc")]
+    DoMigrate,
     /// Parse the paste box / a picked file into a staged [`ContactPreview`].
     PreviewContactPaste,
     PreviewContactFile,
@@ -767,6 +802,7 @@ impl App {
                         vault_id: id,
                         selected: HashSet::new(),
                         include_self: false,
+                        suite: SuiteId::default(),
                     });
                 }
             }
@@ -786,6 +822,30 @@ impl App {
                     }
                 }
             }
+            #[cfg(feature = "pqc")]
+            Action::SetExportSuite(suite) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(e) = &mut s.export {
+                        e.suite = suite;
+                    }
+                }
+            }
+            #[cfg(feature = "pqc")]
+            Action::BeginMigrate => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if !s.identity.is_hybrid_capable() {
+                        s.migrate = Some(MigrateForm::default());
+                    }
+                }
+            }
+            #[cfg(feature = "pqc")]
+            Action::CancelMigrate => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.migrate = None;
+                }
+            }
+            #[cfg(feature = "pqc")]
+            Action::DoMigrate => self.spawn_migrate(ctx),
             Action::CopyPubKey => {
                 let armored = if let State::Unlocked(s) = &self.state {
                     Some(s.identity.public().to_armored())
@@ -889,7 +949,14 @@ impl App {
             None => return,
         };
         self.spawn_job(ctx, "Creating identity…", move || {
-            let identity = match Identity::generate(&name, now_unix()) {
+            // With the `pqc` feature the new identity is hybrid (classical keys
+            // plus ML-DSA-65 / ML-KEM-768), so it can use any suite; otherwise it
+            // is classical. Either way the keystore persists exactly what exists.
+            #[cfg(feature = "pqc")]
+            let generated = Identity::generate_hybrid(&name, now_unix());
+            #[cfg(not(feature = "pqc"))]
+            let generated = Identity::generate(&name, now_unix());
+            let identity = match generated {
                 Ok(i) => i,
                 Err(e) => {
                     return JobReport {
@@ -1674,17 +1741,27 @@ impl App {
                     .find(|v| v.id == form.vault_id)
                     .map(|v| v.name.clone())
                     .unwrap_or_else(|| "vault".into());
-                (form.vault_id.clone(), recipients, name)
+                (form.vault_id.clone(), recipients, name, form.suite)
             })
         } else {
             None
         };
-        let (vault_id, recipients, name) = match gathered {
+        let (vault_id, recipients, name, suite) = match gathered {
             Some(x) => x,
             None => return,
         };
         if recipients.is_empty() {
             self.set_toast("Select at least one recipient.", true);
+            return;
+        }
+        // Hybrid PQC needs every recipient (and the sender) to carry post-quantum
+        // keys. Catch it here with a clear message rather than failing mid-export.
+        if suite.is_hybrid() && recipients.iter().any(|r| !r.is_hybrid_capable()) {
+            self.set_toast(
+                "Hybrid PQC requires every recipient to have post-quantum keys. \
+                 Ask them to re-share an updated public key, or pick another suite.",
+                true,
+            );
             return;
         }
         let suggested = format!("{}.fsec", sanitize_filename(&name));
@@ -1711,18 +1788,84 @@ impl App {
                 Ok(r) => r,
                 Err(e) => return JobReport::err(e),
             };
-            match reader.reexport_to_path(
-                &identity,
-                &recipients,
-                &ExportOptions::default(),
-                &target,
-            ) {
+            let options = ExportOptions {
+                suite,
+                ..ExportOptions::default()
+            };
+            match reader.reexport_to_path(&identity, &recipients, &options, &target) {
                 Ok(()) => JobReport::ok(
                     Outcome::Noop,
-                    format!("Exported to {} for {count} recipient(s).", target.display()),
+                    format!(
+                        "Exported to {} for {count} recipient(s) using {}.",
+                        target.display(),
+                        suite.label()
+                    ),
                 ),
                 Err(e) => JobReport::err(e.to_string()),
             }
+        });
+    }
+
+    /// Run the "upgrade to post-quantum" migration on the worker: re-key the
+    /// whole local store to a new hybrid identity, then swap the session over to
+    /// it. The keystore re-seal needs the passphrase, taken from the dialog.
+    #[cfg(feature = "pqc")]
+    fn spawn_migrate(&mut self, ctx: &egui::Context) {
+        let (pass, data_dir) = if let State::Unlocked(s) = &mut self.state {
+            match &mut s.migrate {
+                Some(f) if f.pass.is_empty() => {
+                    f.error = Some("Enter your passphrase to confirm.".into());
+                    return;
+                }
+                Some(f) => (Zeroizing::new(f.pass.clone()), s.data_dir.clone()),
+                None => return,
+            }
+        } else {
+            return;
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        if let State::Unlocked(s) = &mut self.state {
+            s.migrate = None;
+        }
+        self.spawn_job(ctx, "Upgrading to post-quantum…", move || {
+            let new =
+                match store.migrate_to_hybrid(&identity, pass.as_bytes(), KdfParams::default()) {
+                    Ok(n) => n,
+                    Err(e) => return JobReport::err(e),
+                };
+            // Migration is committed (the keystore now holds the hybrid identity).
+            // Reload the store under the new identity to rebuild the session; on
+            // the off chance a reload fails, ask for a restart rather than risk an
+            // inconsistent session — the keystore is already the new identity.
+            let contacts = match store.load_contacts(&new) {
+                Ok(c) => c,
+                Err(e) => {
+                    return JobReport::err(format!(
+                        "Upgraded — please restart the app. (reloading contacts failed: {e})"
+                    ))
+                }
+            };
+            let registry = match store.load_registry(&new) {
+                Ok(r) => r,
+                Err(e) => {
+                    return JobReport::err(format!(
+                        "Upgraded — please restart the app. (reloading vaults failed: {e})"
+                    ))
+                }
+            };
+            JobReport::ok(
+                Outcome::Unlocked(Box::new(SessionInit {
+                    identity: new,
+                    contacts,
+                    registry,
+                    data_dir,
+                })),
+                "Upgraded to post-quantum. Your safety number changed — re-share your \
+                 public key so contacts can re-verify it.",
+            )
         });
     }
 
@@ -2149,6 +2292,10 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     if s.verify.is_some() {
         verify_window(s, ui.ctx(), action);
     }
+    #[cfg(feature = "pqc")]
+    if s.migrate.is_some() {
+        migrate_window(s, ui.ctx(), action);
+    }
 }
 
 fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
@@ -2488,6 +2635,25 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
             .monospace()
             .color(ACCENT),
     );
+    // Post-quantum status + one-click upgrade (pqc builds only).
+    #[cfg(feature = "pqc")]
+    {
+        ui.add_space(10.0);
+        if s.identity.is_hybrid_capable() {
+            ui.label(
+                RichText::new("🛡 Post-quantum: hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65")
+                    .color(ACCENT),
+            );
+        } else {
+            ui.label(RichText::new("Post-quantum: not enabled (classical identity)").color(MUTED));
+            if ui
+                .button(RichText::new("Upgrade to post-quantum…").strong())
+                .clicked()
+            {
+                *action = Some(Action::BeginMigrate);
+            }
+        }
+    }
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         if ui.button("Copy public key").clicked() {
@@ -2510,6 +2676,80 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
             .color(MUTED)
             .small(),
     );
+}
+
+/// The "Upgrade to post-quantum" confirmation dialog.
+#[cfg(feature = "pqc")]
+fn migrate_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let form = match &mut s.migrate {
+        Some(f) => f,
+        None => return,
+    };
+    let mut open = true;
+    egui::Window::new("Upgrade to post-quantum")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(
+                "This adds ML-KEM-768 and ML-DSA-65 keys to your identity and re-encrypts your \
+                 whole local vault store under the hybrid post-quantum suite. Your existing \
+                 X25519/Ed25519 keys are kept.",
+            );
+            ui.add_space(8.0);
+            ui.colored_label(ERR_RED, "⚠ Your safety number will change.");
+            ui.label(
+                RichText::new(
+                    "Your identity now commits to its post-quantum keys, so your fingerprint and \
+                     safety number change. After upgrading, re-share your public key and have your \
+                     contacts re-verify it.",
+                )
+                .color(MUTED)
+                .small(),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Import any pending .fsec files first — containers others already sent to your \
+                     old identity won't be openable afterwards.",
+                )
+                .color(MUTED)
+                .small(),
+            );
+            ui.add_space(10.0);
+            ui.label("Confirm your passphrase to re-seal the keystore:");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.pass)
+                    .password(true)
+                    .desired_width(260.0),
+            );
+            if let Some(e) = &form.error {
+                ui.colored_label(ERR_RED, e);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Upgrade now").strong()).clicked() {
+                    *action = Some(Action::DoMigrate);
+                }
+                if ui.button("Cancel").clicked() {
+                    *action = Some(Action::CancelMigrate);
+                }
+            });
+        });
+    if !open {
+        *action = Some(Action::CancelMigrate);
+    }
+}
+
+/// Short suite name for the export picker chips.
+#[cfg(feature = "pqc")]
+fn suite_short(s: SuiteId) -> &'static str {
+    match s {
+        SuiteId::Classic => "Classic",
+        SuiteId::Aes256Gcm => "AES-256-GCM",
+        SuiteId::Hybrid => "Hybrid PQC",
+        _ => "Other",
+    }
 }
 
 fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
@@ -2550,6 +2790,72 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
             let mut include_self = form.include_self;
             if ui.checkbox(&mut include_self, "Also include myself (so I can re-open it)").changed() {
                 *action = Some(Action::ToggleIncludeSelf);
+            }
+            // Algorithm-suite picker (post-quantum builds only). The classical
+            // build has a single suite and shows no picker.
+            #[cfg(feature = "pqc")]
+            {
+                // Hybrid needs a post-quantum *sender* identity; a non-migrated
+                // classical identity can only pick the classical suites.
+                let sender_hybrid = s.identity.is_hybrid_capable();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Encryption suite:");
+                    for opt in [SuiteId::Classic, SuiteId::Aes256Gcm, SuiteId::Hybrid] {
+                        let enabled = sender_hybrid || !opt.is_hybrid();
+                        let resp = ui
+                            .add_enabled_ui(enabled, |ui| {
+                                ui.selectable_label(form.suite == opt, suite_short(opt))
+                            })
+                            .inner;
+                        if enabled && resp.clicked() {
+                            *action = Some(Action::SetExportSuite(opt));
+                        }
+                    }
+                });
+                if !sender_hybrid {
+                    ui.label(
+                        RichText::new(
+                            "Hybrid PQC needs a post-quantum identity — upgrade yours in “My \
+                             Identity” to enable it.",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
+                }
+                ui.label(RichText::new(form.suite.label()).color(MUTED).small());
+                if form.suite.is_hybrid() {
+                    let missing: Vec<&str> = s
+                        .contacts
+                        .contacts
+                        .iter()
+                        .filter(|c| {
+                            form.selected.contains(&hex(&c.fingerprint()))
+                                && !c.identity.is_hybrid_capable()
+                        })
+                        .map(|c| {
+                            if c.identity.name.is_empty() {
+                                "(unnamed)"
+                            } else {
+                                c.identity.name.as_str()
+                            }
+                        })
+                        .collect();
+                    if missing.is_empty() {
+                        ui.colored_label(
+                            MUTED,
+                            "Every recipient also gets post-quantum protection.",
+                        );
+                    } else {
+                        ui.colored_label(
+                            ERR_RED,
+                            format!(
+                                "⚠ No post-quantum key for: {}. Pick another suite or ask them to re-share.",
+                                missing.join(", ")
+                            ),
+                        );
+                    }
+                }
             }
             ui.add_space(6.0);
             // Downgrade/trust warning: spell out exactly which selected

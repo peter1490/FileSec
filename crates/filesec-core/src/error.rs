@@ -59,4 +59,11 @@ pub enum Error {
     /// A vault-level invariant was violated (e.g. duplicate or escaping path).
     #[error("vault error: {0}")]
     Vault(String),
+
+    /// A post-quantum (hybrid) operation was requested but the required key
+    /// material is missing — e.g. exporting suite `0x0101` to a recipient whose
+    /// identity carries no ML-KEM key, or opening a hybrid container with a
+    /// classical-only identity.
+    #[error("post-quantum key material is missing: {0}")]
+    MissingPqcKey(&'static str),
 }

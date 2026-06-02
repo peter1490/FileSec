@@ -10,10 +10,12 @@ encrypted file (`.fsec`) that you send to a recipient over any channel (email,
 cloud, USB). Only the intended recipients — selected by their public key — can
 open it.
 
-> **Status: MVP.** The classical crypto suite, vault management, and the full
-> export/import/verify flow are implemented and tested. Post-quantum crypto,
-> in-place editing, OS installers, and a transparent filesystem mount are
-> planned but not in this build (see [Roadmap](#roadmap)).
+> **Status: MVP + opt-in PQC.** The classical crypto suite, vault management,
+> in-place editing, and the full export/import/verify flow are implemented and
+> tested. An **opt-in post-quantum** build (`--features pqc`) adds a hybrid
+> X25519+ML-KEM-768 / Ed25519+ML-DSA-65 suite and an AES-256-GCM suite. OS
+> installers and a transparent filesystem mount are planned but not in this build
+> (see [Roadmap](#roadmap)).
 
 ---
 
@@ -44,8 +46,54 @@ open it.
 
 The container format carries an atomic **algorithm-suite identifier**, bound as
 AAD and covered by the signature, so an attacker cannot downgrade a container to
-a weaker suite. This is the hook for the planned opt-in **hybrid post-quantum**
-suite (X25519 + ML-KEM-768, Ed25519 + ML-DSA-65).
+a weaker suite.
+
+#### Opt-in post-quantum suites (`--features pqc`)
+
+Building with the `pqc` feature adds two more suites and makes new identities
+**hybrid** (they carry ML-DSA-65 and ML-KEM-768 keys alongside the classical
+ones). The suite is chosen per export; a classical build supports only `0x0001`
+and cleanly rejects the others.
+
+| suite    | AEAD               | key agreement         | signature            |
+|----------|--------------------|-----------------------|----------------------|
+| `0x0001` | XChaCha20-Poly1305 | X25519                | Ed25519              |
+| `0x0002` | AES-256-GCM        | X25519                | Ed25519              |
+| `0x0101` | XChaCha20-Poly1305 | X25519 **+ ML-KEM-768** | Ed25519 **+ ML-DSA-65** |
+
+The hybrid suite `0x0101` **combines** the classical and post-quantum primitives
+so it is never weaker than the classical baseline:
+
+- **KEM** — the content-key-wrapping key is derived from a KDF over *both* the
+  X25519 shared secret *and* the ML-KEM-768 shared secret, bound to the full
+  transcript (both public keys and the ML-KEM ciphertext). Recovering it requires
+  breaking *both* KEMs.
+- **Signature** — the container is signed with *both* Ed25519 and ML-DSA-65, and
+  an importer requires *both* to verify, so forging requires breaking *both*
+  schemes.
+
+A hybrid identity's fingerprint (and thus its safety number) commits to all four
+public keys, so verifying a contact out-of-band authenticates its post-quantum
+keys too. The keystore persists each post-quantum keypair as its compact seed.
+
+**Identities and migration (in a `pqc` build):**
+
+- A **fresh** data dir generates a **hybrid** identity, and its local store
+  (vaults, contacts, registry) is encrypted to itself under the hybrid suite —
+  post-quantum protection at rest. It can still read and write classical and
+  AES-256-GCM containers.
+- An **existing classical** identity can **upgrade in place** ("My Identity →
+  Upgrade to post-quantum"): the same X25519/Ed25519 keys are kept, fresh
+  ML-KEM-768/ML-DSA-65 keys are added, and the entire local store is re-encrypted
+  to the new identity. The migration is **crash-safe** — it bridges every store
+  file to *both* identities under the classical suite, re-seals the keystore (the
+  atomic commit point), then hardens to the new hybrid identity only, so an
+  interruption at any step never locks you out. Because the fingerprint commits
+  to the new keys, your **safety number changes**: re-share your public key so
+  contacts can re-verify.
+- Until you migrate, a classical identity is limited to the **classical
+  encryptions** (Classic and AES-256-GCM); the export picker disables Hybrid and
+  points you to the upgrade.
 
 All secret material (private keys, content keys, derived keys, passphrases,
 decrypted buffers) is held in zeroizing buffers and wiped on drop. Comparisons
@@ -89,9 +137,10 @@ The `.fsec` container layout (front to back):
 preamble  : "FSEC\x1A" | format_version (u16) | header_len (u32)
 header    : CBOR — suite id, sender public keys + fingerprint, recipient stanzas,
             nonces, lengths.  Plaintext, but bound as AAD everywhere and signed.
-manifest  : XChaCha20-Poly1305(CBOR manifest)   — encrypted tree + metadata
+manifest  : suite-AEAD(CBOR manifest)           — encrypted tree + metadata
 data      : STREAM of authenticated fixed chunks — encrypted file contents
 trailer   : Ed25519 signature over BLAKE3(everything above)
+            (hybrid suite 0x0101 appends an ML-DSA-65 signature; both required)
 ```
 
 The same format is used both for transport (export to others) and for the local
@@ -239,13 +288,15 @@ out explicitly**. Export names any unverified recipients, and the import dialog
 distinguishes a valid *signature* from a *trusted identity*, offering one-click
 verify / add-to-contacts shortcuts.
 
+**Delivered:** an opt-in hybrid post-quantum suite (X25519+ML-KEM-768,
+Ed25519+ML-DSA-65) and an AES-256-GCM suite, behind `--features pqc` — see
+[Cryptography](#cryptography-suite-0x0001-the-default) above.
+
 Planned, in dependency order:
 
-1. **Opt-in hybrid post-quantum suite** (ML-KEM-768 + ML-DSA-65) and an
-   AES-256-GCM suite — the format and dispatch are already designed for this.
-2. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
+1. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
    notarization, Windows Authenticode.
-3. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
+2. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
 
 ---
 

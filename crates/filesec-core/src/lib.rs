@@ -29,6 +29,10 @@ pub mod kdf;
 pub mod kem;
 pub mod keystore;
 pub mod manifest;
+#[cfg(feature = "pqc")]
+pub mod mldsa;
+#[cfg(feature = "pqc")]
+pub mod mlkem;
 pub mod secret;
 pub mod sign;
 pub mod suite;

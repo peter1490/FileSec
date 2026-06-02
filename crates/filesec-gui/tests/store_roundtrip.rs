@@ -206,3 +206,81 @@ fn data_dir_env_override_is_respected() {
     std::env::remove_var("FILESEC_DATA_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(feature = "pqc")]
+#[test]
+fn migrate_classical_store_to_post_quantum() {
+    use filesec_core::SuiteId;
+
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let pass = b"correct horse battery staple";
+
+    // Start with a classical identity and a populated, classical-at-rest store.
+    let old = Identity::generate("Alice", 0).unwrap();
+    store
+        .save_keystore(&KeystoreFile::create(&old, pass, fast_kdf()).unwrap())
+        .unwrap();
+    let vid = new_vault_id();
+    let mut v = Vault::new("Docs", 10);
+    v.add_file("a/b.txt", b"hello".to_vec(), None, None)
+        .unwrap();
+    // A multi-chunk file so streaming re-encryption is exercised.
+    let big: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+    v.add_file("big.bin", big.clone(), None, None).unwrap();
+    store.save_vault(&old, &vid, &v).unwrap();
+    let mut book = ContactBook::default();
+    book.upsert(Identity::generate("Bob", 0).unwrap().public(), 0);
+    store.save_contacts(&old, &book).unwrap();
+    let mut reg = Registry::default();
+    reg.upsert(VaultMeta {
+        id: vid.clone(),
+        name: "Docs".into(),
+        created_at: 10,
+        modified_at: 11,
+        file_count: 2,
+        total_size: big.len() as u64 + 5,
+    });
+    store.save_registry(&old, &reg).unwrap();
+
+    // At rest, a classical identity stores under the classical suite.
+    assert_eq!(
+        store.open_vault(&old, &vid).unwrap().suite(),
+        SuiteId::Classic
+    );
+
+    // Migrate.
+    let new = store.migrate_to_hybrid(&old, pass, fast_kdf()).unwrap();
+    assert!(new.is_hybrid_capable());
+    assert_ne!(new.fingerprint(), old.fingerprint());
+
+    // The keystore now unlocks to the new hybrid identity.
+    let reloaded = store.load_keystore().unwrap().unlock(pass).unwrap();
+    assert_eq!(reloaded.fingerprint(), new.fingerprint());
+    assert!(reloaded.is_hybrid_capable());
+
+    // Everything is readable by the new identity, content intact, and now stored
+    // under the hybrid post-quantum suite at rest.
+    assert_eq!(
+        store.open_vault(&new, &vid).unwrap().suite(),
+        SuiteId::Hybrid
+    );
+    let v2 = store.load_vault(&new, &vid).unwrap();
+    assert_eq!(&v2.get("a/b.txt").unwrap().content[..], b"hello");
+    assert_eq!(&v2.get("big.bin").unwrap().content[..], &big[..]);
+    assert_eq!(store.load_registry(&new).unwrap().vaults.len(), 1);
+    assert_eq!(store.load_contacts(&new).unwrap().contacts.len(), 1);
+
+    // The old identity can no longer open the hardened store (its fingerprint
+    // changed; the files are now addressed to the new one only).
+    assert!(store.load_vault(&old, &vid).is_err());
+
+    // A normal save under the new identity keeps it on the hybrid suite.
+    store.save_registry(&new, &reg).unwrap();
+    assert_eq!(
+        store.open_vault(&new, &vid).unwrap().suite(),
+        SuiteId::Hybrid
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

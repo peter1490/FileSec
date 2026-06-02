@@ -16,6 +16,29 @@ use filesec_core::identity::Identity;
 use filesec_core::keystore::KeystoreFile;
 use filesec_core::util::now_unix;
 use filesec_core::vault::Vault;
+use filesec_core::SuiteId;
+
+/// The algorithm suite the local at-rest store encrypts itself under for
+/// `identity`. The suite **tracks the identity**: a hybrid (post-quantum)
+/// identity stores its vaults, contacts, and registry under the hybrid suite
+/// (`0x0101`), so the local store gets post-quantum protection at rest; a
+/// classical identity stays on the classical default (`0x0001`).
+fn self_suite(identity: &Identity) -> SuiteId {
+    #[cfg(feature = "pqc")]
+    if identity.is_hybrid_capable() {
+        return SuiteId::Hybrid;
+    }
+    let _ = identity;
+    SuiteId::Classic
+}
+
+/// [`ExportOptions`] for encrypting a store file to `identity` itself.
+fn self_options(identity: &Identity) -> ExportOptions {
+    ExportOptions {
+        suite: self_suite(identity),
+        ..ExportOptions::default()
+    }
+}
 
 const KEYSTORE_FILE: &str = "keystore.fsk";
 const CONTACTS_FILE: &str = "contacts.fsec";
@@ -161,7 +184,7 @@ impl Store {
             &v,
             identity,
             &[identity.public()],
-            &ExportOptions::default(),
+            &self_options(identity),
             path,
         )
         .map_err(err)?;
@@ -220,7 +243,7 @@ impl Store {
             vault,
             identity,
             &[identity.public()],
-            &ExportOptions::default(),
+            &self_options(identity),
             &self.vault_path(id),
         )
         .map_err(err)?;
@@ -260,7 +283,7 @@ impl Store {
         if let Err(e) = reader.append_files_to_path(
             identity,
             &[identity.public()],
-            &ExportOptions::default(),
+            &self_options(identity),
             added,
             added_dirs,
             &tmp,
@@ -289,7 +312,7 @@ impl Store {
         if let Err(e) = reader.remove_paths_to_path(
             identity,
             &[identity.public()],
-            &ExportOptions::default(),
+            &self_options(identity),
             remove,
             &tmp,
         ) {
@@ -321,7 +344,7 @@ impl Store {
         if let Err(e) = reader.replace_file_to_path(
             identity,
             &[identity.public()],
-            &ExportOptions::default(),
+            &self_options(identity),
             vault_path,
             new_source,
             mtime,
@@ -350,7 +373,7 @@ impl Store {
         if let Err(e) = reader.reexport_to_path(
             identity,
             &[identity.public()],
-            &ExportOptions::default(),
+            &self_options(identity),
             &path,
         ) {
             let _ = std::fs::remove_file(&path);
@@ -402,6 +425,111 @@ impl Store {
                 let _ = secure_wipe(&entry.path());
             }
         }
+    }
+
+    /// Every self-encrypted store file that currently exists: the registry, the
+    /// contact book, and each vault container. (The keystore is *not* one of
+    /// these — it is passphrase-sealed, not encrypted to the identity.)
+    #[cfg(feature = "pqc")]
+    fn self_encrypted_files(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for p in [self.index_path(), self.contacts_path()] {
+            if p.exists() {
+                paths.push(p);
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                // Only finished `.fsec` vaults — never a stray `*.tmp` from an
+                // interrupted write or migration.
+                if p.extension().and_then(|s| s.to_str()) == Some("fsec") {
+                    paths.push(p);
+                }
+            }
+        }
+        paths
+    }
+
+    /// Re-encrypt every self-encrypted store file so it is signed by `opener` and
+    /// addressed to `recipients` under `options`. Each file is rewritten atomically
+    /// (temp + rename).
+    #[cfg(feature = "pqc")]
+    fn reencrypt_all(
+        &self,
+        opener: &Identity,
+        recipients: &[filesec_core::PublicIdentity],
+        options: &ExportOptions,
+    ) -> StoreResult<()> {
+        for path in self.self_encrypted_files() {
+            let reader = format::open_vault_from_path(&path, opener).map_err(err)?;
+            let tmp = path.with_extension("migrate-tmp");
+            if let Err(e) = reader.reexport_to_path(opener, recipients, options, &tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(err(e));
+            }
+            std::fs::rename(&tmp, &path).map_err(err)?;
+            harden_file(&path);
+        }
+        Ok(())
+    }
+
+    /// Migrate a classical identity to a hybrid (post-quantum) one, re-encrypting
+    /// the entire local store to the new identity. Returns the new identity.
+    ///
+    /// **Crash-safe by construction.** Re-sealing the keystore is the atomic
+    /// commit point; before it every store file is readable by *both* identities,
+    /// and after it by the *new* one — so an interruption at any step never locks
+    /// you out:
+    ///
+    /// 1. **Bridge** — re-encrypt every store file to `[old, new]` under the
+    ///    classical suite. Both identities can open it, and the keystore still
+    ///    holds `old`, so a crash here leaves everything openable by `old`
+    ///    (re-running the migration is safe).
+    /// 2. **Commit** — re-seal the keystore to `new`. After this the app is hybrid
+    ///    and the bridged files (which list `new` as a recipient) all open.
+    /// 3. **Harden** — re-encrypt every store file to `[new]` only under the
+    ///    hybrid suite, giving post-quantum protection at rest. If interrupted
+    ///    here, `new` still opens every file and a later normal save (which uses
+    ///    [`self_options`]) finishes upgrading any stragglers.
+    ///
+    /// The new identity has a **new fingerprint** — the caller must re-share its
+    /// public key and have contacts re-verify the new safety number. Any `.fsec`
+    /// addressed to the *old* fingerprint that has not been imported yet should be
+    /// imported before migrating.
+    #[cfg(feature = "pqc")]
+    pub fn migrate_to_hybrid(
+        &self,
+        old: &Identity,
+        passphrase: &[u8],
+        kdf: filesec_core::kdf::KdfParams,
+    ) -> StoreResult<Identity> {
+        if old.is_hybrid_capable() {
+            return Err("this identity is already post-quantum".to_string());
+        }
+        let new = old.upgraded_to_hybrid().map_err(err)?;
+
+        // 1. Bridge: classical suite, addressed to both identities.
+        let bridge = [old.public(), new.public()];
+        let classic = ExportOptions {
+            suite: SuiteId::Classic,
+            ..ExportOptions::default()
+        };
+        self.reencrypt_all(old, &bridge, &classic)?;
+
+        // 2. Commit: the keystore now holds the hybrid identity.
+        let ks = KeystoreFile::create(&new, passphrase, kdf).map_err(err)?;
+        self.save_keystore(&ks)?;
+
+        // 3. Harden: hybrid suite, addressed to the new identity only.
+        let new_only = [new.public()];
+        let hybrid = ExportOptions {
+            suite: SuiteId::Hybrid,
+            ..ExportOptions::default()
+        };
+        self.reencrypt_all(&new, &new_only, &hybrid)?;
+
+        Ok(new)
     }
 }
 

@@ -96,15 +96,40 @@ fn envelope_two_party_key_agreement() {
     // The X25519 envelope: a content key wrapped to Bob can only be recovered
     // with Bob's private identity.
     use filesec_core::envelope::{unwrap_with_identity, wrap_for_recipient};
+    use filesec_core::SuiteId;
     let bob = Identity::generate("Bob", 0).unwrap();
     let mallory = Identity::generate("Mallory", 0).unwrap();
     let cek = SymKey::random().unwrap();
-    let stanza = wrap_for_recipient(&cek, &bob.public()).unwrap();
+    let stanza = wrap_for_recipient(&cek, &bob.public(), SuiteId::Classic).unwrap();
 
     let recovered = unwrap_with_identity(&stanza, &bob).unwrap();
     assert_eq!(recovered.as_bytes(), cek.as_bytes());
 
     assert!(unwrap_with_identity(&stanza, &mallory).is_err());
+}
+
+#[test]
+fn suite_parsing_respects_feature_gate() {
+    use filesec_core::SuiteId;
+    assert_eq!(SuiteId::from_u16(0x0001).unwrap(), SuiteId::Classic);
+    assert!(SuiteId::from_u16(0x9999).is_err());
+    // The post-quantum suites parse only when this build can perform them.
+    #[cfg(feature = "pqc")]
+    {
+        assert!(SuiteId::from_u16(0x0002).is_ok());
+        assert!(SuiteId::from_u16(0x0101).is_ok());
+    }
+    #[cfg(not(feature = "pqc"))]
+    {
+        assert!(matches!(
+            SuiteId::from_u16(0x0002),
+            Err(Error::UnsupportedSuite(0x0002))
+        ));
+        assert!(matches!(
+            SuiteId::from_u16(0x0101),
+            Err(Error::UnsupportedSuite(0x0101))
+        ));
+    }
 }
 
 #[test]
