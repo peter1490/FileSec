@@ -1,7 +1,7 @@
 //! Unit-level tests for the cryptographic primitives and key/identity stores.
 
 use filesec_core::aead::{decrypt_stream, encrypt_stream, open, seal, NONCE_LEN, STREAM_NONCE_LEN};
-use filesec_core::contacts::{ContactBook, Trust};
+use filesec_core::contacts::{ContactBook, Trust, UpsertOutcome};
 use filesec_core::identity::Identity;
 use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::KeystoreFile;
@@ -158,21 +158,135 @@ fn contact_book_roundtrip_trust_and_upsert() {
     let fpr = id.fingerprint();
 
     let mut book = ContactBook::default();
-    book.upsert(id.public(), 100);
-    assert_eq!(book.find(&fpr).unwrap().trust, Trust::Unverified);
+    assert_eq!(book.upsert(id.public(), 100), UpsertOutcome::Added);
+    let c = book.find(&fpr).unwrap();
+    assert_eq!(c.trust, Trust::Unverified);
+    assert_eq!(c.verified_at, None);
 
-    assert!(book.set_trust(&fpr, Trust::Verified));
+    assert!(book.set_trust(&fpr, Trust::Verified, 150));
+    assert_eq!(book.find(&fpr).unwrap().verified_at, Some(150));
 
     let bytes = book.to_bytes().unwrap();
     let mut parsed = ContactBook::from_bytes(&bytes).unwrap();
+    let c = parsed.find(&fpr).unwrap();
+    assert_eq!(c.trust, Trust::Verified);
+    assert_eq!(c.verified_at, Some(150));
+
+    // Re-importing the same key with the same name changes nothing and must not
+    // silently reset verified trust.
+    assert_eq!(parsed.upsert(id.public(), 200), UpsertOutcome::Unchanged);
     assert_eq!(parsed.find(&fpr).unwrap().trust, Trust::Verified);
 
-    // Re-importing the same key must not silently reset verified trust.
-    parsed.upsert(id.public(), 200);
-    assert_eq!(parsed.find(&fpr).unwrap().trust, Trust::Verified);
+    // Dropping back to unverified clears the verification timestamp.
+    assert!(parsed.set_trust(&fpr, Trust::Unverified, 300));
+    assert_eq!(parsed.find(&fpr).unwrap().verified_at, None);
 
     assert!(parsed.remove(&fpr));
     assert!(parsed.find(&fpr).is_none());
+}
+
+#[test]
+fn contact_book_loads_without_verified_at_field() {
+    // A contact book written before the `verified_at` field existed must still
+    // deserialize, defaulting the missing field to `None`. We reproduce the old
+    // on-disk shape with a struct that lacks the field.
+    #[derive(serde::Serialize)]
+    struct OldContact {
+        identity: PublicIdentity,
+        trust: Trust,
+        added_at: i64,
+    }
+    #[derive(serde::Serialize)]
+    struct OldBook {
+        contacts: Vec<OldContact>,
+    }
+
+    let id = Identity::generate("Bob", 7).unwrap();
+    let fpr = id.fingerprint();
+    let old = OldBook {
+        contacts: vec![OldContact {
+            identity: id.public(),
+            trust: Trust::Verified,
+            added_at: 42,
+        }],
+    };
+    let bytes = filesec_core::codec::to_vec(&old).unwrap();
+
+    let book = ContactBook::from_bytes(&bytes).unwrap();
+    let c = book.find(&fpr).unwrap();
+    assert_eq!(c.trust, Trust::Verified);
+    assert_eq!(c.added_at, 42);
+    assert_eq!(c.verified_at, None);
+}
+
+#[test]
+fn upsert_reports_renames_and_preserves_verification() {
+    let id = Identity::generate("Alice", 1).unwrap();
+    let fpr = id.fingerprint();
+    let mut book = ContactBook::default();
+    book.upsert(id.public(), 0);
+    assert!(book.set_trust(&fpr, Trust::Verified, 10));
+
+    // Re-import the *same keys* under a different display name: the keys (and so
+    // the verification) are unchanged, but the rename is reported.
+    let mut renamed = id.public();
+    renamed.name = "Alice (work)".into();
+    assert_eq!(
+        book.upsert(renamed, 20),
+        UpsertOutcome::Renamed {
+            old: "Alice".into(),
+            new: "Alice (work)".into(),
+            was_verified: true,
+        }
+    );
+    let c = book.find(&fpr).unwrap();
+    assert_eq!(c.identity.name, "Alice (work)");
+    assert_eq!(c.trust, Trust::Verified);
+}
+
+#[test]
+fn safety_number_matching_is_forgiving() {
+    let id = Identity::generate("Bob", 7).unwrap();
+    let pubid = id.public();
+    let sn = pubid.safety_number();
+
+    // The canonical rendering matches itself.
+    assert!(pubid.safety_number_matches(&sn));
+    // Spacing, case, and dashes are ignored when comparing.
+    assert!(pubid.safety_number_matches(&sn.replace('-', " ").to_lowercase()));
+    assert!(pubid.safety_number_matches(&format!("  {sn}\n")));
+    // Empty input never counts as a match.
+    assert!(!pubid.safety_number_matches(""));
+    assert!(!pubid.safety_number_matches("   "));
+    // A different identity's number does not match.
+    let other = Identity::generate("Eve", 7).unwrap().public();
+    assert!(!pubid.safety_number_matches(&other.safety_number()));
+}
+
+#[test]
+fn from_pasted_accepts_armored_and_bare_base64() {
+    let id = Identity::generate("Bob", 7).unwrap();
+    let pubid = id.public();
+    let armored = pubid.to_armored().unwrap();
+
+    // Full armored block.
+    assert_eq!(
+        PublicIdentity::from_pasted(&armored).unwrap().fingerprint(),
+        pubid.fingerprint()
+    );
+    // Bare base64 body, armor lines stripped — what survives a lossy copy/paste.
+    let bare: String = armored
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        PublicIdentity::from_pasted(&bare).unwrap().fingerprint(),
+        pubid.fingerprint()
+    );
+    // Garbage is rejected.
+    assert!(PublicIdentity::from_pasted("hello there").is_err());
+    assert!(PublicIdentity::from_pasted("").is_err());
 }
 
 #[test]

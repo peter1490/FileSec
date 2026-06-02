@@ -56,6 +56,17 @@ impl PublicIdentity {
         util::safety_number(&self.fingerprint())
     }
 
+    /// Whether `candidate` — as a human typed or pasted it while comparing
+    /// out-of-band, with arbitrary spacing, dashes, or letter case — equals this
+    /// identity's safety number. Empty/whitespace-only input never matches, so a
+    /// blank field can't be mistaken for a confirmed comparison. Both values are
+    /// public, so a plain (non-constant-time) comparison is fine here.
+    #[must_use]
+    pub fn safety_number_matches(&self, candidate: &str) -> bool {
+        let got = util::normalize_safety_number(candidate);
+        !got.is_empty() && got == util::normalize_safety_number(&self.safety_number())
+    }
+
     /// Encode as compact CBOR bytes (the `.fsecpub` file body).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         codec::to_vec(self)
@@ -105,6 +116,33 @@ impl PublicIdentity {
         let bytes = data_encoding::BASE64
             .decode(body.as_bytes())
             .map_err(|_| Error::Format("invalid base64 in armored key"))?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Parse a public key from text a human pasted, being forgiving about what
+    /// exactly they copied. Accepts a full armored block, or a bare base64 body
+    /// with the armor lines and/or surrounding whitespace missing (people often
+    /// copy just the middle, or lose the `-----` lines to a chat client). Tries
+    /// the strict armored form first, then falls back to decoding the remaining
+    /// text as base64 (padded or not).
+    pub fn from_pasted(text: &str) -> Result<Self> {
+        if let Ok(id) = Self::from_armored(text) {
+            return Ok(id);
+        }
+        // Strip any armor delimiter lines and whitespace, then treat the rest as
+        // a bare base64 body.
+        let body: String = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+            .collect();
+        if body.is_empty() {
+            return Err(Error::Format("no public key found"));
+        }
+        let bytes = data_encoding::BASE64
+            .decode(body.as_bytes())
+            .or_else(|_| data_encoding::BASE64_NOPAD.decode(body.as_bytes()))
+            .map_err(|_| Error::Format("not a recognizable public key"))?;
         Self::from_bytes(&bytes)
     }
 }

@@ -144,14 +144,20 @@ The `filesec` binary is self-contained (single executable per OS).
 
 1. **Both** parties open FileSec and create an identity (name + passphrase).
 2. On **My Identity**, each copies/saves their public key and sends it to the
-   other (any channel). Each imports the other under **Contacts**, then compares
-   the **safety number** out-of-band (in person / phone) and marks it *verified*.
+   other (any channel). Each pastes or loads the other's key under **Contacts**
+   and gets a **preview** (name, fingerprint, safety number, and whether it's
+   new / already known / their own key) before confirming. They then open
+   **Verify…**, compare the **safety number** out-of-band (in person / phone) —
+   typing it back so the app checks the match, or ticking "I compared it myself"
+   — and mark the contact *verified* (the date is recorded).
 3. The sender creates a **vault**, adds files/folders, clicks **Send…**, selects
-   the recipient, and saves the `.fsec`.
+   the recipient, and saves the `.fsec`. If any selected recipient is still
+   unverified, the dialog names them and warns before export.
 4. The recipient clicks **Import .fsec…**. FileSec verifies the sender's
-   signature, shows who sent it and whether they're a verified contact, and adds
-   the decrypted vault locally. From the vault they can **Extract all…** or
-   **Save as…** individual files.
+   signature, shows who sent it and whether they're a verified contact — with a
+   one-click **Verify sender…** (known but unverified) or **Add sender to
+   contacts…** (unknown) shortcut — and adds the decrypted vault locally. From
+   the vault they can **Extract all…** or **Save as…** individual files.
 
 ---
 
@@ -168,7 +174,9 @@ The security-critical logic lives in `filesec-core` and is covered by:
 - Path-traversal defense (`..`, absolute paths, backslashes, control chars).
 - AEAD one-shot + streaming correctness and AAD/key binding; the X25519 envelope;
   Argon2id keystore unlock (incl. wrong-passphrase); contacts and armored-key
-  round-trips.
+  round-trips; lenient safety-number matching; forgiving paste parsing (armored
+  or bare base64); upsert rename/verification reporting; and that a contact book
+  written before the `verified_at` field still loads.
 - GUI persistence layer: keystore/vault/registry/contacts round-trips,
   confidentiality (a different identity cannot read your self-encrypted vault),
   and filesystem extraction — all without opening a window.
@@ -217,14 +225,27 @@ already running the wipe waits until that whole app quits (the leave-the-vault
 backstop still covers it); on Linux there is no blocking launcher, so views are
 wiped on leaving the vault rather than on close.
 
+**Trust-UX polish** (the verification workflow): adding a contact is now a
+preview-then-confirm step — paste an armored block *or* a bare base64 body (the
+parser is forgiving of lost armor lines and stray whitespace), or load a
+`.fsecpub` file, and FileSec shows the name, fingerprint, and safety number plus
+whether the key is new, already known, your own, or a rename of an existing
+contact *before* anything is saved. A dedicated **Verify…** dialog shows the
+safety number and lets you type back what the other party reads (compared
+leniently — case, spacing, and grouping dashes are ignored) or confirm a manual
+comparison; verification records its date. Re-importing a key never silently
+re-trusts or downgrades a contact, and **renaming a verified contact is called
+out explicitly**. Export names any unverified recipients, and the import dialog
+distinguishes a valid *signature* from a *trusted identity*, offering one-click
+verify / add-to-contacts shortcuts.
+
 Planned, in dependency order:
 
-1. **Trust-UX polish** — richer verification flow and armored-key paste niceties.
-2. **Opt-in hybrid post-quantum suite** (ML-KEM-768 + ML-DSA-65) and an
+1. **Opt-in hybrid post-quantum suite** (ML-KEM-768 + ML-DSA-65) and an
    AES-256-GCM suite — the format and dispatch are already designed for this.
-3. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
+2. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
    notarization, Windows Authenticode.
-4. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
+3. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
 
 ---
 

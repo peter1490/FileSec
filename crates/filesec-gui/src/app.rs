@@ -16,9 +16,9 @@ use std::time::UNIX_EPOCH;
 use eframe::egui::{self, Color32, RichText};
 use zeroize::{Zeroize, Zeroizing};
 
-use filesec_core::contacts::{ContactBook, Trust};
+use filesec_core::contacts::{ContactBook, Trust, UpsertOutcome};
 use filesec_core::format::{self, ExportOptions, VaultReader};
-use filesec_core::identity::Identity;
+use filesec_core::identity::{Identity, PublicIdentity};
 use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::KeystoreFile;
 use filesec_core::manifest::EntryKind;
@@ -29,6 +29,7 @@ use crate::store::{new_vault_id, Registry, Store, VaultMeta};
 
 const OK_GREEN: Color32 = Color32::from_rgb(0x3c, 0xb3, 0x71);
 const ERR_RED: Color32 = Color32::from_rgb(0xd6, 0x5d, 0x5d);
+const WARN_AMBER: Color32 = Color32::from_rgb(0xd6, 0xa5, 0x4d);
 const MUTED: Color32 = Color32::from_rgb(0x99, 0x99, 0x99);
 const ACCENT: Color32 = Color32::from_rgb(0x5a, 0x9b, 0xd4);
 
@@ -131,11 +132,51 @@ struct ExportForm {
 }
 
 struct ImportInfo {
+    /// The verified sender's public identity (name field is empty — the
+    /// trustworthy name comes from the contact book, below).
+    sender: PublicIdentity,
     sender_fpr_hex: String,
+    /// Display name from the contact book, if the sender is a known contact.
     sender_name: Option<String>,
     verified: bool,
     vault_name: String,
     file_count: usize,
+}
+
+/// A public key that has been parsed but not yet added to the contact book,
+/// shown for confirmation so the user can eyeball exactly who they're about to
+/// trust (and so self/duplicate/rename surprises surface *before* the save).
+struct ContactPreview {
+    pubid: PublicIdentity,
+    status: PreviewStatus,
+}
+
+/// How a previewed key relates to what's already in the contact book.
+enum PreviewStatus {
+    /// Not currently a contact — adding it is a plain insert.
+    New,
+    /// Already a contact under the same display name.
+    Existing { verified: bool },
+    /// Already a contact, but the pasted key carries a different display name.
+    /// Renaming a *verified* contact is the notable case (the keys are
+    /// unchanged, so verification still holds, but it's worth a second look).
+    Renamed { old: String, verified: bool },
+    /// This is the user's own public key — adding yourself is pointless.
+    SelfKey,
+}
+
+/// State backing the per-contact verification dialog: the user compares this
+/// safety number with the contact out-of-band, optionally typing what they read
+/// back so the app checks the match for them.
+struct VerifyForm {
+    fpr_hex: String,
+    name: String,
+    /// Canonical safety number, for display.
+    safety_number: String,
+    /// What the user types/pastes from the other party (compared leniently).
+    input: String,
+    /// "I compared it myself and it matches" — an alternative to typing it in.
+    manual_ok: bool,
 }
 
 /// Unlocked session state. The identity is reference-counted so it can be
@@ -152,6 +193,10 @@ struct Session {
     show_new_vault: bool,
     new_folder_name: String,
     contact_paste: String,
+    /// A parsed key staged for confirmation before it joins the contact book.
+    contact_preview: Option<ContactPreview>,
+    /// The currently-open verification dialog, if any.
+    verify: Option<VerifyForm>,
     export: Option<ExportForm>,
     last_import: Option<ImportInfo>,
     data_dir: String,
@@ -176,6 +221,8 @@ impl Session {
             show_new_vault: false,
             new_folder_name: String::new(),
             contact_paste: String::new(),
+            contact_preview: None,
+            verify: None,
             export: None,
             last_import: None,
             data_dir,
@@ -210,10 +257,23 @@ enum Action {
     DoExport,
     ToggleRecipient(String),
     ToggleIncludeSelf,
-    ImportContactPaste,
-    ImportContactFile,
+    /// Parse the paste box / a picked file into a staged [`ContactPreview`].
+    PreviewContactPaste,
+    PreviewContactFile,
+    /// Commit the staged preview into the contact book.
+    ConfirmAddContact,
+    CancelPreview,
+    /// Open the verification dialog for a contact (by hex fingerprint).
+    BeginVerify(String),
+    /// Copy the safety number shown in the verification dialog.
+    CopyVerifySafetyNumber,
+    /// Finish verification — mark the contact verified and close the dialog.
+    ConfirmVerify(String),
+    CancelVerify,
     SetTrust(String, Trust),
     RemoveContact(String),
+    /// Stage the just-imported container's (unknown) sender for adding.
+    AddSenderToContacts,
     CopyPubKey,
     SavePubKey,
     DismissImportInfo,
@@ -268,7 +328,8 @@ struct SessionInit {
 /// thread against the live contact book).
 struct ImportData {
     registry: Registry,
-    sender_fpr: [u8; 32],
+    /// The cryptographically-verified sender (name field empty).
+    sender: PublicIdentity,
     vault_name: String,
     file_count: usize,
 }
@@ -616,12 +677,14 @@ impl App {
             }
             Outcome::Imported(data) => {
                 if let State::Unlocked(s) = &mut self.state {
-                    let contact = s.contacts.find(&data.sender_fpr);
+                    let fpr = data.sender.fingerprint();
+                    let contact = s.contacts.find(&fpr);
                     let sender_name = contact.map(|c| c.identity.name.clone());
                     let verified = matches!(contact.map(|c| c.trust), Some(Trust::Verified));
                     s.registry = data.registry;
                     s.last_import = Some(ImportInfo {
-                        sender_fpr_hex: hex(&data.sender_fpr),
+                        sender: data.sender,
+                        sender_fpr_hex: hex(&fpr),
                         sender_name,
                         verified,
                         vault_name: data.vault_name,
@@ -738,6 +801,36 @@ impl App {
                     None => {}
                 }
             }
+            Action::CancelPreview => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.contact_preview = None;
+                }
+            }
+            Action::CancelVerify => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.verify = None;
+                }
+            }
+            Action::BeginVerify(fpr_hex) => self.begin_verify(fpr_hex),
+            Action::CopyVerifySafetyNumber => {
+                if let State::Unlocked(s) = &self.state {
+                    if let Some(v) = &s.verify {
+                        ctx.copy_text(v.safety_number.clone());
+                        self.set_toast("Safety number copied to clipboard.", false);
+                    }
+                }
+            }
+            Action::AddSenderToContacts => {
+                // Stage the just-imported container's sender (an unknown party)
+                // for confirmation, then close the import dialog behind it.
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(sender) = s.last_import.as_ref().map(|i| i.sender.clone()) {
+                        let preview = build_contact_preview(s, sender);
+                        s.contact_preview = Some(preview);
+                        s.last_import = None;
+                    }
+                }
+            }
             // --- background jobs ---
             Action::CreateIdentity => self.spawn_create_identity(ctx),
             Action::Unlock => self.spawn_unlock(ctx),
@@ -756,8 +849,10 @@ impl App {
             Action::Discard => self.spawn_discard(ctx),
             Action::ImportContainer => self.spawn_import(ctx),
             Action::DoExport => self.spawn_export(ctx),
-            Action::ImportContactPaste => self.spawn_import_contact_paste(ctx),
-            Action::ImportContactFile => self.spawn_import_contact_file(ctx),
+            Action::PreviewContactPaste => self.preview_contact_paste(),
+            Action::PreviewContactFile => self.preview_contact_file(),
+            Action::ConfirmAddContact => self.spawn_confirm_add_contact(ctx),
+            Action::ConfirmVerify(fpr) => self.confirm_verify(ctx, fpr),
             Action::SetTrust(fpr, t) => self.spawn_set_trust(ctx, fpr, t),
             Action::RemoveContact(fpr) => self.spawn_remove_contact(ctx, fpr),
             Action::SavePubKey => self.spawn_save_pubkey(ctx),
@@ -1551,7 +1646,7 @@ impl App {
             JobReport {
                 outcome: Outcome::Imported(Box::new(ImportData {
                     registry,
-                    sender_fpr: sender.fingerprint,
+                    sender: sender.public(),
                     vault_name: reader.name().to_string(),
                     file_count: reader.file_count(),
                 })),
@@ -1631,29 +1726,83 @@ impl App {
         });
     }
 
-    fn spawn_import_contact_paste(&mut self, ctx: &egui::Context) {
+    /// Parse the paste box into a staged [`ContactPreview`] (no disk I/O, so it
+    /// runs inline rather than on the worker). The user confirms from the
+    /// preview window before anything is saved.
+    fn preview_contact_paste(&mut self) {
         let text = match &self.state {
             State::Unlocked(s) => s.contact_paste.trim().to_string(),
             _ => return,
         };
         if text.is_empty() {
-            self.set_toast("Paste an armored public key first.", true);
+            self.set_toast("Paste a public key first.", true);
             return;
         }
-        let pubid = match filesec_core::PublicIdentity::from_armored(&text) {
-            Ok(p) => p,
+        match PublicIdentity::from_pasted(&text) {
+            Ok(pubid) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.contact_preview = Some(build_contact_preview(s, pubid));
+                }
+            }
+            Err(e) => self.set_toast(format!("Couldn't read that key: {e}"), true),
+        }
+    }
+
+    /// Pick a `.fsecpub` file and stage it as a [`ContactPreview`]. Reading a
+    /// small key file inline keeps the confirm-before-save flow simple.
+    fn preview_contact_file(&mut self) {
+        let path = match rfd::FileDialog::new()
+            .add_filter("FileSec public key", &["fsecpub"])
+            .pick_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
             Err(e) => {
                 self.set_toast(e.to_string(), true);
                 return;
             }
         };
-        if let State::Unlocked(s) = &mut self.state {
-            s.contact_paste.clear();
+        // Accept the compact CBOR body or an armored/base64 text export.
+        let parsed = PublicIdentity::from_bytes(&bytes).or_else(|_| {
+            String::from_utf8(bytes)
+                .map_err(|_| filesec_core::Error::Format("not a public key"))
+                .and_then(|t| PublicIdentity::from_pasted(&t))
+        });
+        match parsed {
+            Ok(pubid) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.contact_preview = Some(build_contact_preview(s, pubid));
+                }
+            }
+            Err(e) => self.set_toast(format!("Couldn't read that key: {e}"), true),
         }
+    }
+
+    /// Commit the staged preview into the contact book (worker side persists the
+    /// re-encrypted book). Refuses to add the user's own key.
+    fn spawn_confirm_add_contact(&mut self, ctx: &egui::Context) {
+        let pubid = match &self.state {
+            State::Unlocked(s) => match &s.contact_preview {
+                Some(p) if matches!(p.status, PreviewStatus::SelfKey) => {
+                    self.set_toast("That's your own key — no need to add yourself.", true);
+                    return;
+                }
+                Some(p) => p.pubid.clone(),
+                None => return,
+            },
+            _ => return,
+        };
         let contacts = match &self.state {
             State::Unlocked(s) => s.contacts.clone(),
             _ => return,
         };
+        if let State::Unlocked(s) = &mut self.state {
+            s.contact_preview = None;
+            s.contact_paste.clear();
+        }
         let (store, identity) = match (self.store_arc(), self.ident_arc()) {
             (Some(s), Some(i)) => (s, i),
             _ => return,
@@ -1663,37 +1812,41 @@ impl App {
         });
     }
 
-    fn spawn_import_contact_file(&mut self, ctx: &egui::Context) {
-        let path = match rfd::FileDialog::new()
-            .add_filter("FileSec public key", &["fsecpub"])
-            .pick_file()
-        {
-            Some(p) => p,
-            None => return,
-        };
-        let contacts = match &self.state {
-            State::Unlocked(s) => s.contacts.clone(),
-            _ => return,
-        };
-        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
-            (Some(s), Some(i)) => (s, i),
-            _ => return,
-        };
-        self.spawn_job(ctx, "Importing contact…", move || {
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => return JobReport::err(e.to_string()),
-            };
-            let pubid = filesec_core::PublicIdentity::from_bytes(&bytes).or_else(|_| {
-                String::from_utf8(bytes.clone())
-                    .map_err(|_| filesec_core::Error::Format("not a public key"))
-                    .and_then(|t| filesec_core::PublicIdentity::from_armored(&t))
-            });
-            match pubid {
-                Ok(p) => import_contact_job(&store, &identity, contacts, p),
-                Err(e) => JobReport::err(e.to_string()),
+    /// Open the verification dialog for a contact identified by hex fingerprint.
+    fn begin_verify(&mut self, fpr_hex: String) {
+        let fpr = match decode_fpr(&fpr_hex) {
+            Some(f) => f,
+            None => {
+                self.set_toast("Bad fingerprint.", true);
+                return;
             }
-        });
+        };
+        if let State::Unlocked(s) = &mut self.state {
+            if let Some(c) = s.contacts.find(&fpr) {
+                let name = if c.identity.name.is_empty() {
+                    "(unnamed)".to_string()
+                } else {
+                    c.identity.name.clone()
+                };
+                s.verify = Some(VerifyForm {
+                    fpr_hex,
+                    name,
+                    safety_number: c.identity.safety_number(),
+                    input: String::new(),
+                    manual_ok: false,
+                });
+                // If verification was launched from the import dialog, close it.
+                s.last_import = None;
+            }
+        }
+    }
+
+    /// Finish verification: close the dialog and mark the contact verified.
+    fn confirm_verify(&mut self, ctx: &egui::Context, fpr_hex: String) {
+        if let State::Unlocked(s) = &mut self.state {
+            s.verify = None;
+        }
+        self.spawn_set_trust(ctx, fpr_hex, Trust::Verified);
     }
 
     fn spawn_set_trust(&mut self, ctx: &egui::Context, fpr_hex: String, trust: Trust) {
@@ -1714,7 +1867,7 @@ impl App {
         };
         self.spawn_job(ctx, "Saving…", move || {
             let mut contacts = contacts;
-            contacts.set_trust(&fpr, trust);
+            contacts.set_trust(&fpr, trust, now_unix());
             match store.save_contacts(&identity, &contacts) {
                 Ok(()) => JobReport::ok(
                     Outcome::Contacts(contacts),
@@ -1837,26 +1990,72 @@ fn finalize_after_save(
     }
 }
 
-/// Upsert a contact and persist the book (worker side).
+/// Upsert a contact and persist the book (worker side). The toast reflects what
+/// actually happened (a fresh add vs. a re-import vs. a rename) so re-importing
+/// a key never looks like it silently re-trusted it.
 fn import_contact_job(
     store: &Store,
     identity: &Identity,
     mut contacts: ContactBook,
-    pubid: filesec_core::PublicIdentity,
+    pubid: PublicIdentity,
 ) -> JobReport {
     let name = if pubid.name.is_empty() {
         "(unnamed)".to_string()
     } else {
         pubid.name.clone()
     };
-    contacts.upsert(pubid, now_unix());
+    let outcome = contacts.upsert(pubid, now_unix());
+    let msg = match outcome {
+        UpsertOutcome::Added => {
+            format!("Added \"{name}\". Verify their safety number before trusting.")
+        }
+        UpsertOutcome::Unchanged => format!("\"{name}\" is already a contact — nothing changed."),
+        UpsertOutcome::Renamed {
+            old, was_verified, ..
+        } => {
+            if was_verified {
+                format!(
+                    "Renamed verified contact \"{old}\" → \"{name}\" (keys unchanged; still verified)."
+                )
+            } else {
+                format!("Updated contact name \"{old}\" → \"{name}\".")
+            }
+        }
+    };
     match store.save_contacts(identity, &contacts) {
-        Ok(()) => JobReport::ok(
-            Outcome::Contacts(contacts),
-            format!("Imported contact \"{name}\". Verify their safety number before trusting."),
-        ),
+        Ok(()) => JobReport::ok(Outcome::Contacts(contacts), msg),
         Err(e) => JobReport::err(e),
     }
+}
+
+/// Classify a parsed key against the current session: is it the user's own key,
+/// already a contact (possibly under a different name), or brand new?
+fn build_contact_preview(s: &Session, pubid: PublicIdentity) -> ContactPreview {
+    let status = if pubid.fingerprint() == s.identity.public().fingerprint() {
+        PreviewStatus::SelfKey
+    } else {
+        match s.contacts.find(&pubid.fingerprint()) {
+            None => PreviewStatus::New,
+            Some(c) => {
+                let verified = c.trust == Trust::Verified;
+                // A name change only matters when both names are present; filling
+                // in a blank name (e.g. a key first learned from a container) is
+                // not a "rename" worth warning about.
+                if c.identity.name == pubid.name
+                    || pubid.name.is_empty()
+                    || c.identity.name.is_empty()
+                {
+                    PreviewStatus::Existing { verified }
+                } else {
+                    PreviewStatus::Renamed {
+                        old: c.identity.name.clone(),
+                        verified,
+                    }
+                }
+            }
+        }
+    };
+    ContactPreview { pubid, status }
 }
 
 // ---------------------------------------------------------------------------
@@ -1943,6 +2142,12 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     }
     if s.last_import.is_some() {
         import_info_window(s, ui.ctx(), action);
+    }
+    if s.contact_preview.is_some() {
+        contact_preview_window(s, ui.ctx(), action);
+    }
+    if s.verify.is_some() {
+        verify_window(s, ui.ctx(), action);
     }
 }
 
@@ -2176,19 +2381,26 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
     egui::CollapsingHeader::new("Add a contact")
         .default_open(s.contacts.contacts.is_empty())
         .show(ui, |ui| {
-            if ui.button("Import from .fsecpub file…").clicked() {
-                *action = Some(Action::ImportContactFile);
+            if ui.button("Load from .fsecpub file…").clicked() {
+                *action = Some(Action::PreviewContactFile);
             }
-            ui.label("…or paste an armored public key:");
+            ui.label("…or paste a public key:");
             ui.add(
                 egui::TextEdit::multiline(&mut s.contact_paste)
                     .desired_rows(4)
                     .desired_width(f32::INFINITY)
                     .hint_text("-----BEGIN FILESEC PUBLIC KEY-----"),
             );
-            if ui.button("Import pasted key").clicked() {
-                *action = Some(Action::ImportContactPaste);
+            if ui.button("Preview key…").clicked() {
+                *action = Some(Action::PreviewContactPaste);
             }
+            ui.label(
+                RichText::new(
+                    "You'll see who the key belongs to and can confirm before it's added.",
+                )
+                .color(MUTED)
+                .small(),
+            );
         });
 
     ui.separator();
@@ -2201,11 +2413,16 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
         let contacts = s.contacts.contacts.clone();
         for c in contacts {
             let fpr_hex = hex(&c.fingerprint());
+            let display_name = if c.identity.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &c.identity.name
+            };
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(&c.identity.name).strong());
+                            ui.label(RichText::new(display_name).strong());
                             match c.trust {
                                 Trust::Verified => ui.colored_label(OK_GREEN, "✔ verified"),
                                 Trust::Unverified => ui.colored_label(ERR_RED, "● unverified"),
@@ -2217,6 +2434,13 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                                 .color(MUTED)
                                 .small(),
                         );
+                        if let (Trust::Verified, Some(t)) = (c.trust, c.verified_at) {
+                            ui.label(
+                                RichText::new(format!("verified {}", fmt_date(t)))
+                                    .color(MUTED)
+                                    .small(),
+                            );
+                        }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Remove").clicked() {
@@ -2230,9 +2454,8 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                                 }
                             }
                             Trust::Unverified => {
-                                if ui.small_button("Mark verified").clicked() {
-                                    *action =
-                                        Some(Action::SetTrust(fpr_hex.clone(), Trust::Verified));
+                                if ui.small_button("Verify…").clicked() {
+                                    *action = Some(Action::BeginVerify(fpr_hex.clone()));
                                 }
                             }
                         }
@@ -2309,9 +2532,14 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                 for c in &s.contacts.contacts {
                     let fpr_hex = hex(&c.fingerprint());
                     let mut checked = form.selected.contains(&fpr_hex);
+                    let name = if c.identity.name.is_empty() {
+                        "(unnamed)"
+                    } else {
+                        c.identity.name.as_str()
+                    };
                     let label = match c.trust {
-                        Trust::Verified => format!("{} (verified)", c.identity.name),
-                        Trust::Unverified => format!("{} — unverified ⚠", c.identity.name),
+                        Trust::Verified => format!("{name} (verified)"),
+                        Trust::Unverified => format!("{name} — unverified ⚠"),
                     };
                     if ui.checkbox(&mut checked, label).changed() {
                         *action = Some(Action::ToggleRecipient(fpr_hex));
@@ -2324,13 +2552,36 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                 *action = Some(Action::ToggleIncludeSelf);
             }
             ui.add_space(6.0);
-            if form.selected.iter().any(|fpr| {
-                s.contacts
-                    .contacts
-                    .iter()
-                    .any(|c| &hex(&c.fingerprint()) == fpr && c.trust == Trust::Unverified)
-            }) {
-                ui.colored_label(ERR_RED, "⚠ Some selected recipients are unverified.");
+            // Downgrade/trust warning: spell out exactly which selected
+            // recipients have not been verified out-of-band, so sending to an
+            // unverified key is always a deliberate, informed choice.
+            let unverified: Vec<&str> = s
+                .contacts
+                .contacts
+                .iter()
+                .filter(|c| {
+                    c.trust == Trust::Unverified && form.selected.contains(&hex(&c.fingerprint()))
+                })
+                .map(|c| {
+                    if c.identity.name.is_empty() {
+                        "(unnamed)"
+                    } else {
+                        c.identity.name.as_str()
+                    }
+                })
+                .collect();
+            if !unverified.is_empty() {
+                ui.colored_label(
+                    ERR_RED,
+                    format!("⚠ Unverified recipient(s): {}", unverified.join(", ")),
+                );
+                ui.label(
+                    RichText::new(
+                        "You haven't confirmed these keys out-of-band. Anyone could have supplied them.",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
             }
             ui.horizontal(|ui| {
                 if ui.button(RichText::new("Choose file & export").strong()).clicked() {
@@ -2360,16 +2611,36 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
             ui.label(RichText::new(format!("\"{}\"", info.vault_name)).strong());
             ui.label(format!("{} file(s)", info.file_count));
             ui.separator();
-            ui.label("Sender (cryptographically verified):");
+            ui.label("Sender's signature is cryptographically valid. Identity:");
+            // `signature valid` only proves the bytes came from whoever holds
+            // these keys — NOT that those keys belong to who you think. The
+            // out-of-band safety-number check is what closes that gap, so the
+            // dialog nudges toward it whenever the sender isn't verified.
+            let fpr_hex = info.sender_fpr_hex.clone();
             match (&info.sender_name, info.verified) {
                 (Some(name), true) => {
                     ui.colored_label(OK_GREEN, format!("✔ {name} (verified contact)"));
                 }
                 (Some(name), false) => {
-                    ui.colored_label(ERR_RED, format!("● {name} (known but UNVERIFIED contact)"));
+                    ui.colored_label(
+                        WARN_AMBER,
+                        format!("● {name} — a known but UNVERIFIED contact"),
+                    );
+                    ui.label(
+                        RichText::new("Verify their safety number before you trust this content.")
+                            .color(MUTED)
+                            .small(),
+                    );
                 }
                 (None, _) => {
                     ui.colored_label(ERR_RED, "● Unknown sender — not in your contacts");
+                    ui.label(
+                        RichText::new(
+                            "Add them as a contact, then verify their safety number out-of-band.",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
                 }
             }
             ui.label(
@@ -2379,18 +2650,239 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
                     .color(MUTED),
             );
             ui.add_space(8.0);
-            if ui.button("OK").clicked() {
-                *action = Some(Action::DismissImportInfo);
-            }
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    *action = Some(Action::DismissImportInfo);
+                }
+                match (&info.sender_name, info.verified) {
+                    // Known but unverified → jump straight into verification.
+                    (Some(_), false) => {
+                        if ui.button("Verify sender…").clicked() {
+                            *action = Some(Action::BeginVerify(fpr_hex));
+                        }
+                    }
+                    // Unknown → offer to add them as a contact first.
+                    (None, _) => {
+                        if ui.button("Add sender to contacts…").clicked() {
+                            *action = Some(Action::AddSenderToContacts);
+                        }
+                    }
+                    _ => {}
+                }
+            });
         });
     if !open {
         *action = Some(Action::DismissImportInfo);
     }
 }
 
+/// Confirmation step for a parsed-but-not-yet-saved contact key. Shows who the
+/// key belongs to (name, fingerprint, safety number) and the trust implication
+/// of adding it, so nothing is added — and no verified contact silently renamed
+/// — without the user seeing it first.
+fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let preview = match &s.contact_preview {
+        Some(p) => p,
+        None => return,
+    };
+    let name = if preview.pubid.name.is_empty() {
+        "(unnamed)".to_string()
+    } else {
+        preview.pubid.name.clone()
+    };
+    let is_self = matches!(preview.status, PreviewStatus::SelfKey);
+    let mut open = true;
+    egui::Window::new("Add contact?")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            egui::Grid::new("preview_grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.label(RichText::new(&name).strong());
+                    ui.end_row();
+                    ui.label("Fingerprint");
+                    ui.label(
+                        RichText::new(preview.pubid.fingerprint_hex())
+                            .monospace()
+                            .small(),
+                    );
+                    ui.end_row();
+                });
+            ui.add_space(4.0);
+            ui.label("Safety number:");
+            ui.label(
+                RichText::new(preview.pubid.safety_number())
+                    .monospace()
+                    .color(ACCENT),
+            );
+            ui.add_space(8.0);
+            ui.separator();
+            match &preview.status {
+                PreviewStatus::New => {
+                    ui.label(
+                        RichText::new(
+                            "New contact. You'll verify their safety number before trusting them.",
+                        )
+                        .color(MUTED),
+                    );
+                }
+                PreviewStatus::Existing { verified: true } => {
+                    ui.colored_label(OK_GREEN, "Already a verified contact — nothing will change.");
+                }
+                PreviewStatus::Existing { verified: false } => {
+                    ui.colored_label(MUTED, "Already a contact (unverified) — nothing will change.");
+                }
+                PreviewStatus::Renamed { old, verified: true } => {
+                    ui.colored_label(
+                        ERR_RED,
+                        format!("⚠ This renames a VERIFIED contact: \"{old}\" → \"{name}\"."),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "The keys are identical, so verification still holds — but confirm you expected this rename.",
+                        )
+                        .color(MUTED)
+                        .small(),
+                    );
+                }
+                PreviewStatus::Renamed { old, verified: false } => {
+                    ui.colored_label(
+                        WARN_AMBER,
+                        format!("Display name will change: \"{old}\" → \"{name}\"."),
+                    );
+                }
+                PreviewStatus::SelfKey => {
+                    ui.colored_label(
+                        ERR_RED,
+                        "⚠ This is your OWN public key — you don't need to add yourself.",
+                    );
+                }
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let add_label = match &preview.status {
+                    PreviewStatus::Renamed { .. } => "Update contact",
+                    _ => "Add contact",
+                };
+                if ui
+                    .add_enabled(!is_self, egui::Button::new(RichText::new(add_label).strong()))
+                    .clicked()
+                {
+                    *action = Some(Action::ConfirmAddContact);
+                }
+                if ui.button("Cancel").clicked() {
+                    *action = Some(Action::CancelPreview);
+                }
+            });
+        });
+    if !open {
+        *action = Some(Action::CancelPreview);
+    }
+}
+
+/// The verification dialog: compare a contact's safety number out-of-band. The
+/// user can either type back what the other party reads (the app checks the
+/// match, ignoring spacing/case) or tick the manual "I compared it" box. Either
+/// path enables "Mark verified".
+fn verify_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let form = match &mut s.verify {
+        Some(f) => f,
+        None => return,
+    };
+    let fpr_hex = form.fpr_hex.clone();
+    // Recompute the match each frame against the canonical number.
+    let typed_match = !form.input.trim().is_empty()
+        && filesec_core::util::normalize_safety_number(&form.input)
+            == filesec_core::util::normalize_safety_number(&form.safety_number);
+    let mut open = true;
+    egui::Window::new(format!("Verify {}", form.name))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Compare this safety number with the contact over a trusted channel — in person, a video call, or a line you already trust. Mark verified only once both sides match exactly.",
+                )
+                .color(MUTED),
+            );
+            ui.add_space(8.0);
+            ui.label("Their safety number should read:");
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&form.safety_number)
+                        .monospace()
+                        .color(ACCENT),
+                );
+                if ui.small_button("Copy").clicked() {
+                    *action = Some(Action::CopyVerifySafetyNumber);
+                }
+            });
+            ui.add_space(8.0);
+            ui.label("Type what they read back (optional — the app checks it for you):");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.input)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("e.g. ABCD-EFGH-…"),
+            );
+            if !form.input.trim().is_empty() {
+                if typed_match {
+                    ui.colored_label(OK_GREEN, "✔ Matches.");
+                } else {
+                    ui.colored_label(ERR_RED, "✗ Does not match — do not verify.");
+                }
+            }
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut form.manual_ok,
+                "I compared it myself and it matches exactly.",
+            );
+            ui.add_space(10.0);
+            let can_verify = typed_match || form.manual_ok;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        can_verify,
+                        egui::Button::new(RichText::new("Mark verified").strong()),
+                    )
+                    .clicked()
+                {
+                    *action = Some(Action::ConfirmVerify(fpr_hex.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    *action = Some(Action::CancelVerify);
+                }
+            });
+        });
+    if !open {
+        *action = Some(Action::CancelVerify);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// Format a Unix timestamp (seconds) as a UTC `YYYY-MM-DD` date. Self-contained
+/// (no chrono dependency) via Howard Hinnant's civil-from-days algorithm.
+fn fmt_date(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
 
 fn decode_fpr(hex_str: &str) -> Option<[u8; 32]> {
     if hex_str.len() != 64 {

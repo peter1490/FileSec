@@ -32,3 +32,16 @@ pub fn safety_number(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// Reduce a safety number (or anything a human typed while comparing one) to a
+/// canonical form for equality checks: keep only ASCII alphanumerics, uppercase
+/// them, and drop everything else (the grouping dashes, spaces, and stray line
+/// breaks people introduce when reading a code aloud or pasting it). Two
+/// safety numbers are "the same" iff their normalized forms are equal.
+#[must_use]
+pub fn normalize_safety_number(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
