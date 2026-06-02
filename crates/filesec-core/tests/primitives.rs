@@ -4,10 +4,11 @@ use filesec_core::aead::{decrypt_stream, encrypt_stream, open, seal, NONCE_LEN, 
 use filesec_core::contacts::{ContactBook, Trust, UpsertOutcome};
 use filesec_core::identity::Identity;
 use filesec_core::kdf::KdfParams;
-use filesec_core::keystore::KeystoreFile;
+use filesec_core::keystore::{KeystoreFile, PasskeyEnrollment, HMAC_SECRET_LEN};
 use filesec_core::secret::{ct_eq, random_vec, SymKey};
 use filesec_core::{Error, PublicIdentity};
 use std::io::Cursor;
+use zeroize::Zeroizing;
 
 #[test]
 fn oneshot_aead_roundtrip_and_aad_binding() {
@@ -155,6 +156,165 @@ fn keystore_roundtrip_and_wrong_passphrase() {
         Err(e) => panic!("expected BadPassphrase, got {e:?}"),
         Ok(_) => panic!("unlock unexpectedly succeeded with the wrong passphrase"),
     }
+}
+
+/// Cheap Argon2id parameters so the keystore tests stay fast.
+fn cheap_params() -> KdfParams {
+    KdfParams {
+        m_cost: 8 * 1024,
+        t_cost: 1,
+        p_cost: 1,
+    }
+}
+
+/// A synthetic passkey enrollment. `secret` stands in for the authenticator's
+/// 32-byte `hmac-secret` output (so these tests need no hardware); the same
+/// `secret` must be supplied to `unlock_with_passkey`.
+fn enrollment(secret: u8, credential_id: &[u8], label: &str) -> PasskeyEnrollment {
+    PasskeyEnrollment {
+        credential_id: credential_id.to_vec(),
+        rp_id: "filesec.local".into(),
+        hmac_salt: [secret ^ 0x5a; HMAC_SECRET_LEN],
+        label: label.into(),
+        added_at: 100,
+        hmac_output: Zeroizing::new([secret; HMAC_SECRET_LEN]),
+    }
+}
+
+#[test]
+fn v1_keystore_keeps_legacy_unframed_format() {
+    let id = Identity::generate("Alice", 1).unwrap();
+    let ks = KeystoreFile::create(&id, b"pw correct", cheap_params()).unwrap();
+    let bytes = ks.to_bytes().unwrap();
+    // A keystore with no passkeys stays in the legacy v1 format: no magic
+    // preamble, so a pre-passkey build still opens it byte-for-byte.
+    assert!(!bytes.starts_with(b"FSK\x1a"));
+    assert!(!ks.has_passkeys());
+    assert!(ks.passkey_slots().is_empty());
+    let opened = KeystoreFile::from_bytes(&bytes)
+        .unwrap()
+        .unlock(b"pw correct")
+        .unwrap();
+    assert_eq!(opened.fingerprint(), id.fingerprint());
+}
+
+#[test]
+fn passkey_and_passphrase_recover_same_identity() {
+    let id = Identity::generate("Alice", 7).unwrap();
+    let mut ks = KeystoreFile::create(&id, b"pw correct", cheap_params()).unwrap();
+    assert!(!ks.has_passkeys());
+
+    let secret = 0x11u8;
+    ks.add_passkey(b"pw correct", enrollment(secret, b"cred-1", "Key A"))
+        .unwrap();
+    assert!(ks.has_passkeys());
+
+    // The first passkey promotes the keystore to the framed v2 format.
+    let bytes = ks.to_bytes().unwrap();
+    assert!(bytes.starts_with(b"FSK\x1a"));
+    let ks = KeystoreFile::from_bytes(&bytes).unwrap();
+
+    // Both unlock paths recover the identical identity.
+    assert_eq!(
+        ks.unlock(b"pw correct").unwrap().fingerprint(),
+        id.fingerprint()
+    );
+    assert_eq!(
+        ks.unlock_with_passkey(0, &[secret; HMAC_SECRET_LEN])
+            .unwrap()
+            .fingerprint(),
+        id.fingerprint()
+    );
+    // Wrong passphrase is still rejected after promotion.
+    assert!(matches!(ks.unlock(b"nope"), Err(Error::BadPassphrase)));
+}
+
+#[test]
+fn wrong_passkey_secret_and_bad_index_fail_cleanly() {
+    let id = Identity::generate("Bob", 9).unwrap();
+    let mut ks = KeystoreFile::create(&id, b"pw", cheap_params()).unwrap();
+    ks.add_passkey(b"pw", enrollment(0x22, b"cred", "K"))
+        .unwrap();
+    // Wrong hmac secret cannot unwrap the DEK.
+    assert!(ks.unlock_with_passkey(0, &[0x23; HMAC_SECRET_LEN]).is_err());
+    // An out-of-range slot index errors rather than panicking.
+    assert!(ks.unlock_with_passkey(5, &[0x22; HMAC_SECRET_LEN]).is_err());
+}
+
+#[test]
+fn multiple_passkeys_each_unlock() {
+    let id = Identity::generate("Carol", 3).unwrap();
+    let mut ks = KeystoreFile::create(&id, b"pw", cheap_params()).unwrap();
+    ks.add_passkey(b"pw", enrollment(0x31, b"cred-0", "Key Zero"))
+        .unwrap();
+    ks.add_passkey(b"pw", enrollment(0x32, b"cred-1", "Key One"))
+        .unwrap();
+
+    let slots = ks.passkey_slots();
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0].label, "Key Zero");
+    assert_eq!(slots[0].credential_id, b"cred-0");
+    assert_eq!(slots[0].rp_id, "filesec.local");
+    assert_eq!(slots[1].label, "Key One");
+
+    assert_eq!(
+        ks.unlock_with_passkey(0, &[0x31; HMAC_SECRET_LEN])
+            .unwrap()
+            .fingerprint(),
+        id.fingerprint()
+    );
+    assert_eq!(
+        ks.unlock_with_passkey(1, &[0x32; HMAC_SECRET_LEN])
+            .unwrap()
+            .fingerprint(),
+        id.fingerprint()
+    );
+}
+
+#[test]
+fn remove_passkey_keeps_passphrase_and_survivors() {
+    let id = Identity::generate("Dave", 4).unwrap();
+    let mut ks = KeystoreFile::create(&id, b"pw", cheap_params()).unwrap();
+    ks.add_passkey(b"pw", enrollment(0x41, b"c0", "K0"))
+        .unwrap();
+    ks.add_passkey(b"pw", enrollment(0x42, b"c1", "K1"))
+        .unwrap();
+
+    ks.remove_passkey(0).unwrap();
+    let slots = ks.passkey_slots();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].label, "K1");
+    // The survivor is now index 0 and still unlocks; passphrase still works.
+    assert_eq!(
+        ks.unlock_with_passkey(0, &[0x42; HMAC_SECRET_LEN])
+            .unwrap()
+            .fingerprint(),
+        id.fingerprint()
+    );
+    assert_eq!(ks.unlock(b"pw").unwrap().fingerprint(), id.fingerprint());
+
+    // Out-of-range removal errors, doesn't panic.
+    assert!(ks.remove_passkey(9).is_err());
+
+    // Removing the last passkey leaves the passphrase as the only way in.
+    ks.remove_passkey(0).unwrap();
+    assert!(!ks.has_passkeys());
+    assert_eq!(ks.unlock(b"pw").unwrap().fingerprint(), id.fingerprint());
+}
+
+#[test]
+fn malformed_keystore_is_rejected_cleanly() {
+    assert!(KeystoreFile::from_bytes(b"").is_err());
+    assert!(KeystoreFile::from_bytes(b"not a keystore").is_err());
+    // Magic present but an unsupported version → clean Format error, no panic.
+    let mut framed = Vec::new();
+    framed.extend_from_slice(b"FSK\x1a");
+    framed.extend_from_slice(&99u16.to_be_bytes());
+    framed.push(0xa0); // an empty CBOR map body
+    assert!(matches!(
+        KeystoreFile::from_bytes(&framed),
+        Err(Error::Format(_))
+    ));
 }
 
 #[test]

@@ -20,12 +20,13 @@ use filesec_core::contacts::{ContactBook, Trust, UpsertOutcome};
 use filesec_core::format::{self, ExportOptions, VaultReader};
 use filesec_core::identity::{Identity, PublicIdentity};
 use filesec_core::kdf::KdfParams;
-use filesec_core::keystore::KeystoreFile;
+use filesec_core::keystore::{KeystoreFile, PasskeyInfo, HMAC_SECRET_LEN};
 use filesec_core::manifest::EntryKind;
 use filesec_core::util::{hex, now_unix};
 use filesec_core::vault::Vault;
 use filesec_core::SuiteId;
 
+use crate::passkey;
 use crate::store::{new_vault_id, Registry, Store, VaultMeta};
 
 const OK_GREEN: Color32 = Color32::from_rgb(0x3c, 0xb3, 0x71);
@@ -75,13 +76,53 @@ impl Drop for FirstRun {
 #[derive(Default)]
 struct Unlock {
     pass: String,
+    /// Optional PIN for unlocking with a security key (blank ⇒ no PIN / on-device
+    /// user verification only). Kept here so it survives across frames.
+    pin: String,
+    /// Whether the on-disk keystore has any passkeys enrolled (decided once at
+    /// startup / lock so the unlock screen can offer the security-key button).
+    has_passkeys: bool,
     error: Option<String>,
 }
 
-/// Wipe the passphrase buffer when the unlock form is discarded. See [`FirstRun`].
+impl Unlock {
+    /// Build the unlock screen state, noting whether the keystore has passkeys.
+    fn for_store(store: &Store) -> Self {
+        Self {
+            pass: String::new(),
+            pin: String::new(),
+            has_passkeys: store
+                .load_keystore()
+                .map(|k| k.has_passkeys())
+                .unwrap_or(false),
+            error: None,
+        }
+    }
+}
+
+/// Wipe the passphrase and PIN buffers when the unlock form is discarded. See
+/// [`FirstRun`].
 impl Drop for Unlock {
     fn drop(&mut self) {
         self.pass.zeroize();
+        self.pin.zeroize();
+    }
+}
+
+/// The "Add security key" dialog: a label, the passphrase that authorizes the
+/// change, and an optional security-key PIN.
+#[derive(Default)]
+struct PasskeyEnrollForm {
+    label: String,
+    pass: String,
+    pin: String,
+    error: Option<String>,
+}
+
+impl Drop for PasskeyEnrollForm {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+        self.pin.zeroize();
     }
 }
 
@@ -222,6 +263,10 @@ struct Session {
     /// The open "upgrade to post-quantum" dialog, if any.
     #[cfg(feature = "pqc")]
     migrate: Option<MigrateForm>,
+    /// Passkeys enrolled on the keystore (cached; refreshed after add/remove).
+    passkeys: Vec<PasskeyInfo>,
+    /// The open "add security key" dialog, if any.
+    add_passkey: Option<PasskeyEnrollForm>,
     data_dir: String,
 }
 
@@ -230,6 +275,7 @@ impl Session {
         identity: Arc<Identity>,
         contacts: ContactBook,
         registry: Registry,
+        passkeys: Vec<PasskeyInfo>,
         data_dir: String,
     ) -> Self {
         Self {
@@ -250,6 +296,8 @@ impl Session {
             last_import: None,
             #[cfg(feature = "pqc")]
             migrate: None,
+            passkeys,
+            add_passkey: None,
             data_dir,
         }
     }
@@ -313,6 +361,15 @@ enum Action {
     SavePubKey,
     DismissImportInfo,
     DismissToast,
+    /// Unlock by deriving a key from an enrolled security key (passkey).
+    UnlockWithPasskey,
+    /// Open / cancel the "add security key" dialog.
+    BeginAddPasskey,
+    CancelAddPasskey,
+    /// Enroll a new security key from the open dialog.
+    AddPasskey,
+    /// Remove the enrolled passkey at this slot index.
+    RemovePasskey(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +413,7 @@ struct SessionInit {
     identity: Identity,
     contacts: ContactBook,
     registry: Registry,
+    passkeys: Vec<PasskeyInfo>,
     data_dir: String,
 }
 
@@ -406,6 +464,9 @@ enum Outcome {
     StartView(Box<ActiveView>),
     Imported(Box<ImportData>),
     Contacts(ContactBook),
+    /// Replace the cached passkey list after an enroll/remove and close the
+    /// "add security key" dialog.
+    PasskeysUpdated(Vec<PasskeyInfo>),
 }
 
 impl Default for App {
@@ -420,7 +481,7 @@ impl App {
         match Store::discover() {
             Ok(store) => {
                 let state = if store.keystore_exists() {
-                    State::Unlock(Unlock::default())
+                    State::Unlock(Unlock::for_store(&store))
                 } else {
                     State::FirstRun(FirstRun::default())
                 };
@@ -622,12 +683,14 @@ impl App {
                     identity,
                     contacts,
                     registry,
+                    passkeys,
                     data_dir,
                 } = *init;
                 self.state = State::Unlocked(Box::new(Session::new(
                     Arc::new(identity),
                     contacts,
                     registry,
+                    passkeys,
                     data_dir,
                 )));
             }
@@ -732,6 +795,12 @@ impl App {
                     s.contacts = book;
                 }
             }
+            Outcome::PasskeysUpdated(passkeys) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.passkeys = passkeys;
+                    s.add_passkey = None;
+                }
+            }
         }
     }
 
@@ -753,7 +822,10 @@ impl App {
                 if let State::Unlocked(s) = &mut self.state {
                     wipe_all_views(&mut s.views);
                 }
-                self.state = State::Unlock(Unlock::default());
+                self.state = match &self.store {
+                    Some(store) => State::Unlock(Unlock::for_store(store)),
+                    None => State::Unlock(Unlock::default()),
+                };
                 self.toast = None;
             }
             Action::DismissToast => self.toast = None,
@@ -866,6 +938,16 @@ impl App {
                     s.contact_preview = None;
                 }
             }
+            Action::BeginAddPasskey => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.add_passkey = Some(PasskeyEnrollForm::default());
+                }
+            }
+            Action::CancelAddPasskey => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.add_passkey = None;
+                }
+            }
             Action::CancelVerify => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.verify = None;
@@ -894,6 +976,9 @@ impl App {
             // --- background jobs ---
             Action::CreateIdentity => self.spawn_create_identity(ctx),
             Action::Unlock => self.spawn_unlock(ctx),
+            Action::UnlockWithPasskey => self.spawn_unlock_passkey(ctx),
+            Action::AddPasskey => self.spawn_add_passkey(ctx),
+            Action::RemovePasskey(i) => self.spawn_remove_passkey(ctx, i),
             Action::CreateVault => self.spawn_create_vault(ctx),
             Action::OpenVault(id) => self.spawn_open_vault(ctx, id),
             Action::DeleteVault(id) => self.spawn_delete_vault(ctx, id),
@@ -986,6 +1071,7 @@ impl App {
                     identity,
                     contacts: ContactBook::default(),
                     registry: Registry::default(),
+                    passkeys: Vec::new(),
                     data_dir,
                 })),
                 "Identity created. Your keys are protected by your passphrase.",
@@ -1027,6 +1113,7 @@ impl App {
             };
             let contacts = store.load_contacts(&identity).unwrap_or_default();
             let registry = store.load_registry(&identity).unwrap_or_default();
+            let passkeys = ks.passkey_slots();
             let data_dir = store.data_dir().display().to_string();
             // Securely wipe any checkout temp files orphaned by a prior crash.
             store.clean_checkout_dir();
@@ -1035,9 +1122,184 @@ impl App {
                     identity,
                     contacts,
                     registry,
+                    passkeys,
                     data_dir,
                 })),
                 "Unlocked.",
+            )
+        });
+    }
+
+    /// Unlock by deriving a key from an enrolled security key (passkey). Tries
+    /// each enrolled slot against the connected key; the first that the present
+    /// authenticator satisfies opens the keystore.
+    fn spawn_unlock_passkey(&mut self, ctx: &egui::Context) {
+        let pin = match &mut self.state {
+            State::Unlock(u) => {
+                u.error = None;
+                let pin = u.pin.trim().to_string();
+                if pin.is_empty() {
+                    None
+                } else {
+                    Some(Zeroizing::new(pin))
+                }
+            }
+            _ => return,
+        };
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(ctx, "Waiting for your security key…", move || {
+            let ks = match store.load_keystore() {
+                Ok(k) => k,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
+            let slots = ks.passkey_slots();
+            if slots.is_empty() {
+                return JobReport {
+                    outcome: Outcome::UnlockFailed("No security keys are enrolled.".into()),
+                    toast: None,
+                };
+            }
+            let pin = pin.as_deref().map(|s| s.as_str());
+            // Try each enrolled credential; the connected key only answers for
+            // the one it actually holds. `passkey_slots()` is in keystore order,
+            // so the enumerate index is the slot index for `unlock_with_passkey`.
+            let mut last_err =
+                String::from("Your security key did not match any enrolled passkey.");
+            for (i, slot) in slots.iter().enumerate() {
+                let salt: [u8; HMAC_SECRET_LEN] = match slot.hmac_salt.as_slice().try_into() {
+                    Ok(s) => s,
+                    Err(_) => continue, // malformed slot; skip
+                };
+                let secret = match passkey::assert(&slot.credential_id, &salt, pin) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = e.to_string();
+                        continue;
+                    }
+                };
+                match ks.unlock_with_passkey(i, &secret) {
+                    Ok(identity) => {
+                        let contacts = store.load_contacts(&identity).unwrap_or_default();
+                        let registry = store.load_registry(&identity).unwrap_or_default();
+                        let passkeys = ks.passkey_slots();
+                        let data_dir = store.data_dir().display().to_string();
+                        store.clean_checkout_dir();
+                        return JobReport::ok(
+                            Outcome::Unlocked(Box::new(SessionInit {
+                                identity,
+                                contacts,
+                                registry,
+                                passkeys,
+                                data_dir,
+                            })),
+                            "Unlocked with your security key.",
+                        );
+                    }
+                    Err(e) => last_err = e.to_string(),
+                }
+            }
+            JobReport {
+                outcome: Outcome::UnlockFailed(last_err),
+                toast: None,
+            }
+        });
+    }
+
+    /// Enroll a new security key as an additional unlock method. Reads the open
+    /// "add security key" dialog (label + passphrase + optional PIN).
+    fn spawn_add_passkey(&mut self, ctx: &egui::Context) {
+        let (label, pass, pin) = match &mut self.state {
+            State::Unlocked(s) => match &mut s.add_passkey {
+                Some(f) => {
+                    let label = f.label.trim().to_string();
+                    if label.is_empty() {
+                        f.error = Some("Give this key a name so you can recognize it.".into());
+                        return;
+                    }
+                    if f.pass.is_empty() {
+                        f.error = Some("Enter your passphrase to authorize this change.".into());
+                        return;
+                    }
+                    f.error = None;
+                    let pin = f.pin.trim().to_string();
+                    let pin = if pin.is_empty() {
+                        None
+                    } else {
+                        Some(Zeroizing::new(pin))
+                    };
+                    (label, Zeroizing::new(std::mem::take(&mut f.pass)), pin)
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(
+            ctx,
+            "Touch your security key twice to enroll it…",
+            move || {
+                // 1. Talk to the hardware (blocks on a touch).
+                let enrollment =
+                    match passkey::enroll(&label, pin.as_deref().map(|s| s.as_str()), now_unix()) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            return JobReport::err(format!(
+                                "Could not enroll the security key: {e}"
+                            ))
+                        }
+                    };
+                // 2. Wrap the keystore's data key under the new passkey (authorized by
+                //    the passphrase) and persist atomically.
+                let mut ks = match store.load_keystore() {
+                    Ok(k) => k,
+                    Err(e) => return JobReport::err(e),
+                };
+                if let Err(e) = ks.add_passkey(pass.as_bytes(), enrollment) {
+                    return JobReport::err(e.to_string());
+                }
+                if let Err(e) = store.save_keystore(&ks) {
+                    return JobReport::err(e);
+                }
+                JobReport::ok(
+                    Outcome::PasskeysUpdated(ks.passkey_slots()),
+                    "Security key enrolled. You can now unlock with it.",
+                )
+            },
+        );
+    }
+
+    /// Remove the enrolled passkey at `index`. The passphrase always remains, so
+    /// this never risks a lockout.
+    fn spawn_remove_passkey(&mut self, ctx: &egui::Context, index: usize) {
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(ctx, "Removing security key…", move || {
+            let mut ks = match store.load_keystore() {
+                Ok(k) => k,
+                Err(e) => return JobReport::err(e),
+            };
+            if let Err(e) = ks.remove_passkey(index) {
+                return JobReport::err(e.to_string());
+            }
+            if let Err(e) = store.save_keystore(&ks) {
+                return JobReport::err(e);
+            }
+            JobReport::ok(
+                Outcome::PasskeysUpdated(ks.passkey_slots()),
+                "Security key removed.",
             )
         });
     }
@@ -1861,10 +2123,13 @@ impl App {
                     identity: new,
                     contacts,
                     registry,
+                    // Migration re-seals a fresh passphrase-only keystore; any
+                    // security keys must be re-enrolled afterwards.
+                    passkeys: Vec::new(),
                     data_dir,
                 })),
                 "Upgraded to post-quantum. Your safety number changed — re-share your \
-                 public key so contacts can re-verify it.",
+                 public key so contacts can re-verify it. Re-enroll any security keys.",
             )
         });
     }
@@ -2262,6 +2527,38 @@ fn unlock_ui(u: &mut Unlock, ui: &mut egui::Ui, action: &mut Option<Action>) {
         if ui.button(RichText::new("Unlock").strong()).clicked() || submit {
             *action = Some(Action::Unlock);
         }
+
+        // Security-key (passkey) unlock, when one is enrolled and this build
+        // supports the hardware.
+        if u.has_passkeys && passkey::SUPPORTED {
+            ui.add_space(14.0);
+            ui.label(RichText::new("— or —").color(MUTED).small());
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut u.pin)
+                    .password(true)
+                    .desired_width(220.0)
+                    .hint_text("Security-key PIN (if set)"),
+            );
+            ui.add_space(6.0);
+            if ui
+                .button(RichText::new("🔑 Unlock with security key").strong())
+                .clicked()
+            {
+                *action = Some(Action::UnlockWithPasskey);
+            }
+        } else if u.has_passkeys {
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new(
+                    "This identity has a security key enrolled, but this build can't use it \
+                     (rebuild with --features passkey). Use your passphrase.",
+                )
+                .color(MUTED)
+                .small(),
+            );
+        }
+
         if let Some(e) = &u.error {
             ui.add_space(8.0);
             ui.colored_label(ERR_RED, e);
@@ -2295,6 +2592,9 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     #[cfg(feature = "pqc")]
     if s.migrate.is_some() {
         migrate_window(s, ui.ctx(), action);
+    }
+    if s.add_passkey.is_some() {
+        add_passkey_window(s, ui.ctx(), action);
     }
 }
 
@@ -2669,6 +2969,52 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
             .color(MUTED)
             .small(),
     );
+
+    // Security keys (passkeys). Shown when this build supports them, or whenever
+    // any are already enrolled.
+    if passkey::SUPPORTED || !s.passkeys.is_empty() {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Security keys");
+        ui.label(
+            RichText::new(
+                "Unlock with a hardware security key (FIDO2) in addition to your passphrase. \
+                 Your passphrase always keeps working — a lost key is never a lockout.",
+            )
+            .color(MUTED)
+            .small(),
+        );
+        ui.add_space(6.0);
+        if s.passkeys.is_empty() {
+            ui.label(RichText::new("No security keys enrolled.").color(MUTED));
+        } else {
+            for (i, pk) in s.passkeys.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("🔑 {}", pk.label)).strong());
+                    ui.label(
+                        RichText::new(format!("added {}", fmt_date(pk.added_at)))
+                            .color(MUTED)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Remove").clicked() {
+                            *action = Some(Action::RemovePasskey(i));
+                        }
+                    });
+                });
+            }
+        }
+        if passkey::SUPPORTED {
+            ui.add_space(6.0);
+            if ui
+                .button(RichText::new("➕ Add security key…").strong())
+                .clicked()
+            {
+                *action = Some(Action::BeginAddPasskey);
+            }
+        }
+    }
+
     ui.add_space(12.0);
     ui.separator();
     ui.label(
@@ -2738,6 +3084,74 @@ fn migrate_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Acti
         });
     if !open {
         *action = Some(Action::CancelMigrate);
+    }
+}
+
+/// The "Add security key" dialog.
+fn add_passkey_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let form = match &mut s.add_passkey {
+        Some(f) => f,
+        None => return,
+    };
+    let mut open = true;
+    egui::Window::new("Add security key")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(
+                "Enroll a FIDO2 hardware key (YubiKey, SoloKey, …) as an extra way to unlock. \
+                 You'll be asked to touch it twice — once to create the key, once to set up \
+                 unlock. Your passphrase keeps working too.",
+            );
+            ui.add_space(10.0);
+            egui::Grid::new("add_passkey_grid")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.label)
+                            .hint_text("e.g. YubiKey 5C")
+                            .desired_width(240.0),
+                    );
+                    ui.end_row();
+                    ui.label("Passphrase");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.pass)
+                            .password(true)
+                            .hint_text("authorizes the change")
+                            .desired_width(240.0),
+                    );
+                    ui.end_row();
+                    ui.label("Key PIN");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.pin)
+                            .password(true)
+                            .hint_text("optional — only if your key has one")
+                            .desired_width(240.0),
+                    );
+                    ui.end_row();
+                });
+            if let Some(e) = &form.error {
+                ui.add_space(4.0);
+                ui.colored_label(ERR_RED, e);
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("Touch key to enroll").strong())
+                    .clicked()
+                {
+                    *action = Some(Action::AddPasskey);
+                }
+                if ui.button("Cancel").clicked() {
+                    *action = Some(Action::CancelAddPasskey);
+                }
+            });
+        });
+    if !open {
+        *action = Some(Action::CancelAddPasskey);
     }
 }
 

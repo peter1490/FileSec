@@ -10,12 +10,13 @@ encrypted file (`.fsec`) that you send to a recipient over any channel (email,
 cloud, USB). Only the intended recipients — selected by their public key — can
 open it.
 
-> **Status: MVP + opt-in PQC.** The classical crypto suite, vault management,
-> in-place editing, and the full export/import/verify flow are implemented and
-> tested. An **opt-in post-quantum** build (`--features pqc`) adds a hybrid
-> X25519+ML-KEM-768 / Ed25519+ML-DSA-65 suite and an AES-256-GCM suite. OS
-> installers and a transparent filesystem mount are planned but not in this build
-> (see [Roadmap](#roadmap)).
+> **Status: MVP + opt-in PQC & passkeys.** The classical crypto suite, vault
+> management, in-place editing, and the full export/import/verify flow are
+> implemented and tested. An **opt-in post-quantum** build (`--features pqc`) adds
+> a hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 suite and an AES-256-GCM suite;
+> an **opt-in passkey** build (`--features passkey`) lets you unlock with a FIDO2
+> hardware key in addition to your passphrase. OS installers and a transparent
+> filesystem mount are planned but not in this build (see [Roadmap](#roadmap)).
 
 ---
 
@@ -98,6 +99,49 @@ keys too. The keystore persists each post-quantum keypair as its compact seed.
 All secret material (private keys, content keys, derived keys, passphrases,
 decrypted buffers) is held in zeroizing buffers and wiped on drop. Comparisons
 of tags and fingerprints are constant-time.
+
+#### Opt-in passkey unlock (`--features passkey`)
+
+You can enroll a **hardware security key** (FIDO2: YubiKey, SoloKey, …) as an
+*additional* way to unlock your identity, alongside your passphrase. Because
+FileSec is offline there is no server to verify a WebAuthn assertion, so a
+passkey can't "log you in" the usual way; instead FileSec uses the FIDO2
+**`hmac-secret`** extension (a.k.a. WebAuthn PRF) — the authenticator
+deterministically returns a stable 32-byte secret, gated by physical possession
+of the key plus user verification (touch / PIN). That secret wraps the keystore.
+This is the same mechanism behind systemd-cryptenroll, age-plugin-fido2-hmac,
+and "unlock with passkey" in password managers.
+
+The keystore uses a **keyslot** design (like LUKS / age). Your private identity
+is encrypted once under a random data key (DEK); the DEK is then wrapped once per
+unlock method:
+
+- exactly **one passphrase slot** (Argon2id) — always present, so it can never
+  be removed; and
+- **zero or more passkey slots**, each wrapping the DEK under a key derived from
+  that key's `hmac-secret` output. Each slot stores only public handles (the
+  credential id, a random salt, a label) — all bound into the slot's AEAD so they
+  can't be tampered with.
+
+So **either** the passphrase **or** an enrolled security key opens the keystore.
+**Keep your passphrase — it is your recovery: a lost or wiped key is never a
+lockout.** Manage keys under *My Identity → Security keys* (Add / Remove); unlock
+with *🔑 Unlock with security key* on the unlock screen. Enrolling asks for **two
+touches** (the `hmac-secret` value is only returned by an assertion, so creating
+the credential and deriving its secret are two user-presence steps); unlocking is
+a single touch.
+
+Backward compatible: a keystore with no passkeys stays in the original on-disk
+format byte-for-byte (so a build without this feature still opens it). The first
+enrollment migrates it to the keyslot format. Keystore writes are atomic
+(temp + fsync + rename), so enrolling/removing a key can never half-write it.
+Upgrading to post-quantum re-seals a fresh keystore, so re-enroll any keys after.
+
+> The passkey backend talks to the key over USB HID via `ctap-hid-fido2`, which
+> vendors the C `hidapi` library — it is **only** compiled with
+> `--features passkey`, needs a physical key to test, and is pinned to a version
+> that builds on the project's Rust 1.86 MSRV. The keyslot crypto itself lives in
+> `filesec-core` with no hardware dependency and is fully unit-tested.
 
 ### Threat model — what is *not* protected
 
@@ -185,9 +229,15 @@ cargo test --workspace
 # Lint & format
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+
+# Opt-in builds: post-quantum suites, and/or hardware-passkey unlock
+cargo run -p filesec-gui --release --features pqc
+cargo run -p filesec-gui --release --features passkey   # needs a FIDO2 key to use
 ```
 
-The `filesec` binary is self-contained (single executable per OS).
+The `filesec` binary is self-contained (single executable per OS). The `passkey`
+feature compiles a USB-HID FIDO2 client (vendored `hidapi` C); it is off by
+default and requires a physical security key to exercise.
 
 ### A typical two-party exchange
 
@@ -289,7 +339,9 @@ distinguishes a valid *signature* from a *trusted identity*, offering one-click
 verify / add-to-contacts shortcuts.
 
 **Delivered:** an opt-in hybrid post-quantum suite (X25519+ML-KEM-768,
-Ed25519+ML-DSA-65) and an AES-256-GCM suite, behind `--features pqc` — see
+Ed25519+ML-DSA-65) and an AES-256-GCM suite, behind `--features pqc`; and
+**opt-in passkey unlock** (FIDO2 `hmac-secret` hardware keys, behind
+`--features passkey`) as a co-equal alternative to the passphrase — see
 [Cryptography](#cryptography-suite-0x0001-the-default) above.
 
 Planned, in dependency order:

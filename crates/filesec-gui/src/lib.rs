@@ -5,4 +5,5 @@
 //! [`app::App`].
 
 pub mod app;
+pub mod passkey;
 pub mod store;

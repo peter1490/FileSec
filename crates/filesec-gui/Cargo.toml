@@ -15,6 +15,11 @@ path = "src/main.rs"
 default = []
 # Forward the core post-quantum opt-in.
 pqc = ["filesec-core/pqc"]
+# Opt-in hardware passkey unlock (FIDO2 `hmac-secret`). Pulls a USB-HID FIDO2
+# client; kept optional so the default build stays dependency-light and the
+# CI/sandbox build (which can't compile vendored hidapi or test real hardware)
+# is unaffected. See src/passkey.rs.
+passkey = ["dep:ctap-hid-fido2"]
 
 [dependencies]
 directories = "6.0.0"
@@ -27,4 +32,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 walkdir = "2.5.0"
 # Pinned to match filesec-core (Rust 1.86 MSRV); wipes passphrases held in UI state.
 zeroize = "1.8.2"
-# rest filled in via `cargo add`
+
+# Hardware passkey backend (opt-in via the `passkey` feature). Pinned to 3.5.7:
+# 3.5.8+ call `u*::is_multiple_of` (stabilized in Rust 1.87) in their hmac-secret
+# code and so won't build on our 1.86 MSRV. 3.5.7 has the full hmac-secret API
+# and uses `ring` for crypto, so getrandom stays 0.2. Vendors hidapi (C) and is
+# compiled only when the feature is enabled.
+ctap-hid-fido2 = { version = "=3.5.7", optional = true }

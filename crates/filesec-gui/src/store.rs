@@ -156,11 +156,19 @@ impl Store {
         self.keystore_path().exists()
     }
 
-    /// Persist the passphrase-protected keystore.
+    /// Persist the keystore (passphrase- and, once enrolled, passkey-protected).
+    ///
+    /// Written **atomically**: bytes go to a private (0600) temp file that is
+    /// fsync'd and then renamed into place, with a best-effort directory fsync so
+    /// the rename is durable. Because the keystore is now mutated in place
+    /// (enrolling/removing a passkey), a crash mid-write must never leave a
+    /// half-written file — a half-written keystore would be permanent lockout.
     pub fn save_keystore(&self, ks: &KeystoreFile) -> StoreResult<()> {
         let bytes = ks.to_bytes().map_err(err)?;
-        std::fs::write(self.keystore_path(), bytes).map_err(err)?;
-        harden_file(&self.keystore_path());
+        let final_path = self.keystore_path();
+        let tmp = self.data_dir.join("keystore.fsk.tmp");
+        write_private_atomic(&tmp, &final_path, &bytes)?;
+        harden_file(&final_path);
         Ok(())
     }
 
@@ -633,10 +641,11 @@ pub fn make_readonly(path: &Path) -> StoreResult<()> {
     std::fs::set_permissions(path, perms).map_err(err)
 }
 
-/// Create (truncating) a file for writing with owner-only permissions from the
-/// outset where the OS supports it, so plaintext never exists with loose perms.
+/// Open (creating, truncating) a file for writing with owner-only permissions
+/// from the outset where the OS supports it, so secret bytes never exist with
+/// loose perms. Returns the open handle.
 #[cfg(unix)]
-fn open_private_truncating(path: &Path) -> StoreResult<()> {
+fn open_private_create(path: &Path) -> StoreResult<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
@@ -644,18 +653,52 @@ fn open_private_truncating(path: &Path) -> StoreResult<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .map_err(err)?;
-    Ok(())
+        .map_err(err)
 }
 
 #[cfg(not(unix))]
-fn open_private_truncating(path: &Path) -> StoreResult<()> {
+fn open_private_create(path: &Path) -> StoreResult<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(path)
-        .map_err(err)?;
+        .map_err(err)
+}
+
+/// Create an empty private (0600 where supported) file at `path`.
+fn open_private_truncating(path: &Path) -> StoreResult<()> {
+    open_private_create(path).map(drop)
+}
+
+/// Atomically write `bytes` to `final_path` via a private temp file that is
+/// fsync'd and renamed into place, then best-effort fsync the directory so the
+/// rename is durable. A crash can leave the old file or the new one, never a
+/// half-written one. The temp is cleaned up on any failure.
+fn write_private_atomic(tmp: &Path, final_path: &Path, bytes: &[u8]) -> StoreResult<()> {
+    use std::io::Write;
+    let mut f = open_private_create(tmp)?;
+    let write = (|| {
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()
+    })();
+    drop(f);
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(tmp);
+        return Err(err(e));
+    }
+    if let Err(e) = std::fs::rename(tmp, final_path) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(err(e));
+    }
+    // Best-effort: fsync the containing directory so the rename itself survives a
+    // crash. Not all platforms/filesystems support directory fsync; ignore errors.
+    if let Some(parent) = final_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
