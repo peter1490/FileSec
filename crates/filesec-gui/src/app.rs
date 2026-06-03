@@ -1925,7 +1925,7 @@ impl App {
                 return JobReport::err(format!("\"{leaf}\" already exists here."));
             }
             if let Err(e) =
-                store.append_files_to_vault(&identity, &id, &reader, &[], &[vault_path.clone()])
+                store.append_files_to_vault(&identity, &id, &reader, &[], std::slice::from_ref(&vault_path))
             {
                 return JobReport::err(e);
             }
@@ -2047,7 +2047,7 @@ impl App {
         self.spawn_job(ctx, "Saving…", move || {
             // Stream the surviving data through and drop the removed entry — the
             // vault is never decrypted into memory.
-            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, &[path.clone()])
+            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, std::slice::from_ref(&path))
             {
                 return JobReport::err(e);
             }
@@ -3193,7 +3193,7 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         let mut vaults = s.registry.vaults.clone();
-        vaults.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        vaults.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
         for v in vaults {
             theme::card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -4365,10 +4365,10 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
                     }
                 }
                 // Unknown → offer to add them as a contact first.
-                (None, _) => {
-                    if theme::primary_button(ui, "Add sender to contacts…").clicked() {
-                        *action = Some(Action::AddSenderToContacts);
-                    }
+                (None, _)
+                    if theme::primary_button(ui, "Add sender to contacts…").clicked() =>
+                {
+                    *action = Some(Action::AddSenderToContacts);
                 }
                 _ => {}
             }
