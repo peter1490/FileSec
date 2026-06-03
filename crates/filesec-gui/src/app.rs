@@ -1924,9 +1924,13 @@ impl App {
             if reader.entries().iter().any(|e| e.path == vault_path) {
                 return JobReport::err(format!("\"{leaf}\" already exists here."));
             }
-            if let Err(e) =
-                store.append_files_to_vault(&identity, &id, &reader, &[], std::slice::from_ref(&vault_path))
-            {
+            if let Err(e) = store.append_files_to_vault(
+                &identity,
+                &id,
+                &reader,
+                &[],
+                std::slice::from_ref(&vault_path),
+            ) {
                 return JobReport::err(e);
             }
             finalize_after_save(
@@ -2047,7 +2051,8 @@ impl App {
         self.spawn_job(ctx, "Saving…", move || {
             // Stream the surviving data through and drop the removed entry — the
             // vault is never decrypted into memory.
-            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, std::slice::from_ref(&path))
+            if let Err(e) =
+                store.remove_paths_from_vault(&identity, &id, &reader, std::slice::from_ref(&path))
             {
                 return JobReport::err(e);
             }
@@ -4365,9 +4370,7 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
                     }
                 }
                 // Unknown → offer to add them as a contact first.
-                (None, _)
-                    if theme::primary_button(ui, "Add sender to contacts…").clicked() =>
-                {
+                (None, _) if theme::primary_button(ui, "Add sender to contacts…").clicked() => {
                     *action = Some(Action::AddSenderToContacts);
                 }
                 _ => {}
