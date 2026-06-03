@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use filesec_core::contacts::ContactBook;
 use filesec_core::format::{self, ExportOptions};
+use filesec_core::format_v2::VaultReaderV2;
 use filesec_core::identity::Identity;
 use filesec_core::keystore::KeystoreFile;
 use filesec_core::util::now_unix;
@@ -99,6 +100,7 @@ pub struct Store {
     data_dir: PathBuf,
     vaults_dir: PathBuf,
     checkout_dir: PathBuf,
+    mounts_dir: PathBuf,
 }
 
 impl Store {
@@ -121,15 +123,19 @@ impl Store {
         let data_dir = data_dir.into();
         let vaults_dir = data_dir.join("vaults");
         let checkout_dir = data_dir.join("checkout");
+        let mounts_dir = data_dir.join("mounts");
         std::fs::create_dir_all(&vaults_dir).map_err(err)?;
         std::fs::create_dir_all(&checkout_dir).map_err(err)?;
+        std::fs::create_dir_all(&mounts_dir).map_err(err)?;
         harden_dir(&data_dir);
         harden_dir(&vaults_dir);
         harden_dir(&checkout_dir);
+        harden_dir(&mounts_dir);
         Ok(Self {
             data_dir,
             vaults_dir,
             checkout_dir,
+            mounts_dir,
         })
     }
 
@@ -149,6 +155,11 @@ impl Store {
     }
     fn vault_path(&self, id: &str) -> PathBuf {
         self.vaults_dir.join(format!("{id}.fsec"))
+    }
+
+    /// The v2 (directory-of-blobs) on-disk path for a vault.
+    fn vault_dir_v2(&self, id: &str) -> PathBuf {
+        self.vaults_dir.join(format!("{id}.fsv2"))
     }
 
     /// Whether an identity has already been created.
@@ -245,157 +256,189 @@ impl Store {
         self.save_blob(identity, &self.index_path(), REGISTRY_BLOB, &bytes)
     }
 
-    /// Persist a vault to its local encrypted file.
+    /// Persist a (typically new) vault to its local v2 store directory, encrypted
+    /// to the identity itself under the identity's at-rest suite.
     pub fn save_vault(&self, identity: &Identity, id: &str, vault: &Vault) -> StoreResult<()> {
-        format::export_vault_to_path(
-            vault,
-            identity,
-            &[identity.public()],
-            &self_options(identity),
-            &self.vault_path(id),
-        )
-        .map_err(err)?;
-        harden_file(&self.vault_path(id));
+        let dir = self.vault_dir_v2(id);
+        // Start from a clean directory: vault ids are random so this is normally a
+        // no-op, but it makes an overwrite well-defined (no stale blobs linger).
+        let _ = std::fs::remove_dir_all(&dir);
+        VaultReaderV2::from_vault(&dir, identity, self_suite(identity), vault).map_err(err)?;
         Ok(())
     }
 
-    /// Load a vault fully into memory (used for mutation and re-export, which
-    /// need the entire plaintext).
+    /// Load a vault fully into memory (used by tests and any caller needing the
+    /// whole plaintext). Opens the vault — migrating a legacy v1 container to v2
+    /// if needed — and decrypts every file.
     pub fn load_vault(&self, identity: &Identity, id: &str) -> StoreResult<Vault> {
-        let imported =
-            format::import_vault_from_path(&self.vault_path(id), identity).map_err(err)?;
-        Ok(imported.vault)
+        self.open_vault(identity, id)?.to_vault().map_err(err)
     }
 
-    /// Lazily open a vault: authenticate and load only the manifest (metadata),
-    /// decrypting file contents on demand. Cheap even for very large vaults.
-    pub fn open_vault(&self, identity: &Identity, id: &str) -> StoreResult<format::VaultReader> {
-        format::open_vault_from_path(&self.vault_path(id), identity).map_err(err)
+    /// Lazily open a vault (metadata only; file contents decrypt on demand). A
+    /// legacy v1 `.fsec` container is transparently migrated to the v2 directory
+    /// format on first open (crash-safe; see [`Self::migrate_vault_v1_to_v2`]).
+    pub fn open_vault(&self, identity: &Identity, id: &str) -> StoreResult<VaultReaderV2> {
+        let v2 = self.vault_dir_v2(id);
+        if v2.exists() {
+            // A crash after the migration commit but before the old file was
+            // wiped can leave the v1 container behind; the v2 dir wins.
+            let v1 = self.vault_path(id);
+            if v1.exists() {
+                let _ = secure_wipe(&v1);
+            }
+            return VaultReaderV2::open(&v2, identity).map_err(err);
+        }
+        if self.vault_path(id).exists() {
+            self.migrate_vault_v1_to_v2(identity, id)?;
+            return VaultReaderV2::open(&v2, identity).map_err(err);
+        }
+        Err(format!("vault not found: {id}"))
     }
 
-    /// Add files (streamed from disk) and empty directories to an existing vault
-    /// **without** decrypting it into memory: the new container is written from
-    /// `reader` (which streams the existing data) plus the new files, to a temp
-    /// file that atomically replaces the vault. Peak memory is a couple of chunks
-    /// regardless of vault or file size.
+    /// Crash-safe lazy migration of a legacy v1 `.fsec` vault to the v2 directory
+    /// format. The fully-written `<id>.fsv2.partial` dir is renamed to `<id>.fsv2`
+    /// (the atomic commit point) before the old `.fsec` is wiped, so a crash
+    /// before the rename keeps the v1 file intact (and the stray `.partial` is
+    /// cleaned on the next unlock), and a crash after it makes the v2 dir
+    /// authoritative. Data is never lost.
+    fn migrate_vault_v1_to_v2(&self, identity: &Identity, id: &str) -> StoreResult<()> {
+        let v1 = self.vault_path(id);
+        let final_dir = self.vault_dir_v2(id);
+        let partial = self.vaults_dir.join(format!("{id}.fsv2.partial"));
+        let _ = std::fs::remove_dir_all(&partial);
+        let reader = format::open_vault_from_path(&v1, identity).map_err(err)?;
+        if let Err(e) =
+            VaultReaderV2::from_reader_v1(&partial, identity, self_suite(identity), &reader)
+        {
+            let _ = std::fs::remove_dir_all(&partial);
+            return Err(err(e));
+        }
+        std::fs::rename(&partial, &final_dir).map_err(err)?;
+        if let Ok(d) = std::fs::File::open(&self.vaults_dir) {
+            let _ = d.sync_all();
+        }
+        let _ = secure_wipe(&v1);
+        Ok(())
+    }
+
+    /// Best-effort cleanup, on unlock, of interrupted vault-migration scratch
+    /// directories: a `*.fsv2.partial` (an aborted write) is removed; a
+    /// `*.fsv2.old` (an interrupted suite re-key) is removed when its final dir
+    /// committed, else rolled back into place.
+    pub fn clean_partial_dirs(&self) {
+        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".fsv2.partial") {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else if let Some(stem) = name.strip_suffix(".old") {
+                    let final_dir = self.vaults_dir.join(stem);
+                    if final_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::rename(&path, &final_dir);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Add files (from disk) and empty directories to an existing v2 vault. Each
+    /// new file becomes its own encrypted blob and the manifest is resealed —
+    /// O(the change), not a whole-vault rewrite, and other files are never read.
     pub fn append_files_to_vault(
         &self,
-        identity: &Identity,
-        id: &str,
-        reader: &format::VaultReader,
+        _identity: &Identity,
+        _id: &str,
+        reader: &VaultReaderV2,
         added: &[format::AddedFile],
         added_dirs: &[String],
     ) -> StoreResult<()> {
-        let final_path = self.vault_path(id);
-        let tmp = self.vaults_dir.join(format!("{id}.fsec.tmp"));
-        if let Err(e) = reader.append_files_to_path(
-            identity,
-            &[identity.public()],
-            &self_options(identity),
-            added,
-            added_dirs,
-            &tmp,
-        ) {
-            let _ = std::fs::remove_file(&tmp); // don't leave a partial temp behind
-            return Err(err(e));
+        // v2 is O(change): each new file becomes its own blob and the manifest is
+        // resealed — no whole-vault rewrite. The reader is cloned (it carries the
+        // manifest key); the caller re-opens afterwards to pick up the new state.
+        let mut writer = reader.clone();
+        for d in added_dirs {
+            writer.mkdir(d).map_err(err)?;
         }
-        std::fs::rename(&tmp, &final_path).map_err(err)?;
-        harden_file(&final_path);
+        for f in added {
+            writer
+                .put_file(&f.vault_path, &f.source, f.mtime, f.mode)
+                .map_err(err)?;
+        }
         Ok(())
     }
 
     /// Remove paths (each entry plus, for a directory, its subtree) from an
-    /// existing vault **without** decrypting it into memory: the new container is
-    /// streamed from `reader` minus the removed files, to a temp file that
-    /// atomically replaces the vault.
+    /// existing v2 vault: each removal unlinks only that file's blob and reseals
+    /// the manifest — other files are untouched.
     pub fn remove_paths_from_vault(
         &self,
-        identity: &Identity,
-        id: &str,
-        reader: &format::VaultReader,
+        _identity: &Identity,
+        _id: &str,
+        reader: &VaultReaderV2,
         remove: &[String],
     ) -> StoreResult<()> {
-        let final_path = self.vault_path(id);
-        let tmp = self.vaults_dir.join(format!("{id}.fsec.tmp"));
-        if let Err(e) = reader.remove_paths_to_path(
-            identity,
-            &[identity.public()],
-            &self_options(identity),
-            remove,
-            &tmp,
-        ) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err(e));
+        let mut writer = reader.clone();
+        for p in remove {
+            writer.remove_path(p).map_err(err)?;
         }
-        std::fs::rename(&tmp, &final_path).map_err(err)?;
-        harden_file(&final_path);
         Ok(())
     }
 
-    /// Replace a single file's contents inside an existing vault **without**
-    /// decrypting it into memory: the new container is streamed from `reader`
-    /// (the old file's bytes dropped, the new file appended from disk) to a temp
-    /// file that atomically replaces the vault. Peak memory is a couple of chunks.
+    /// Replace a single file's contents inside an existing v2 vault: the new file
+    /// is written as a fresh blob, the old blob is unlinked, and the manifest is
+    /// resealed. Only that one file's storage changes.
     #[allow(clippy::too_many_arguments)]
     pub fn replace_file_in_vault(
         &self,
-        identity: &Identity,
-        id: &str,
-        reader: &format::VaultReader,
+        _identity: &Identity,
+        _id: &str,
+        reader: &VaultReaderV2,
         vault_path: &str,
         new_source: &Path,
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> StoreResult<()> {
-        let final_path = self.vault_path(id);
-        let tmp = self.vaults_dir.join(format!("{id}.fsec.tmp"));
-        if let Err(e) = reader.replace_file_to_path(
-            identity,
-            &[identity.public()],
-            &self_options(identity),
-            vault_path,
-            new_source,
-            mtime,
-            mode,
-            &tmp,
-        ) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err(e));
-        }
-        std::fs::rename(&tmp, &final_path).map_err(err)?;
-        harden_file(&final_path);
+        // Overwrite is just a `put_file`: a fresh blob replaces the old one and
+        // the manifest is resealed (the old blob is unlinked).
+        let mut writer = reader.clone();
+        writer
+            .put_file(vault_path, new_source, mtime, mode)
+            .map_err(err)?;
         Ok(())
     }
 
-    /// Transcode a just-verified incoming container straight into the local
-    /// self-encrypted store, **streaming** from `reader` so a huge imported file
-    /// is never held in memory. Writes to the (new) vault path directly — there is
-    /// no existing file to preserve — and cleans up on failure.
+    /// Transcode a just-verified incoming v1 container into a fresh local v2 store
+    /// directory (encrypted to self), one file at a time so a huge imported file
+    /// is never fully held in memory. Cleans up the directory on failure.
     pub fn import_reader_to_vault(
         &self,
         identity: &Identity,
         id: &str,
         reader: &format::VaultReader,
     ) -> StoreResult<()> {
-        let path = self.vault_path(id);
-        if let Err(e) = reader.reexport_to_path(
-            identity,
-            &[identity.public()],
-            &self_options(identity),
-            &path,
-        ) {
-            let _ = std::fs::remove_file(&path);
+        let dir = self.vault_dir_v2(id);
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = VaultReaderV2::from_reader_v1(&dir, identity, self_suite(identity), reader)
+        {
+            let _ = std::fs::remove_dir_all(&dir);
             return Err(err(e));
         }
-        harden_file(&path);
         Ok(())
     }
 
-    /// Delete a vault's encrypted file.
+    /// Delete a vault's encrypted store, securely wiping its contents. Handles
+    /// both the v2 directory and any leftover legacy v1 `.fsec` file.
     pub fn delete_vault_file(&self, id: &str) -> StoreResult<()> {
-        let p = self.vault_path(id);
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(err)?;
+        let dir = self.vault_dir_v2(id);
+        if dir.exists() {
+            wipe_vault_dir(&dir);
+        }
+        let v1 = self.vault_path(id);
+        if v1.exists() {
+            let _ = secure_wipe(&v1);
         }
         Ok(())
     }
@@ -431,6 +474,35 @@ impl Store {
         if let Ok(rd) = std::fs::read_dir(&self.checkout_dir) {
             for entry in rd.flatten() {
                 let _ = secure_wipe(&entry.path());
+            }
+        }
+    }
+
+    /// Create (and harden, 0700 on Unix) the mount-point directory for vault
+    /// `id`, returning its path. The directory must exist and be empty for a FUSE
+    /// driver to mount over it. Lives under `data_dir/mounts/<id>`.
+    pub fn mount_point_for(&self, id: &str) -> StoreResult<PathBuf> {
+        let path = self.mounts_dir.join(id);
+        std::fs::create_dir_all(&path).map_err(err)?;
+        harden_dir(&path);
+        Ok(path)
+    }
+
+    /// Best-effort removal of a vault's (now-unmounted) mount-point directory.
+    /// Non-recursive, so it only succeeds when the directory is empty — i.e. when
+    /// nothing is still mounted there.
+    pub fn remove_mount_point(&self, id: &str) {
+        let _ = std::fs::remove_dir(self.mounts_dir.join(id));
+    }
+
+    /// Best-effort cleanup of stale mount-point directories left by a prior crash
+    /// (a clean unmount removes its own). Called on unlock, mirroring
+    /// [`Self::clean_checkout_dir`]. Only empty (unmounted) directories are
+    /// removed; anything the OS has not finished tearing down is left untouched.
+    pub fn clean_mounts_dir(&self) {
+        if let Ok(rd) = std::fs::read_dir(&self.mounts_dir) {
+            for entry in rd.flatten() {
+                let _ = std::fs::remove_dir(entry.path());
             }
         }
     }
@@ -478,6 +550,56 @@ impl Store {
             }
             std::fs::rename(&tmp, &path).map_err(err)?;
             harden_file(&path);
+        }
+        Ok(())
+    }
+
+    /// List every v2 vault directory in the store.
+    #[cfg(feature = "pqc")]
+    fn v2_vault_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() && p.extension().and_then(|s| s.to_str()) == Some("fsv2") {
+                    dirs.push(p);
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Re-key every v2 vault to `suite`, addressed to `opener` — the post-quantum
+    /// migration's harden phase. Crash-safe per vault: the new directory is built
+    /// in `<dir>.partial`, the current dir is moved aside to `<dir>.old`, the new
+    /// dir is renamed into place, then `.old` is removed. `clean_partial_dirs`
+    /// rolls back an interruption. Idempotent — a vault already on `suite` is left
+    /// alone. (`opener` shares the pre-migration X25519 key, so it can still open a
+    /// classical vault here; hardening to the hybrid suite is what re-establishes
+    /// confidentiality from the old fingerprint.)
+    #[cfg(feature = "pqc")]
+    fn reencrypt_v2_vaults(&self, opener: &Identity, suite: SuiteId) -> StoreResult<()> {
+        for dir in self.v2_vault_dirs() {
+            let current = VaultReaderV2::open(&dir, opener).map_err(err)?;
+            if current.suite() == suite {
+                continue;
+            }
+            let vault = current.to_vault().map_err(err)?;
+            drop(current);
+            let mut partial = dir.clone().into_os_string();
+            partial.push(".partial");
+            let partial = PathBuf::from(partial);
+            let mut old = dir.clone().into_os_string();
+            old.push(".old");
+            let old = PathBuf::from(old);
+            let _ = std::fs::remove_dir_all(&partial);
+            if let Err(e) = VaultReaderV2::from_vault(&partial, opener, suite, &vault) {
+                let _ = std::fs::remove_dir_all(&partial);
+                return Err(err(e));
+            }
+            std::fs::rename(&dir, &old).map_err(err)?;
+            std::fs::rename(&partial, &dir).map_err(err)?;
+            let _ = std::fs::remove_dir_all(&old);
         }
         Ok(())
     }
@@ -536,6 +658,9 @@ impl Store {
             ..ExportOptions::default()
         };
         self.reencrypt_all(&new, &new_only, &hybrid)?;
+        // v2 vault directories aren't `.fsec` files, so `reencrypt_all` skipped
+        // them; re-key each to the new hybrid suite (addressed to `new`).
+        self.reencrypt_v2_vaults(&new, SuiteId::Hybrid)?;
 
         Ok(new)
     }
@@ -587,6 +712,19 @@ fn restore_writable(path: &Path) {
         perms.set_readonly(false);
         let _ = std::fs::set_permissions(path, perms);
     }
+}
+
+/// Best-effort secure deletion of a v2 vault directory: wipe the header, the
+/// manifest, and every blob, then remove the directory tree.
+fn wipe_vault_dir(dir: &Path) {
+    if let Ok(rd) = std::fs::read_dir(dir.join("blobs")) {
+        for e in rd.flatten() {
+            let _ = secure_wipe(&e.path());
+        }
+    }
+    let _ = secure_wipe(&dir.join("manifest"));
+    let _ = secure_wipe(&dir.join("header"));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Best-effort secure deletion: overwrite the file's current length with random

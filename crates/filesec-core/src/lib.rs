@@ -24,6 +24,7 @@ pub mod contacts;
 pub mod envelope;
 pub mod error;
 pub mod format;
+pub mod format_v2;
 pub mod identity;
 pub mod kdf;
 pub mod kem;
@@ -41,6 +42,7 @@ pub mod vault;
 
 pub use error::{Error, Result};
 pub use format::{AddedFile, ExportOptions, ImportedVault, VaultReader, VerifiedSender};
+pub use format_v2::VaultReaderV2;
 pub use identity::{Identity, PublicIdentity};
 pub use suite::SuiteId;
 pub use vault::Vault;

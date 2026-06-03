@@ -697,3 +697,129 @@ fn path_normalization_blocks_traversal() {
     assert!(normalize_path("a/../../b").is_err());
     assert!(normalize_path("a/\0/b").is_err());
 }
+
+/// Open `sample_vault()` lazily and return a `(reader, path)`; caller removes the
+/// file. `data/big.bin` is multi-chunk and starts at stream offset 19, so its
+/// 64 KiB chunk boundaries fall mid-file — ideal for exercising `read_at`.
+fn lazy_sample(name: &str) -> (format::VaultReader, PathBuf) {
+    let alice = ident("Alice");
+    let path = tmp_path(name);
+    format::export_vault_to_path(
+        &sample_vault(),
+        &alice,
+        &[alice.public()],
+        &ExportOptions::default(),
+        &path,
+    )
+    .unwrap();
+    let reader = format::open_vault_from_path(&path, &alice).unwrap();
+    (reader, path)
+}
+
+#[test]
+fn read_at_matches_read_entry_over_random_windows() {
+    let (reader, path) = lazy_sample("readat.fsec");
+    let full = reader.read_entry("data/big.bin").unwrap();
+    let size = full.len() as u64;
+
+    // Pseudo-random (offset, len) windows: read_at must always equal the same
+    // slice of the whole-file decryption, including short reads past EOF.
+    for _ in 0..200 {
+        let r = filesec_core::secret::random_vec(8).unwrap();
+        let offset = u64::from(u32::from_le_bytes([r[0], r[1], r[2], r[3]])) % (size + 1);
+        let len = (u64::from(u32::from_le_bytes([r[4], r[5], r[6], r[7]])) % (size + 200)) as usize;
+        let mut buf = vec![0u8; len];
+        let n = reader.read_at("data/big.bin", offset, &mut buf).unwrap();
+        let expected: &[u8] = if offset >= size {
+            &[]
+        } else {
+            let end = (offset + len as u64).min(size) as usize;
+            &full[offset as usize..end]
+        };
+        assert_eq!(n, expected.len(), "len at offset={offset} len={len}");
+        assert_eq!(&buf[..n], expected, "bytes at offset={offset} len={len}");
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn read_at_spans_chunk_boundaries() {
+    let (reader, path) = lazy_sample("readat-bnd.fsec");
+    let full = reader.read_entry("data/big.bin").unwrap();
+    let size = full.len();
+
+    // big.bin starts at stream offset 19, so stream-chunk boundaries land at
+    // big.bin offsets (chunk - 19) and (2*chunk - 19). Straddle each, plus the
+    // file's start and tail, with a range of widths.
+    let chunk = 64 * 1024usize;
+    for win_start in [0usize, chunk - 19 - 5, 2 * chunk - 19 - 5, size - 10] {
+        for len in [1usize, 10, 64, chunk] {
+            let end = (win_start + len).min(size);
+            let mut buf = vec![0u8; len];
+            let n = reader
+                .read_at("data/big.bin", win_start as u64, &mut buf)
+                .unwrap();
+            assert_eq!(&buf[..n], &full[win_start..end], "window {win_start}+{len}");
+        }
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn read_at_past_eof_and_empty_file() {
+    let (reader, path) = lazy_sample("readat-eof.fsec");
+    let big_size = reader.read_entry("data/big.bin").unwrap().len() as u64;
+
+    let mut buf = [0u8; 64];
+    // offset at/after EOF → 0 bytes, no chunk touched.
+    assert_eq!(
+        reader.read_at("data/big.bin", big_size, &mut buf).unwrap(),
+        0
+    );
+    assert_eq!(
+        reader
+            .read_at("data/big.bin", big_size + 1000, &mut buf)
+            .unwrap(),
+        0
+    );
+    // empty output buffer → 0 bytes.
+    assert_eq!(reader.read_at("data/big.bin", 0, &mut []).unwrap(), 0);
+    // a zero-length file is always a 0-byte read.
+    assert_eq!(reader.read_at("empty.bin", 0, &mut buf).unwrap(), 0);
+    // a directory or a missing path is an error, not a read.
+    assert!(reader.read_at("emptydir", 0, &mut buf).is_err());
+    assert!(reader.read_at("nope.bin", 0, &mut buf).is_err());
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn read_at_on_tampered_chunk_errors() {
+    let alice = ident("Alice");
+    let path = tmp_path("readat-tamper.fsec");
+    format::export_vault_to_path(
+        &sample_vault(),
+        &alice,
+        &[alice.public()],
+        &ExportOptions::default(),
+        &path,
+    )
+    .unwrap();
+
+    // Flip a byte in the data section (just before the 64-byte signature) — this
+    // lands in big.bin's final chunk (it is the last file in the stream).
+    let mut bytes = std::fs::read(&path).unwrap();
+    let idx = bytes.len() - 100;
+    bytes[idx] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let reader = format::open_vault_from_path(&path, &alice).unwrap();
+    let size = sample_vault().get("data/big.bin").unwrap().content.len();
+    // A ranged read covering the corrupted chunk fails per-chunk authentication.
+    let mut buf = vec![0u8; size];
+    assert!(reader.read_at("data/big.bin", 0, &mut buf).is_err());
+
+    let _ = std::fs::remove_file(&path);
+}
