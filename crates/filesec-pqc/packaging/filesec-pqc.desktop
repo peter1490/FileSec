@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FileSec (post-quantum)
+GenericName=Secure File Exchange
+Comment=Offline secure file exchange with hybrid post-quantum cryptography
+Exec=filesec-pqc
+Icon=filesec-pqc
+Terminal=false
+Categories=Utility;Security;
+StartupWMClass=FileSec (post-quantum)

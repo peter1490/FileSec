@@ -26,14 +26,11 @@ use filesec_core::util::{hex, now_unix};
 use filesec_core::vault::Vault;
 use filesec_core::SuiteId;
 
+use crate::autounlock;
 use crate::passkey;
 use crate::store::{new_vault_id, Registry, Store, VaultMeta};
 
-const OK_GREEN: Color32 = Color32::from_rgb(0x3c, 0xb3, 0x71);
-const ERR_RED: Color32 = Color32::from_rgb(0xd6, 0x5d, 0x5d);
-const WARN_AMBER: Color32 = Color32::from_rgb(0xd6, 0xa5, 0x4d);
-const MUTED: Color32 = Color32::from_rgb(0x99, 0x99, 0x99);
-const ACCENT: Color32 = Color32::from_rgb(0x5a, 0x9b, 0xd4);
+use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
 
 /// Top-level application.
 pub struct App {
@@ -41,11 +38,18 @@ pub struct App {
     state: State,
     toast: Option<Toast>,
     job: Option<Job>,
+    /// One-shot flag: a secret is saved in the OS keychain for this data dir, so
+    /// try to auto-unlock with it on first launch. Cleared after the attempt is
+    /// fired, and never set after a manual lock (locking signals intent to stop).
+    auto_unlock_pending: bool,
 }
 
 struct Toast {
     msg: String,
     error: bool,
+    /// egui-clock time (seconds) the toast was first painted, for auto-dismiss.
+    /// Stamped lazily on first render so both constructors can leave it `None`.
+    shown_at: Option<f64>,
 }
 
 enum State {
@@ -82,11 +86,15 @@ struct Unlock {
     /// Whether the on-disk keystore has any passkeys enrolled (decided once at
     /// startup / lock so the unlock screen can offer the security-key button).
     has_passkeys: bool,
+    /// Whether a passphrase is saved in the OS keychain for this data dir, so the
+    /// unlock screen can offer "unlock with saved passphrase (this device)".
+    has_saved: bool,
     error: Option<String>,
 }
 
 impl Unlock {
-    /// Build the unlock screen state, noting whether the keystore has passkeys.
+    /// Build the unlock screen state, noting whether the keystore has passkeys
+    /// and whether a passphrase is saved in the OS keychain for this device.
     fn for_store(store: &Store) -> Self {
         Self {
             pass: String::new(),
@@ -95,6 +103,7 @@ impl Unlock {
                 .load_keystore()
                 .map(|k| k.has_passkeys())
                 .unwrap_or(false),
+            has_saved: autounlock::is_saved(&store.data_dir().display().to_string()),
             error: None,
         }
     }
@@ -126,6 +135,20 @@ impl Drop for PasskeyEnrollForm {
     }
 }
 
+/// The "Remember on this device" dialog: the passphrase to verify and then save
+/// into the OS keychain so this device can auto-unlock.
+#[derive(Default)]
+struct AutoUnlockForm {
+    pass: String,
+    error: Option<String>,
+}
+
+impl Drop for AutoUnlockForm {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+    }
+}
+
 /// The "Upgrade to post-quantum" confirmation dialog. Re-sealing the keystore
 /// needs the passphrase, so it is re-entered here (this also confirms intent).
 #[cfg(feature = "pqc")]
@@ -147,6 +170,28 @@ enum Nav {
     Vaults,
     Contacts,
     Identity,
+}
+
+/// Sort order for the in-vault file browser. Directories always sort before
+/// files regardless; this only orders within each group.
+#[derive(PartialEq, Clone, Copy, Default)]
+enum SortMode {
+    #[default]
+    NameAsc,
+    NameDesc,
+    SizeDesc,
+    SizeAsc,
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "Name (A–Z)",
+            SortMode::NameDesc => "Name (Z–A)",
+            SortMode::SizeDesc => "Size (large first)",
+            SortMode::SizeAsc => "Size (small first)",
+        }
+    }
 }
 
 struct OpenVault {
@@ -253,6 +298,16 @@ struct Session {
     new_vault_name: String,
     show_new_vault: bool,
     new_folder_name: String,
+    /// Folder currently being browsed inside the open vault ("" = vault root).
+    current_dir: String,
+    /// Whether the inline "new folder" composer is shown in the browser.
+    show_new_folder: bool,
+    /// Live name filter over the open vault; non-empty searches the whole vault.
+    file_search: String,
+    /// Files multi-selected in the browser (full vault paths), for batch actions.
+    selected: HashSet<String>,
+    /// Sort order for the browser's file/folder list.
+    sort: SortMode,
     contact_paste: String,
     /// A parsed key staged for confirmation before it joins the contact book.
     contact_preview: Option<ContactPreview>,
@@ -267,6 +322,11 @@ struct Session {
     passkeys: Vec<PasskeyInfo>,
     /// The open "add security key" dialog, if any.
     add_passkey: Option<PasskeyEnrollForm>,
+    /// Whether this device's passphrase is saved in the OS keychain (cached;
+    /// refreshed after enable/disable).
+    auto_unlock: bool,
+    /// The open "remember on this device" dialog, if any.
+    auto_unlock_form: Option<AutoUnlockForm>,
     data_dir: String,
 }
 
@@ -276,6 +336,7 @@ impl Session {
         contacts: ContactBook,
         registry: Registry,
         passkeys: Vec<PasskeyInfo>,
+        auto_unlock: bool,
         data_dir: String,
     ) -> Self {
         Self {
@@ -289,6 +350,11 @@ impl Session {
             new_vault_name: String::new(),
             show_new_vault: false,
             new_folder_name: String::new(),
+            current_dir: String::new(),
+            show_new_folder: false,
+            file_search: String::new(),
+            selected: HashSet::new(),
+            sort: SortMode::default(),
             contact_paste: String::new(),
             contact_preview: None,
             verify: None,
@@ -298,8 +364,21 @@ impl Session {
             migrate: None,
             passkeys,
             add_passkey: None,
+            auto_unlock,
+            auto_unlock_form: None,
             data_dir,
         }
+    }
+
+    /// Reset the browser's transient view state. Called when a vault is opened or
+    /// closed so navigation, selection, search, and the new-folder composer never
+    /// leak from one vault (or browsing session) into the next.
+    fn reset_browse(&mut self) {
+        self.current_dir.clear();
+        self.show_new_folder = false;
+        self.new_folder_name.clear();
+        self.file_search.clear();
+        self.selected.clear();
     }
 }
 
@@ -317,7 +396,13 @@ enum Action {
     ImportContainer,
     AddFiles,
     AddFolder,
+    /// Add OS files/folders dropped onto the window into the current folder.
+    DropPaths(Vec<std::path::PathBuf>),
     NewFolder,
+    /// Toggle the inline "new folder" composer in the browser.
+    ToggleNewFolder(bool),
+    /// Navigate the browser into a folder ("" = vault root).
+    EnterDir(String),
     DeleteEntry(String),
     SaveEntryAs(String),
     ViewFile(String),
@@ -325,6 +410,18 @@ enum Action {
     CheckIn,
     Discard,
     ExtractAll,
+    /// Toggle a file's membership in the browser selection.
+    ToggleSelect(String),
+    /// Select every file in the current folder view.
+    SelectAllVisible,
+    /// Clear the browser selection.
+    ClearSelection,
+    /// Remove every selected file (and selected nothing-else) from the vault.
+    RemoveSelected,
+    /// Decrypt every selected file to a chosen folder.
+    ExtractSelected,
+    /// Change the browser's sort order.
+    SetSort(SortMode),
     BeginExport(String),
     CancelExport,
     DoExport,
@@ -370,6 +467,15 @@ enum Action {
     AddPasskey,
     /// Remove the enrolled passkey at this slot index.
     RemovePasskey(usize),
+    /// Unlock using the passphrase saved in the OS keychain (this device).
+    UnlockWithKeyring,
+    /// Open / cancel the "remember on this device" dialog.
+    BeginEnableAutoUnlock,
+    CancelEnableAutoUnlock,
+    /// Verify the entered passphrase and save it to the OS keychain.
+    ConfirmEnableAutoUnlock,
+    /// Forget the passphrase saved in the OS keychain for this device.
+    DisableAutoUnlock,
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +520,8 @@ struct SessionInit {
     contacts: ContactBook,
     registry: Registry,
     passkeys: Vec<PasskeyInfo>,
+    /// Whether a passphrase is saved in the OS keychain for this data dir.
+    auto_unlock: bool,
     data_dir: String,
 }
 
@@ -467,6 +575,9 @@ enum Outcome {
     /// Replace the cached passkey list after an enroll/remove and close the
     /// "add security key" dialog.
     PasskeysUpdated(Vec<PasskeyInfo>),
+    /// Update the cached "remember on this device" state after enable/disable and
+    /// close the dialog.
+    AutoUnlockChanged(bool),
 }
 
 impl Default for App {
@@ -480,16 +591,23 @@ impl App {
     pub fn new() -> Self {
         match Store::discover() {
             Ok(store) => {
-                let state = if store.keystore_exists() {
-                    State::Unlock(Unlock::for_store(&store))
-                } else {
-                    State::FirstRun(FirstRun::default())
+                let unlock = store.keystore_exists().then(|| Unlock::for_store(&store));
+                // Offer to auto-unlock from the keychain only at first launch (a
+                // saved secret exists and this build can read it). A manual lock
+                // later never re-arms this.
+                let auto_unlock_pending = unlock
+                    .as_ref()
+                    .is_some_and(|u| u.has_saved && autounlock::SUPPORTED);
+                let state = match unlock {
+                    Some(u) => State::Unlock(u),
+                    None => State::FirstRun(FirstRun::default()),
                 };
                 App {
                     store: Some(Arc::new(store)),
                     state,
                     toast: None,
                     job: None,
+                    auto_unlock_pending,
                 }
             }
             Err(e) => App {
@@ -497,6 +615,7 @@ impl App {
                 state: State::Fatal(e),
                 toast: None,
                 job: None,
+                auto_unlock_pending: false,
             },
         }
     }
@@ -514,53 +633,80 @@ impl eframe::App for App {
         let busy = self.job.is_some();
         let mut action: Option<Action> = None;
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_enabled_ui(!busy, |ui| self.top_bar(ui, &mut action));
-        });
-
-        if let Some(t) = &self.toast {
-            egui::TopBottomPanel::bottom("toast").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let color = if t.error { ERR_RED } else { OK_GREEN };
-                    ui.colored_label(color, &t.msg);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
-                            action = Some(Action::DismissToast);
-                        }
-                    });
+        // Left sidebar — only once unlocked. Auth/fatal screens are full-window.
+        if matches!(self.state, State::Unlocked(_)) {
+            let sidebar_fill = theme::colors_for(ctx).sidebar;
+            egui::SidePanel::left("sidebar")
+                .resizable(false)
+                .exact_width(theme::SIDEBAR_W)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(sidebar_fill)
+                        .inner_margin(egui::Margin::same(12)),
+                )
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(!busy, |ui| self.sidebar(ui, &mut action));
                 });
-            });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_enabled_ui(!busy, |ui| match &mut self.state {
-                State::Fatal(msg) => {
-                    ui.heading("FileSec could not start");
-                    ui.colored_label(ERR_RED, msg.clone());
-                }
-                State::FirstRun(f) => first_run_ui(f, ui, &mut action),
-                State::Unlock(u) => unlock_ui(u, ui, &mut action),
-                State::Unlocked(s) => session_ui(s, ui, &mut action),
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::colors_for(ctx).bg)
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(!busy, |ui| match &mut self.state {
+                    State::Fatal(msg) => fatal_ui(msg, ui),
+                    State::FirstRun(f) => first_run_ui(f, ui, &mut action),
+                    State::Unlock(u) => unlock_ui(u, ui, &mut action),
+                    State::Unlocked(s) => session_ui(s, ui, &mut action),
+                });
             });
-        });
 
+        // Floating, auto-dismissing toast (bottom-right).
+        if let Some(t) = &mut self.toast {
+            let now = ctx.input(|i| i.time);
+            let shown = *t.shown_at.get_or_insert(now);
+            let msg = t.msg.clone();
+            let error = t.error;
+            let dismissed = theme::toast(ctx, &msg, error);
+            const TTL: f64 = 4.0;
+            let age = now - shown;
+            if dismissed || age > TTL {
+                action = Some(Action::DismissToast);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                    (TTL - age).max(0.05),
+                ));
+            }
+        }
+
+        // Busy overlay: dimmed backdrop + centered spinner.
         if busy {
             let label = self
                 .job
                 .as_ref()
                 .map(|j| j.label.clone())
                 .unwrap_or_default();
-            egui::Window::new("working")
-                .title_bar(false)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            egui::Modal::new(egui::Id::new("working"))
+                .backdrop_color(Color32::from_black_alpha(140))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
+                        ui.add_space(8.0);
                         ui.label(label);
                     });
                 });
+        }
+
+        // One-shot keychain auto-unlock on first launch: fire it once when idle
+        // and still on the unlock screen, without overriding a user action.
+        if self.auto_unlock_pending && !busy && action.is_none() {
+            self.auto_unlock_pending = false;
+            if matches!(self.state, State::Unlock(_)) {
+                action = Some(Action::UnlockWithKeyring);
+            }
         }
 
         if let Some(a) = action {
@@ -587,34 +733,87 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn top_bar(&self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    fn sidebar(&self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        let c = theme::colors(ui);
+
+        // Brand.
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.heading(RichText::new("🔒 FileSec").color(ACCENT));
-            ui.label(RichText::new("secure file exchange").color(MUTED).small());
-            if let State::Unlocked(s) = &self.state {
-                ui.separator();
-                let mut nav_button = |ui: &mut egui::Ui, label: &str, nav: Nav| {
-                    let selected = s.open.is_none() && s.nav == nav;
-                    if ui.selectable_label(selected, label).clicked() {
-                        *action = Some(Action::Nav(nav));
+            ui.label(theme::icon_text(theme::icon::LOCK_KEY, 22.0).color(c.accent));
+            ui.label(RichText::new("FileSec").heading().color(c.accent));
+        });
+        ui.label(
+            RichText::new("secure file exchange")
+                .small()
+                .color(c.text_muted),
+        );
+        ui.add_space(16.0);
+
+        if let State::Unlocked(s) = &self.state {
+            let mut nav_item = |ui: &mut egui::Ui, glyph: &str, label: &str, nav: Nav| {
+                let selected = s.open.is_none() && s.nav == nav;
+                if sidebar_nav_item(ui, glyph, label, selected).clicked() {
+                    *action = Some(Action::Nav(nav));
+                }
+            };
+            nav_item(ui, theme::icon::VAULT, "Vaults", Nav::Vaults);
+            nav_item(ui, theme::icon::CONTACTS, "Contacts", Nav::Contacts);
+            nav_item(ui, theme::icon::IDENTITY, "My Identity", Nav::Identity);
+
+            // Bottom-pinned: theme controls and Lock.
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.add_space(2.0);
+                if theme::secondary_button(ui, "Lock").clicked() {
+                    *action = Some(Action::Lock);
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let dark = ui.visuals().dark_mode;
+                    let (glyph, hover, pref) = if dark {
+                        (
+                            theme::icon::SUN,
+                            "Switch to light",
+                            egui::ThemePreference::Light,
+                        )
+                    } else {
+                        (
+                            theme::icon::MOON,
+                            "Switch to dark",
+                            egui::ThemePreference::Dark,
+                        )
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(theme::icon_text(glyph, 16.0).color(c.text_muted))
+                                .frame(false),
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        ui.ctx().set_theme(pref);
                     }
-                };
-                nav_button(ui, "Vaults", Nav::Vaults);
-                nav_button(ui, "Contacts", Nav::Contacts);
-                nav_button(ui, "My Identity", Nav::Identity);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Lock").clicked() {
-                        *action = Some(Action::Lock);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                theme::icon_text(theme::icon::GEAR, 16.0).color(c.text_muted),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Follow system theme")
+                        .clicked()
+                    {
+                        ui.ctx().set_theme(egui::ThemePreference::System);
                     }
                 });
-            }
-        });
+            });
+        }
     }
 
     fn set_toast(&mut self, msg: impl Into<String>, error: bool) {
         self.toast = Some(Toast {
             msg: msg.into(),
             error,
+            shown_at: None,
         });
     }
 
@@ -674,7 +873,11 @@ impl App {
 
     fn apply(&mut self, report: JobReport) {
         if let Some((msg, error)) = report.toast {
-            self.toast = Some(Toast { msg, error });
+            self.toast = Some(Toast {
+                msg,
+                error,
+                shown_at: None,
+            });
         }
         match report.outcome {
             Outcome::Noop => {}
@@ -684,6 +887,7 @@ impl App {
                     contacts,
                     registry,
                     passkeys,
+                    auto_unlock,
                     data_dir,
                 } = *init;
                 self.state = State::Unlocked(Box::new(Session::new(
@@ -691,6 +895,7 @@ impl App {
                     contacts,
                     registry,
                     passkeys,
+                    auto_unlock,
                     data_dir,
                 )));
             }
@@ -713,6 +918,7 @@ impl App {
                     s.registry = registry;
                     s.new_vault_name.clear();
                     s.show_new_vault = false;
+                    s.reset_browse();
                     s.open = Some(OpenVault {
                         id,
                         reader: *reader,
@@ -721,6 +927,7 @@ impl App {
             }
             Outcome::SetOpen { id, reader } => {
                 if let State::Unlocked(s) = &mut self.state {
+                    s.reset_browse();
                     s.open = Some(OpenVault {
                         id,
                         reader: *reader,
@@ -801,6 +1008,12 @@ impl App {
                     s.add_passkey = None;
                 }
             }
+            Outcome::AutoUnlockChanged(enabled) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.auto_unlock = enabled;
+                    s.auto_unlock_form = None;
+                }
+            }
         }
     }
 
@@ -861,6 +1074,53 @@ impl App {
                 if let State::Unlocked(s) = &mut self.state {
                     wipe_all_views(&mut s.views);
                     s.open = None;
+                    s.reset_browse();
+                }
+            }
+            Action::EnterDir(dir) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.current_dir = dir;
+                    // Selection and search are scoped to a folder view; leaving the
+                    // folder (or a breadcrumb jump) starts fresh.
+                    s.selected.clear();
+                    s.file_search.clear();
+                }
+            }
+            Action::ToggleNewFolder(b) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.show_new_folder = b;
+                    if !b {
+                        s.new_folder_name.clear();
+                    }
+                }
+            }
+            Action::ToggleSelect(path) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if !s.selected.insert(path.clone()) {
+                        s.selected.remove(&path);
+                    }
+                }
+            }
+            Action::SelectAllVisible => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(o) = &s.open {
+                        let entries = snapshot_entries(&o.reader);
+                        for row in visible_rows(&entries, &s.current_dir, &s.file_search, s.sort) {
+                            if row.kind == EntryKind::File {
+                                s.selected.insert(row.path);
+                            }
+                        }
+                    }
+                }
+            }
+            Action::ClearSelection => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.selected.clear();
+                }
+            }
+            Action::SetSort(mode) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.sort = mode;
                 }
             }
             Action::CancelExport => {
@@ -948,6 +1208,16 @@ impl App {
                     s.add_passkey = None;
                 }
             }
+            Action::BeginEnableAutoUnlock => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.auto_unlock_form = Some(AutoUnlockForm::default());
+                }
+            }
+            Action::CancelEnableAutoUnlock => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.auto_unlock_form = None;
+                }
+            }
             Action::CancelVerify => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.verify = None;
@@ -979,13 +1249,19 @@ impl App {
             Action::UnlockWithPasskey => self.spawn_unlock_passkey(ctx),
             Action::AddPasskey => self.spawn_add_passkey(ctx),
             Action::RemovePasskey(i) => self.spawn_remove_passkey(ctx, i),
+            Action::UnlockWithKeyring => self.spawn_unlock_keyring(ctx),
+            Action::ConfirmEnableAutoUnlock => self.spawn_enable_auto_unlock(ctx),
+            Action::DisableAutoUnlock => self.spawn_disable_auto_unlock(ctx),
             Action::CreateVault => self.spawn_create_vault(ctx),
             Action::OpenVault(id) => self.spawn_open_vault(ctx, id),
             Action::DeleteVault(id) => self.spawn_delete_vault(ctx, id),
             Action::AddFiles => self.spawn_add_files(ctx),
             Action::AddFolder => self.spawn_add_folder(ctx),
+            Action::DropPaths(paths) => self.spawn_add_paths(ctx, paths),
             Action::NewFolder => self.spawn_new_folder(ctx),
             Action::DeleteEntry(p) => self.spawn_delete_entry(ctx, p),
+            Action::RemoveSelected => self.spawn_remove_selected(ctx),
+            Action::ExtractSelected => self.spawn_extract_selected(ctx),
             Action::ExtractAll => self.spawn_extract_all(ctx),
             Action::SaveEntryAs(p) => self.spawn_save_entry_as(ctx, p),
             Action::ViewFile(p) => self.spawn_view(ctx, p),
@@ -1072,6 +1348,8 @@ impl App {
                     contacts: ContactBook::default(),
                     registry: Registry::default(),
                     passkeys: Vec::new(),
+                    // A brand-new identity has nothing saved in the keychain yet.
+                    auto_unlock: false,
                     data_dir,
                 })),
                 "Identity created. Your keys are protected by your passphrase.",
@@ -1123,6 +1401,7 @@ impl App {
                     contacts,
                     registry,
                     passkeys,
+                    auto_unlock: autounlock::is_saved(&data_dir),
                     data_dir,
                 })),
                 "Unlocked.",
@@ -1198,6 +1477,7 @@ impl App {
                                 contacts,
                                 registry,
                                 passkeys,
+                                auto_unlock: autounlock::is_saved(&data_dir),
                                 data_dir,
                             })),
                             "Unlocked with your security key.",
@@ -1304,6 +1584,139 @@ impl App {
         });
     }
 
+    /// Unlock using the passphrase saved in the OS keychain for this data dir.
+    /// If the saved secret is gone or stale it falls back to the passphrase
+    /// prompt with a clear message (and drops a stale entry).
+    fn spawn_unlock_keyring(&mut self, ctx: &egui::Context) {
+        if let State::Unlock(u) = &mut self.state {
+            u.error = None;
+        }
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(ctx, "Unlocking from this device…", move || {
+            let data_dir = store.data_dir().display().to_string();
+            let secret = match autounlock::load(&data_dir) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(
+                            "No saved passphrase for this device. Enter your passphrase.".into(),
+                        ),
+                        toast: None,
+                    }
+                }
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e.to_string()),
+                        toast: None,
+                    }
+                }
+            };
+            let ks = match store.load_keystore() {
+                Ok(k) => k,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
+            let identity = match ks.unlock(secret.as_slice()) {
+                Ok(i) => i,
+                Err(_) => {
+                    // The saved secret no longer opens the keystore (e.g. the
+                    // passphrase was changed elsewhere). Drop the stale entry.
+                    let _ = autounlock::clear(&data_dir);
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(
+                            "The saved passphrase no longer works and was removed. \
+                             Enter your passphrase."
+                                .into(),
+                        ),
+                        toast: None,
+                    };
+                }
+            };
+            let contacts = store.load_contacts(&identity).unwrap_or_default();
+            let registry = store.load_registry(&identity).unwrap_or_default();
+            let passkeys = ks.passkey_slots();
+            store.clean_checkout_dir();
+            JobReport::ok(
+                Outcome::Unlocked(Box::new(SessionInit {
+                    identity,
+                    contacts,
+                    registry,
+                    passkeys,
+                    auto_unlock: true,
+                    data_dir,
+                })),
+                "Unlocked from this device.",
+            )
+        });
+    }
+
+    /// Verify the entered passphrase against the keystore, then save it to the OS
+    /// keychain so this device can auto-unlock.
+    fn spawn_enable_auto_unlock(&mut self, ctx: &egui::Context) {
+        let pass = match &mut self.state {
+            State::Unlocked(s) => match &mut s.auto_unlock_form {
+                Some(f) => {
+                    if f.pass.is_empty() {
+                        f.error = Some("Enter your passphrase to confirm.".into());
+                        return;
+                    }
+                    f.error = None;
+                    // Wiped after the worker uses it (see `spawn_create_identity`).
+                    Zeroizing::new(std::mem::take(&mut f.pass))
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(ctx, "Saving to this device…", move || {
+            let ks = match store.load_keystore() {
+                Ok(k) => k,
+                Err(e) => return JobReport::err(e),
+            };
+            // Confirm the passphrase actually opens the keystore before saving it.
+            if ks.unlock(pass.as_bytes()).is_err() {
+                return JobReport::err("That passphrase is incorrect.");
+            }
+            let data_dir = store.data_dir().display().to_string();
+            if let Err(e) = autounlock::save(&data_dir, pass.as_bytes()) {
+                return JobReport::err(e.to_string());
+            }
+            JobReport::ok(
+                Outcome::AutoUnlockChanged(true),
+                "This device will now unlock automatically. Your passphrase still works.",
+            )
+        });
+    }
+
+    /// Forget the passphrase saved in the OS keychain for this data dir.
+    fn spawn_disable_auto_unlock(&mut self, ctx: &egui::Context) {
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(ctx, "Updating this device…", move || {
+            let data_dir = store.data_dir().display().to_string();
+            if let Err(e) = autounlock::clear(&data_dir) {
+                return JobReport::err(e.to_string());
+            }
+            JobReport::ok(
+                Outcome::AutoUnlockChanged(false),
+                "This device will no longer unlock automatically.",
+            )
+        });
+    }
+
     fn spawn_create_vault(&mut self, ctx: &egui::Context) {
         let (name, registry) = match &self.state {
             State::Unlocked(s) => (s.new_vault_name.trim().to_string(), s.registry.clone()),
@@ -1400,137 +1813,97 @@ impl App {
         });
     }
 
+    /// The folder currently being browsed in the open vault ("" = root).
+    fn current_dir(&self) -> String {
+        if let State::Unlocked(s) = &self.state {
+            s.current_dir.clone()
+        } else {
+            String::new()
+        }
+    }
+
     fn spawn_add_files(&mut self, ctx: &egui::Context) {
-        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
-            (Some(s), Some(i)) => (s, i),
-            _ => return,
-        };
         let files = match rfd::FileDialog::new().pick_files() {
             Some(f) => f,
             None => return,
         };
-        let (id, reader, registry) = match self.open_ctx() {
-            Some(x) => x,
-            None => return,
-        };
-        self.spawn_job(ctx, "Encrypting…", move || {
-            // Stream each picked file straight from disk into the vault — neither
-            // the files nor the existing vault are loaded into memory.
-            let mut existing: HashSet<String> =
-                reader.entries().iter().map(|e| e.path.clone()).collect();
-            let mut added = Vec::new();
-            let mut failed = 0usize;
-            for path in files {
-                if std::fs::File::open(&path).is_err() {
-                    failed += 1;
-                    continue;
-                }
-                let base = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file".into());
-                let name = unique_name_in(&existing, &base);
-                existing.insert(name.clone());
-                let mtime = file_mtime(&path);
-                added.push(format::AddedFile {
-                    vault_path: name,
-                    source: path,
-                    mtime,
-                    mode: None,
-                });
-            }
-            if added.is_empty() {
-                return JobReport::err(if failed > 0 {
-                    format!("{failed} file(s) could not be read.")
-                } else {
-                    "No files to add.".into()
-                });
-            }
-            let n = added.len();
-            if let Err(e) = store.append_files_to_vault(&identity, &id, &reader, &added, &[]) {
-                return JobReport::err(e);
-            }
-            let msg = if failed > 0 {
-                format!("Added {n} file(s); {failed} could not be read.")
-            } else {
-                format!("Added {n} file(s).")
-            };
-            finalize_after_save(&store, &identity, id, registry, msg)
-        });
+        self.add_sources(ctx, files);
     }
 
     fn spawn_add_folder(&mut self, ctx: &egui::Context) {
-        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
-            (Some(s), Some(i)) => (s, i),
-            _ => return,
-        };
         let base = match rfd::FileDialog::new().pick_folder() {
             Some(p) => p,
             None => return,
         };
+        self.add_sources(ctx, vec![base]);
+    }
+
+    /// Add OS files/folders dropped onto the window. Same path as the pickers.
+    fn spawn_add_paths(&mut self, ctx: &egui::Context, paths: Vec<std::path::PathBuf>) {
+        self.add_sources(ctx, paths);
+    }
+
+    /// Shared core for adding OS files/folders into the open vault at the current
+    /// folder — used by "Add files…", "Add folder…", and drag-and-drop. Each
+    /// source streams straight from disk; nothing is held in memory at once.
+    fn add_sources(&mut self, ctx: &egui::Context, sources: Vec<std::path::PathBuf>) {
+        if sources.is_empty() {
+            return;
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let into = self.current_dir();
         let (id, reader, registry) = match self.open_ctx() {
             Some(x) => x,
             None => return,
         };
         self.spawn_job(ctx, "Encrypting…", move || {
-            // Walk the folder and stream every file straight from disk — the
-            // tree's contents are never held in memory at once.
-            let root = base
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "folder".into());
-            let existing: HashSet<String> =
-                reader.entries().iter().map(|e| e.path.clone()).collect();
-            let mut added = Vec::new();
-            let mut dirs = Vec::new();
-            for entry in walkdir::WalkDir::new(&base).into_iter().flatten() {
-                let rel = match entry.path().strip_prefix(&base) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if rel.as_os_str().is_empty() {
-                    continue;
-                }
-                let vault_path = format!("{root}/{}", rel.to_string_lossy());
-                if existing.contains(&vault_path) {
-                    continue; // skip collisions, as the old in-memory path did
-                }
-                if entry.file_type().is_dir() {
-                    dirs.push(vault_path);
-                } else if entry.file_type().is_file() && std::fs::File::open(entry.path()).is_ok() {
-                    added.push(format::AddedFile {
-                        vault_path,
-                        source: entry.path().to_path_buf(),
-                        mtime: file_mtime(entry.path()),
-                        mode: None,
-                    });
-                }
+            let (added, dirs, failed) = plan_additions(&reader, &into, &sources);
+            if added.is_empty() && dirs.is_empty() {
+                return JobReport::err(if failed > 0 {
+                    format!("{failed} item(s) could not be read.")
+                } else {
+                    "Nothing new to add.".into()
+                });
             }
             let n = added.len();
             if let Err(e) = store.append_files_to_vault(&identity, &id, &reader, &added, &dirs) {
                 return JobReport::err(e);
             }
-            finalize_after_save(
-                &store,
-                &identity,
-                id,
-                registry,
-                format!("Added folder \"{root}\" ({n} file(s))."),
-            )
+            let dest = if into.is_empty() {
+                String::new()
+            } else {
+                format!(" to {}", leaf_name(&into))
+            };
+            let msg = if failed > 0 {
+                format!("Added {n} file(s){dest}; {failed} could not be read.")
+            } else {
+                format!("Added {n} file(s){dest}.")
+            };
+            finalize_after_save(&store, &identity, id, registry, msg)
         });
     }
 
     fn spawn_new_folder(&mut self, ctx: &egui::Context) {
-        let name = match &self.state {
-            State::Unlocked(s) => s.new_folder_name.trim().to_string(),
+        let (leaf, into) = match &self.state {
+            State::Unlocked(s) => (s.new_folder_name.trim().to_string(), s.current_dir.clone()),
             _ => return,
         };
-        if name.is_empty() {
+        if leaf.is_empty() {
             self.set_toast("Enter a folder name.", true);
+            return;
+        }
+        // A folder name is a single path segment; a slash would silently create a
+        // nested tree and desync the breadcrumb, so reject it.
+        if leaf.contains('/') {
+            self.set_toast("Folder names can't contain “/”.", true);
             return;
         }
         if let State::Unlocked(s) = &mut self.state {
             s.new_folder_name.clear();
+            s.show_new_folder = false;
         }
         let (store, identity) = match (self.store_arc(), self.ident_arc()) {
             (Some(s), Some(i)) => (s, i),
@@ -1540,11 +1913,19 @@ impl App {
             Some(x) => x,
             None => return,
         };
+        let vault_path = if into.is_empty() {
+            leaf.clone()
+        } else {
+            format!("{into}/{leaf}")
+        };
         self.spawn_job(ctx, "Saving…", move || {
             // Stream the existing data through unchanged and just add the dir entry
             // — no need to decrypt the whole vault into memory.
+            if reader.entries().iter().any(|e| e.path == vault_path) {
+                return JobReport::err(format!("\"{leaf}\" already exists here."));
+            }
             if let Err(e) =
-                store.append_files_to_vault(&identity, &id, &reader, &[], &[name.clone()])
+                store.append_files_to_vault(&identity, &id, &reader, &[], &[vault_path.clone()])
             {
                 return JobReport::err(e);
             }
@@ -1553,8 +1934,104 @@ impl App {
                 &identity,
                 id,
                 registry,
-                format!("Created folder \"{name}\"."),
+                format!("Created folder \"{leaf}\"."),
             )
+        });
+    }
+
+    /// Remove every file in the browser selection in one streaming pass.
+    fn spawn_remove_selected(&mut self, ctx: &egui::Context) {
+        let paths: Vec<String> = match &self.state {
+            State::Unlocked(s) => s.selected.iter().cloned().collect(),
+            _ => return,
+        };
+        if paths.is_empty() {
+            self.set_toast("Select files to remove first.", true);
+            return;
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        let n = paths.len();
+        self.spawn_job(ctx, "Removing…", move || {
+            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, &paths) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Removed {n} file(s)."),
+            )
+        });
+    }
+
+    /// Decrypt every file in the browser selection to a chosen folder, recreating
+    /// each file's vault-relative path underneath it.
+    fn spawn_extract_selected(&mut self, ctx: &egui::Context) {
+        let mut paths: Vec<String> = match &self.state {
+            State::Unlocked(s) => s.selected.iter().cloned().collect(),
+            _ => return,
+        };
+        if paths.is_empty() {
+            self.set_toast("Select files to extract first.", true);
+            return;
+        }
+        paths.sort();
+        let (_, reader) = match self.open_reader() {
+            Some(x) => x,
+            None => return,
+        };
+        let dest = match rfd::FileDialog::new().pick_folder() {
+            Some(p) => p,
+            None => return,
+        };
+        let n = paths.len();
+        self.spawn_job(ctx, "Decrypting…", move || {
+            let mut failed = 0usize;
+            for path in &paths {
+                // Paths are normalized (never absolute, never `..`), so joining is
+                // confined to `dest`.
+                let out_path = dest.join(path);
+                if let Some(parent) = out_path.parent() {
+                    if std::fs::create_dir_all(parent).is_err() {
+                        failed += 1;
+                        continue;
+                    }
+                }
+                let out = match std::fs::File::create(&out_path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let mut out = std::io::BufWriter::new(out);
+                if reader.read_entry_to_writer(path, &mut out).is_err()
+                    || std::io::Write::flush(&mut out).is_err()
+                {
+                    failed += 1;
+                }
+            }
+            let saved = n - failed;
+            if saved == 0 {
+                return JobReport::err("Could not extract the selected files.");
+            }
+            let msg = if failed > 0 {
+                format!(
+                    "Extracted {saved} file(s) to {}; {failed} failed.",
+                    dest.display()
+                )
+            } else {
+                format!("Extracted {saved} file(s) to {}.", dest.display())
+            };
+            JobReport::ok(Outcome::Noop, msg)
         });
     }
 
@@ -2124,8 +2601,10 @@ impl App {
                     contacts,
                     registry,
                     // Migration re-seals a fresh passphrase-only keystore; any
-                    // security keys must be re-enrolled afterwards.
+                    // security keys must be re-enrolled afterwards. The passphrase
+                    // is unchanged, so a saved keychain secret stays valid.
                     passkeys: Vec::new(),
+                    auto_unlock: autounlock::is_saved(&data_dir),
                     data_dir,
                 })),
                 "Upgraded to post-quantum. Your safety number changed — re-share your \
@@ -2470,99 +2949,166 @@ fn build_contact_preview(s: &Session, pubid: PublicIdentity) -> ContactPreview {
 // Screen rendering (collects actions only).
 // ---------------------------------------------------------------------------
 
-fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    ui.add_space(20.0);
+/// A full-width sidebar navigation row: icon + label, with selected/hover states.
+fn sidebar_nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool) -> egui::Response {
+    let c = theme::colors(ui);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+    let bg = if selected {
+        theme::accent_soft(c)
+    } else if resp.hovered() {
+        c.surface_hi
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_SM), bg);
+    let fg = if selected { c.accent } else { c.text };
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        glyph,
+        egui::FontId::new(18.0, egui::FontFamily::Name("phosphor".into())),
+        fg,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 40.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(14.5, egui::FontFamily::Proportional),
+        fg,
+    );
+    resp
+}
+
+fn fatal_ui(msg: &str, ui: &mut egui::Ui) {
+    ui.add_space(40.0);
     ui.vertical_centered(|ui| {
+        ui.heading("FileSec could not start");
+        ui.add_space(8.0);
+        ui.colored_label(ERR_RED, msg);
+    });
+}
+
+fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let c = theme::colors(ui);
+    ui.add_space(36.0);
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(440.0);
+        ui.label(theme::icon_text(theme::icon::LOCK_KEY, 40.0).color(c.accent));
+        ui.add_space(6.0);
         ui.heading("Welcome to FileSec");
         ui.label(
-            RichText::new("Create your identity. Your private keys never leave this device and are\nencrypted with your passphrase.")
-                .color(MUTED),
+            RichText::new(
+                "Create your identity. Your private keys never leave this device \
+                 and are encrypted with your passphrase.",
+            )
+            .color(c.text_muted),
+        );
+        ui.add_space(18.0);
+
+        theme::card(ui, |ui| {
+            field_label(ui, "Display name");
+            theme::text_input(ui, &mut f.name, "e.g. Alice", false);
+            ui.add_space(10.0);
+            field_label(ui, "Passphrase");
+            theme::text_input(ui, &mut f.pass, "At least 8 characters", true);
+            ui.add_space(10.0);
+            field_label(ui, "Confirm passphrase");
+            theme::text_input(ui, &mut f.pass2, "Repeat passphrase", true);
+            ui.add_space(14.0);
+            if let Some(e) = &f.error {
+                ui.colored_label(c.err, e);
+                ui.add_space(10.0);
+            }
+            if theme::primary_button_full(ui, "Create identity").clicked() {
+                *action = Some(Action::CreateIdentity);
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(
+                "⚠ There is no password recovery. If you forget your passphrase, \
+                 your vaults cannot be opened.",
+            )
+            .color(c.warn)
+            .small(),
         );
     });
-    ui.add_space(16.0);
-    egui::Grid::new("firstrun")
-        .num_columns(2)
-        .spacing([12.0, 10.0])
-        .show(ui, |ui| {
-            ui.label("Display name");
-            ui.text_edit_singleline(&mut f.name);
-            ui.end_row();
-            ui.label("Passphrase");
-            ui.add(egui::TextEdit::singleline(&mut f.pass).password(true));
-            ui.end_row();
-            ui.label("Confirm passphrase");
-            ui.add(egui::TextEdit::singleline(&mut f.pass2).password(true));
-            ui.end_row();
-        });
-    ui.add_space(12.0);
-    if let Some(e) = &f.error {
-        ui.colored_label(ERR_RED, e);
-    }
-    if ui
-        .button(RichText::new("Create identity").strong())
-        .clicked()
-    {
-        *action = Some(Action::CreateIdentity);
-    }
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("⚠ There is no password recovery. If you forget your passphrase, your vaults cannot be opened.")
-            .color(MUTED)
-            .small(),
-    );
+}
+
+/// A small muted field caption above a form input.
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    let c = theme::colors(ui);
+    ui.label(RichText::new(text).small().color(c.text_muted));
+    ui.add_space(2.0);
 }
 
 fn unlock_ui(u: &mut Unlock, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    ui.add_space(40.0);
+    let c = theme::colors(ui);
+    ui.add_space(60.0);
     ui.vertical_centered(|ui| {
+        ui.set_max_width(420.0);
+        ui.label(theme::icon_text(theme::icon::LOCK, 40.0).color(c.accent));
+        ui.add_space(6.0);
         ui.heading("Unlock FileSec");
-        ui.add_space(12.0);
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut u.pass)
-                .password(true)
-                .hint_text("Passphrase"),
-        );
-        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        ui.add_space(8.0);
-        if ui.button(RichText::new("Unlock").strong()).clicked() || submit {
-            *action = Some(Action::Unlock);
-        }
+        ui.add_space(16.0);
 
-        // Security-key (passkey) unlock, when one is enrolled and this build
-        // supports the hardware.
-        if u.has_passkeys && passkey::SUPPORTED {
-            ui.add_space(14.0);
-            ui.label(RichText::new("— or —").color(MUTED).small());
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut u.pin)
-                    .password(true)
-                    .desired_width(220.0)
-                    .hint_text("Security-key PIN (if set)"),
-            );
-            ui.add_space(6.0);
-            if ui
-                .button(RichText::new("🔑 Unlock with security key").strong())
-                .clicked()
-            {
-                *action = Some(Action::UnlockWithPasskey);
-            }
-        } else if u.has_passkeys {
-            ui.add_space(14.0);
-            ui.label(
-                RichText::new(
-                    "This identity has a security key enrolled, but this build can't use it \
-                     (rebuild with --features passkey). Use your passphrase.",
-                )
-                .color(MUTED)
-                .small(),
-            );
-        }
-
-        if let Some(e) = &u.error {
+        theme::card(ui, |ui| {
+            let resp = theme::text_input(ui, &mut u.pass, "Passphrase", true);
+            let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
-            ui.colored_label(ERR_RED, e);
-        }
+            if theme::primary_button_full(ui, "Unlock").clicked() || submit {
+                *action = Some(Action::Unlock);
+            }
+
+            // Security-key (passkey) unlock, when one is enrolled and this build
+            // supports the hardware.
+            if u.has_passkeys && passkey::SUPPORTED {
+                theme::divider_or(ui);
+                theme::text_input(ui, &mut u.pin, "Security-key PIN (if set)", true);
+                ui.add_space(6.0);
+                if theme::secondary_button_full(ui, "🔑  Unlock with security key").clicked() {
+                    *action = Some(Action::UnlockWithPasskey);
+                }
+            } else if u.has_passkeys {
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "This identity has a security key enrolled, but this build can't use it \
+                         (rebuild with --features passkey). Use your passphrase.",
+                    )
+                    .color(c.text_muted)
+                    .small(),
+                );
+            }
+
+            // Saved-passphrase (OS keychain) unlock, when one is stored for this
+            // device and this build can read it.
+            if u.has_saved && autounlock::SUPPORTED {
+                theme::divider_or(ui);
+                if theme::secondary_button_full(ui, "🔓  Unlock with saved passphrase").clicked()
+                {
+                    *action = Some(Action::UnlockWithKeyring);
+                }
+            } else if u.has_saved {
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "A passphrase is saved for this device, but this build can't use it \
+                         (rebuild with --features keyring). Use your passphrase.",
+                    )
+                    .color(c.text_muted)
+                    .small(),
+                );
+            }
+
+            if let Some(e) = &u.error {
+                ui.add_space(10.0);
+                ui.colored_label(c.err, e);
+            }
+        });
     });
 }
 
@@ -2596,43 +3142,52 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     if s.add_passkey.is_some() {
         add_passkey_window(s, ui.ctx(), action);
     }
+    if s.auto_unlock_form.is_some() {
+        autounlock_window(s, ui.ctx(), action);
+    }
 }
 
 fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    ui.horizontal(|ui| {
-        ui.heading("Vaults");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Import .fsec…").clicked() {
-                *action = Some(Action::ImportContainer);
-            }
-            if ui.button("➕ New vault").clicked() {
-                *action = Some(Action::ToggleNewVault(!s.show_new_vault));
-            }
-        });
+    let c = theme::colors(ui);
+    theme::section_header(ui, "Vaults", |ui| {
+        if theme::primary_button(ui, "+  New vault").clicked() {
+            *action = Some(Action::ToggleNewVault(!s.show_new_vault));
+        }
+        if theme::secondary_button(ui, "Import .fsec…").clicked() {
+            *action = Some(Action::ImportContainer);
+        }
     });
 
     if s.show_new_vault {
-        ui.horizontal(|ui| {
-            ui.label("Name:");
-            ui.text_edit_singleline(&mut s.new_vault_name);
-            if ui.button("Create").clicked() {
-                *action = Some(Action::CreateVault);
-            }
-            if ui.button("Cancel").clicked() {
-                *action = Some(Action::ToggleNewVault(false));
-            }
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.new_vault_name)
+                        .hint_text("Vault name")
+                        .desired_width(240.0),
+                );
+                if theme::primary_button(ui, "Create").clicked() {
+                    *action = Some(Action::CreateVault);
+                }
+                if theme::secondary_button(ui, "Cancel").clicked() {
+                    *action = Some(Action::ToggleNewVault(false));
+                }
+            });
         });
     }
 
-    ui.separator();
     if s.registry.vaults.is_empty() {
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.colored_label(
-                MUTED,
-                "No vaults yet. Create one, or import a .fsec someone sent you.",
-            );
-        });
+        theme::empty_state(
+            ui,
+            theme::icon::VAULT,
+            "No vaults yet",
+            "Create one, or import a .fsec someone sent you.",
+            |ui| {
+                if theme::primary_button(ui, "+  New vault").clicked() {
+                    *action = Some(Action::ToggleNewVault(true));
+                }
+            },
+        );
         return;
     }
 
@@ -2640,23 +3195,30 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let mut vaults = s.registry.vaults.clone();
         vaults.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
         for v in vaults {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            theme::card(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.label(theme::icon_text(theme::icon::VAULT, 22.0).color(c.accent));
+                    ui.add_space(6.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&v.name).strong());
-                        ui.colored_label(
-                            MUTED,
-                            format!("{} file(s) · {}", v.file_count, human_size(v.total_size)),
+                        ui.label(RichText::new(&v.name).strong().size(15.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} file(s) · {}",
+                                v.file_count,
+                                human_size(v.total_size)
+                            ))
+                            .color(c.text_muted)
+                            .small(),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("🗑").on_hover_text("Delete vault").clicked() {
+                        if theme::icon_button(ui, theme::icon::TRASH, "Delete vault").clicked() {
                             *action = Some(Action::DeleteVault(v.id.clone()));
                         }
-                        if ui.button("Send…").clicked() {
+                        if theme::secondary_button(ui, "Send…").clicked() {
                             *action = Some(Action::BeginExport(v.id.clone()));
                         }
-                        if ui.button("Open").clicked() {
+                        if theme::primary_button(ui, "Open").clicked() {
                             *action = Some(Action::OpenVault(v.id.clone()));
                         }
                     });
@@ -2667,192 +3229,524 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 }
 
 fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    let (name, id) = match &s.open {
-        Some(o) => (o.reader.name().to_string(), o.id.clone()),
+    let panel_rect = ui.max_rect();
+    let (name, id, entries) = match &s.open {
+        Some(o) => (
+            o.reader.name().to_string(),
+            o.id.clone(),
+            snapshot_entries(&o.reader),
+        ),
         None => return,
     };
     // Drop any view whose temp a watcher already wiped (the app was closed), so
     // the banner reflects what is actually still open.
     s.views.retain(|v| v.temp_path.exists());
-    // Leaf of the file currently checked out for editing (if any). While set,
-    // all other vault mutations are disabled and the user must check in/discard.
+    // Keep the browse state coherent with the (possibly just-mutated) vault: clamp
+    // the current folder to one that still exists, and drop any selection whose
+    // files were removed/renamed out from under us.
+    s.current_dir = clamp_dir(&entries, &s.current_dir);
+    {
+        let files: HashSet<&str> = entries
+            .iter()
+            .filter(|(_, k, _)| *k == EntryKind::File)
+            .map(|(p, _, _)| p.as_str())
+            .collect();
+        s.selected.retain(|p| files.contains(p.as_str()));
+    }
+
+    // Leaf of the file currently checked out for editing (if any). While set, all
+    // other vault mutations are disabled and the user must check in / discard.
     let editing = s.checkout.as_ref().map(|c| c.leaf.clone());
     let viewing: Vec<String> = s.views.iter().map(|v| v.leaf.clone()).collect();
+    let idle = editing.is_none();
+    let c = theme::colors(ui);
+    let cur = s.current_dir.clone();
 
+    // ---- Header: back, title, and whole-vault actions ----
     ui.horizontal(|ui| {
-        if ui.button("← Vaults").clicked() {
+        if theme::secondary_button(ui, "←  Vaults").clicked() {
             *action = Some(Action::CloseVault);
         }
+        ui.add_space(4.0);
         ui.heading(&name);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::primary_button(ui, "Send…").clicked() {
+                *action = Some(Action::BeginExport(id.clone()));
+            }
+            if theme::secondary_button(ui, "Extract all…").clicked() {
+                *action = Some(Action::ExtractAll);
+            }
+        });
     });
+    ui.add_space(8.0);
 
     if let Some(leaf) = &editing {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        theme::banner(ui, c.accent, |ui| {
             ui.horizontal(|ui| {
-                ui.colored_label(ACCENT, format!("✏ Editing {leaf}"));
+                ui.label(theme::icon_text(theme::icon::EDIT, 16.0).color(c.accent));
+                ui.label(
+                    RichText::new(format!("Editing {leaf}"))
+                        .color(c.accent)
+                        .strong(),
+                );
                 ui.label(
                     RichText::new("— edit in your app, then:")
-                        .color(MUTED)
+                        .color(c.text_muted)
                         .small(),
                 );
-                if ui.button("Check in").clicked() {
-                    *action = Some(Action::CheckIn);
-                }
-                if ui.button("Discard").clicked() {
-                    *action = Some(Action::Discard);
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::danger_button(ui, "Discard").clicked() {
+                        *action = Some(Action::Discard);
+                    }
+                    if theme::primary_button(ui, "Check in").clicked() {
+                        *action = Some(Action::CheckIn);
+                    }
+                });
             });
         });
     }
 
     if !viewing.is_empty() {
         let plural = if viewing.len() == 1 { "y" } else { "ies" };
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        theme::banner(ui, c.accent, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(
-                    ACCENT,
-                    format!("👁 Viewing {} read-only cop{plural}", viewing.len()),
+                ui.label(theme::icon_text(theme::icon::EYE, 16.0).color(c.accent));
+                ui.label(
+                    RichText::new(format!("Viewing {} read-only cop{plural}", viewing.len()))
+                        .color(c.accent)
+                        .strong(),
                 );
                 ui.label(
                     RichText::new(format!("({})", viewing.join(", ")))
-                        .color(MUTED)
+                        .color(c.text_muted)
                         .small(),
                 );
                 ui.label(
                     RichText::new("— wiped automatically on close, or when you leave the vault.")
-                        .color(MUTED)
+                        .color(c.text_muted)
                         .small(),
                 );
             });
         });
     }
 
-    ui.add_enabled_ui(editing.is_none(), |ui| {
+    // ---- Drag-and-drop from the OS (into the current folder) ----
+    let modal_open = s.export.is_some()
+        || s.last_import.is_some()
+        || s.contact_preview.is_some()
+        || s.verify.is_some()
+        || s.add_passkey.is_some()
+        || s.auto_unlock_form.is_some();
+    let dnd_enabled = idle && !modal_open;
+    let hovering_files = dnd_enabled && ui.input(|i| !i.raw.hovered_files.is_empty());
+    if dnd_enabled {
+        let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            *action = Some(Action::DropPaths(dropped));
+        }
+    }
+
+    // ---- Breadcrumb + sort + search ----
+    ui.horizontal(|ui| {
+        breadcrumb(ui, &cur, action);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !s.file_search.is_empty()
+                && theme::icon_button(ui, theme::icon::CLOSE, "Clear search").clicked()
+            {
+                s.file_search.clear();
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut s.file_search)
+                    .hint_text("Search this vault…")
+                    .desired_width(180.0),
+            );
+            egui::ComboBox::from_id_salt("file_sort")
+                .selected_text(s.sort.label())
+                .show_ui(ui, |ui| {
+                    for m in [
+                        SortMode::NameAsc,
+                        SortMode::NameDesc,
+                        SortMode::SizeDesc,
+                        SortMode::SizeAsc,
+                    ] {
+                        if ui.selectable_label(s.sort == m, m.label()).clicked() {
+                            *action = Some(Action::SetSort(m));
+                        }
+                    }
+                });
+        });
+    });
+    ui.add_space(4.0);
+
+    // ---- Add content (targets the current folder) ----
+    ui.add_enabled_ui(idle, |ui| {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("➕ Add files…").clicked() {
+            if theme::secondary_button(ui, "+  Add files…").clicked() {
                 *action = Some(Action::AddFiles);
             }
-            if ui.button("📁 Add folder…").clicked() {
+            if theme::secondary_button(ui, "+  Add folder…").clicked() {
                 *action = Some(Action::AddFolder);
             }
-            ui.label("New folder:");
-            ui.add(egui::TextEdit::singleline(&mut s.new_folder_name).desired_width(120.0));
-            if ui.button("Create").clicked() {
-                *action = Some(Action::NewFolder);
-            }
-            ui.separator();
-            if ui.button("⬇ Extract all…").clicked() {
-                *action = Some(Action::ExtractAll);
-            }
-            if ui.button("📤 Send…").clicked() {
-                *action = Some(Action::BeginExport(id.clone()));
+            if theme::secondary_button(ui, "+  New folder").clicked() {
+                *action = Some(Action::ToggleNewFolder(!s.show_new_folder));
             }
         });
     });
-    ui.separator();
-
-    let open = match &s.open {
-        Some(o) => o,
-        None => return,
-    };
-    if open.reader.is_empty() {
-        ui.add_space(16.0);
-        ui.colored_label(MUTED, "Empty vault. Add files or folders above.");
-        return;
-    }
-
-    let mut rows: Vec<(String, EntryKind, u64)> = open
-        .reader
-        .entries()
-        .iter()
-        .map(|e| (e.path.clone(), e.kind, e.size))
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for (path, kind, size) in rows {
-            let depth = path.matches('/').count();
-            let indent = "    ".repeat(depth);
-            let leaf = path.rsplit('/').next().unwrap_or(&path);
+    if s.show_new_folder && idle {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
-                let label = match kind {
-                    EntryKind::Dir => format!("{indent}📁 {leaf}"),
-                    EntryKind::File => format!("{indent}📄 {leaf}"),
-                };
-                ui.label(label);
-                if kind == EntryKind::File {
-                    ui.colored_label(MUTED, human_size(size));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut s.new_folder_name)
+                        .hint_text("Folder name")
+                        .desired_width(220.0),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::primary_button(ui, "Create").clicked() || submit {
+                    *action = Some(Action::NewFolder);
                 }
+                if theme::secondary_button(ui, "Cancel").clicked() {
+                    *action = Some(Action::ToggleNewFolder(false));
+                }
+            });
+        });
+    }
+    ui.add_space(6.0);
+
+    // ---- Selection action bar ----
+    if idle && !s.selected.is_empty() {
+        let n = s.selected.len();
+        theme::banner(ui, c.accent, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{n} selected"))
+                        .color(c.accent)
+                        .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let idle = editing.is_none();
-                    if ui
-                        .add_enabled(idle, egui::Button::new("🗑").small())
-                        .on_hover_text("Remove")
-                        .clicked()
-                    {
-                        *action = Some(Action::DeleteEntry(path.clone()));
+                    if theme::secondary_button(ui, "Clear").clicked() {
+                        *action = Some(Action::ClearSelection);
                     }
-                    if kind == EntryKind::File && ui.small_button("Save as…").clicked() {
-                        *action = Some(Action::SaveEntryAs(path.clone()));
+                    if theme::danger_button(ui, "Remove").clicked() {
+                        *action = Some(Action::RemoveSelected);
                     }
-                    if kind == EntryKind::File
-                        && ui
-                            .add_enabled(idle, egui::Button::new("✏").small())
-                            .on_hover_text("Check out & edit")
-                            .clicked()
-                    {
-                        *action = Some(Action::CheckOut(path.clone()));
-                    }
-                    if kind == EntryKind::File
-                        && ui
-                            .add_enabled(idle, egui::Button::new("👁").small())
-                            .on_hover_text("View read-only (auto-wiped on close)")
-                            .clicked()
-                    {
-                        *action = Some(Action::ViewFile(path.clone()));
+                    if theme::primary_button(ui, "Extract…").clicked() {
+                        *action = Some(Action::ExtractSelected);
                     }
                 });
             });
+        });
+    }
+
+    // ---- The file/folder list ----
+    let search = s.file_search.clone();
+    let searching = !search.trim().is_empty();
+    let rows = visible_rows(&entries, &cur, &search, s.sort);
+
+    if entries.is_empty() {
+        theme::empty_state(
+            ui,
+            theme::icon::FOLDER,
+            "This vault is empty",
+            "Add files or folders — or just drag them in from your computer.",
+            |ui| {
+                if idle && theme::primary_button(ui, "+  Add files…").clicked() {
+                    *action = Some(Action::AddFiles);
+                }
+            },
+        );
+    } else if rows.is_empty() {
+        if searching {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(theme::icon_text(theme::icon::FILE, 40.0).color(c.text_muted));
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("No files match “{}”", search.trim())).strong());
+            });
+        } else {
+            theme::empty_state(
+                ui,
+                theme::icon::FOLDER,
+                "This folder is empty",
+                "Add files here, or drag them in from your computer.",
+                |ui| {
+                    if idle && theme::primary_button(ui, "+  Add files…").clicked() {
+                        *action = Some(Action::AddFiles);
+                    }
+                },
+            );
+        }
+    } else {
+        if searching {
+            ui.label(
+                RichText::new("Showing matches across the whole vault")
+                    .color(c.text_muted)
+                    .small(),
+            );
+            ui.add_space(2.0);
+        } else if idle {
+            // A subtle "select all" affordance for the current folder's files.
+            let files_here = rows.iter().filter(|r| r.kind == EntryKind::File).count();
+            if files_here > 1 {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Select all").color(c.text_muted).small(),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        *action = Some(Action::SelectAllVisible);
+                    }
+                });
+                ui.add_space(2.0);
+            }
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for row in &rows {
+                    let selected = s.selected.contains(&row.path);
+                    entry_row(ui, c, row, selected, idle, searching, action);
+                }
+            });
+    }
+
+    // ---- Drag-and-drop overlay ----
+    if hovering_files {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("filesec_dropzone"),
+        ));
+        painter.rect_filled(
+            panel_rect,
+            egui::CornerRadius::same(theme::RADIUS),
+            theme::accent_soft(c),
+        );
+        painter.rect_stroke(
+            panel_rect.shrink(2.0),
+            egui::CornerRadius::same(theme::RADIUS),
+            egui::Stroke::new(2.0, c.accent),
+            egui::StrokeKind::Inside,
+        );
+        let target = if cur.is_empty() {
+            name.clone()
+        } else {
+            leaf_name(&cur).to_string()
+        };
+        painter.text(
+            panel_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("Drop to add to {target}"),
+            egui::FontId::proportional(18.0),
+            c.accent,
+        );
+    }
+}
+
+/// Render the folder breadcrumb ("Home / a / b"); each ancestor crumb navigates.
+fn breadcrumb(ui: &mut egui::Ui, current: &str, action: &mut Option<Action>) {
+    let c = theme::colors(ui);
+    let segs = breadcrumb_segments(current);
+    let last = segs.len().saturating_sub(1);
+    // Scope the tighter crumb spacing so it doesn't leak to the rest of the row.
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (i, (label, target)) in segs.iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("/").color(c.text_muted));
+            }
+            if i == last {
+                ui.label(RichText::new(label).strong().color(c.text));
+            } else if ui
+                .add(egui::Button::new(RichText::new(label).color(c.accent)).frame(false))
+                .clicked()
+            {
+                *action = Some(Action::EnterDir(target.clone()));
+            }
         }
     });
 }
 
+/// One row in the file browser: a full-width, hover/selected-highlighted surface
+/// with a type-tinted icon, a name + secondary line, and trailing quick actions
+/// revealed on hover. Folders enter on click; files toggle selection on click and
+/// open (view) on double-click.
+fn entry_row(
+    ui: &mut egui::Ui,
+    c: theme::Colors,
+    row: &Row,
+    selected: bool,
+    idle: bool,
+    searching: bool,
+    action: &mut Option<Action>,
+) {
+    let is_dir = row.kind == EntryKind::Dir;
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+    // `contains_pointer` (geometric) rather than `hovered` (which a child button
+    // on top would steal) so the trailing actions stay visible while you reach for
+    // them, and the whole-row highlight doesn't flicker.
+    let hovered = resp.contains_pointer();
+    let bg = if selected {
+        theme::accent_soft(c)
+    } else if hovered {
+        c.surface_hi
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_SM), bg);
+    if selected {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(theme::RADIUS_SM),
+            egui::Stroke::new(1.0, c.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 10.0, rect.top()),
+        egui::pos2(rect.right() - 8.0, rect.bottom()),
+    );
+    let mut cui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let (glyph, col) = if is_dir {
+        (theme::icon::FOLDER, c.accent)
+    } else {
+        (theme::icon::FILE, file_tint(leaf_name(&row.path), c))
+    };
+    cui.label(theme::icon_text(glyph, 18.0).color(col));
+    cui.add_space(8.0);
+    cui.vertical(|ui| {
+        ui.add_space(4.0);
+        ui.label(RichText::new(leaf_name(&row.path)).color(c.text).size(14.5));
+        let secondary = if is_dir {
+            format!(
+                "{} item{}",
+                row.children,
+                if row.children == 1 { "" } else { "s" }
+            )
+        } else if searching {
+            let parent = parent_dir(&row.path);
+            if parent.is_empty() {
+                human_size(row.size)
+            } else {
+                format!("{} · {}", human_size(row.size), parent)
+            }
+        } else {
+            human_size(row.size)
+        };
+        ui.label(RichText::new(secondary).color(c.text_muted).small());
+    });
+    // Trailing actions, ordered left→right as View · Edit · Save · Remove (added
+    // right-to-left). Shown on hover or when the row is selected.
+    cui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let show = hovered || selected;
+        if is_dir {
+            if show && idle && theme::icon_button(ui, theme::icon::TRASH, "Remove folder").clicked()
+            {
+                *action = Some(Action::DeleteEntry(row.path.clone()));
+            }
+        } else {
+            if show && idle && theme::icon_button(ui, theme::icon::TRASH, "Remove").clicked() {
+                *action = Some(Action::DeleteEntry(row.path.clone()));
+            }
+            if show && theme::icon_button(ui, theme::icon::SAVE, "Save as…").clicked() {
+                *action = Some(Action::SaveEntryAs(row.path.clone()));
+            }
+            if show
+                && idle
+                && theme::icon_button(ui, theme::icon::EDIT, "Check out & edit").clicked()
+            {
+                *action = Some(Action::CheckOut(row.path.clone()));
+            }
+            if show
+                && idle
+                && theme::icon_button(ui, theme::icon::EYE, "View read-only (auto-wiped on close)")
+                    .clicked()
+            {
+                *action = Some(Action::ViewFile(row.path.clone()));
+            }
+        }
+    });
+
+    if is_dir {
+        if resp.clicked() {
+            *action = Some(Action::EnterDir(row.path.clone()));
+        }
+    } else if idle {
+        if resp.double_clicked() {
+            *action = Some(Action::ViewFile(row.path.clone()));
+        } else if resp.clicked() {
+            *action = Some(Action::ToggleSelect(row.path.clone()));
+        }
+    }
+}
+
 fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    ui.heading("Contacts");
+    let cc = theme::colors(ui);
+    theme::section_header(ui, "Contacts", |_ui| {});
     ui.label(
         RichText::new("Import someone's public key, then verify their safety number out-of-band (in person or over a trusted channel) before sending them anything.")
-            .color(MUTED),
+            .color(cc.text_muted),
     );
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
-    egui::CollapsingHeader::new("Add a contact")
-        .default_open(s.contacts.contacts.is_empty())
-        .show(ui, |ui| {
-            if ui.button("Load from .fsecpub file…").clicked() {
-                *action = Some(Action::PreviewContactFile);
-            }
-            ui.label("…or paste a public key:");
-            ui.add(
-                egui::TextEdit::multiline(&mut s.contact_paste)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("-----BEGIN FILESEC PUBLIC KEY-----"),
-            );
-            if ui.button("Preview key…").clicked() {
-                *action = Some(Action::PreviewContactPaste);
-            }
-            ui.label(
-                RichText::new(
-                    "You'll see who the key belongs to and can confirm before it's added.",
-                )
-                .color(MUTED)
-                .small(),
-            );
-        });
+    theme::card(ui, |ui| {
+        egui::CollapsingHeader::new("Add a contact")
+            .default_open(s.contacts.contacts.is_empty())
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                if theme::secondary_button(ui, "Load from .fsecpub file…").clicked() {
+                    *action = Some(Action::PreviewContactFile);
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("…or paste a public key:")
+                        .color(cc.text_muted)
+                        .small(),
+                );
+                theme::text_area(
+                    ui,
+                    &mut s.contact_paste,
+                    "-----BEGIN FILESEC PUBLIC KEY-----",
+                    4,
+                );
+                ui.add_space(6.0);
+                if theme::primary_button(ui, "Preview key…").clicked() {
+                    *action = Some(Action::PreviewContactPaste);
+                }
+                ui.label(
+                    RichText::new(
+                        "You'll see who the key belongs to and can confirm before it's added.",
+                    )
+                    .color(cc.text_muted)
+                    .small(),
+                );
+            });
+    });
 
-    ui.separator();
     if s.contacts.contacts.is_empty() {
-        ui.colored_label(MUTED, "No contacts yet.");
+        theme::empty_state(
+            ui,
+            theme::icon::CONTACTS,
+            "No contacts yet",
+            "Add someone's public key above so you can send them vaults.",
+            |_ui| {},
+        );
         return;
     }
 
@@ -2865,43 +3759,47 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
             } else {
                 &c.identity.name
             };
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            theme::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(display_name).strong());
+                            ui.label(RichText::new(display_name).strong().size(15.0));
                             match c.trust {
-                                Trust::Verified => ui.colored_label(OK_GREEN, "✔ verified"),
-                                Trust::Unverified => ui.colored_label(ERR_RED, "● unverified"),
+                                Trust::Verified => {
+                                    theme::badge(ui, "Verified", theme::BadgeKind::Ok)
+                                }
+                                Trust::Unverified => {
+                                    theme::badge(ui, "Unverified", theme::BadgeKind::Warn)
+                                }
                             };
                         });
                         ui.label(
                             RichText::new(c.identity.safety_number())
                                 .monospace()
-                                .color(MUTED)
+                                .color(cc.text_muted)
                                 .small(),
                         );
                         if let (Trust::Verified, Some(t)) = (c.trust, c.verified_at) {
                             ui.label(
                                 RichText::new(format!("verified {}", fmt_date(t)))
-                                    .color(MUTED)
+                                    .color(cc.text_muted)
                                     .small(),
                             );
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Remove").clicked() {
+                        if theme::icon_button(ui, theme::icon::TRASH, "Remove").clicked() {
                             *action = Some(Action::RemoveContact(fpr_hex.clone()));
                         }
                         match c.trust {
                             Trust::Verified => {
-                                if ui.small_button("Unverify").clicked() {
+                                if theme::secondary_button(ui, "Unverify").clicked() {
                                     *action =
                                         Some(Action::SetTrust(fpr_hex.clone(), Trust::Unverified));
                                 }
                             }
                             Trust::Unverified => {
-                                if ui.small_button("Verify…").clicked() {
+                                if theme::primary_button(ui, "Verify…").clicked() {
                                     *action = Some(Action::BeginVerify(fpr_hex.clone()));
                                 }
                             }
@@ -2914,114 +3812,163 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
 }
 
 fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let cc = theme::colors(ui);
     let pubid = s.identity.public();
-    ui.heading("My Identity");
-    ui.add_space(8.0);
-    egui::Grid::new("ident")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .show(ui, |ui| {
-            ui.label("Name");
-            ui.label(RichText::new(&s.identity.name).strong());
-            ui.end_row();
-            ui.label("Fingerprint");
-            ui.label(RichText::new(pubid.fingerprint_hex()).monospace().small());
-            ui.end_row();
-        });
-    ui.add_space(8.0);
-    ui.label("Safety number (read this aloud to verify with others):");
-    ui.label(
-        RichText::new(pubid.safety_number())
-            .monospace()
-            .color(ACCENT),
-    );
-    // Post-quantum status + one-click upgrade (pqc builds only).
-    #[cfg(feature = "pqc")]
-    {
-        ui.add_space(10.0);
-        if s.identity.is_hybrid_capable() {
-            ui.label(
-                RichText::new("🛡 Post-quantum: hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65")
-                    .color(ACCENT),
-            );
-        } else {
-            ui.label(RichText::new("Post-quantum: not enabled (classical identity)").color(MUTED));
-            if ui
-                .button(RichText::new("Upgrade to post-quantum…").strong())
-                .clicked()
-            {
-                *action = Some(Action::BeginMigrate);
-            }
-        }
-    }
-    ui.add_space(12.0);
-    ui.horizontal(|ui| {
-        if ui.button("Copy public key").clicked() {
-            *action = Some(Action::CopyPubKey);
-        }
-        if ui.button("Save public key…").clicked() {
-            *action = Some(Action::SavePubKey);
-        }
-    });
-    ui.add_space(8.0);
-    ui.label(
-        RichText::new("Share your public key with others so they can send you vaults. It contains no secrets.")
-            .color(MUTED)
-            .small(),
-    );
+    theme::section_header(ui, "My Identity", |_ui| {});
 
-    // Security keys (passkeys). Shown when this build supports them, or whenever
-    // any are already enrolled.
-    if passkey::SUPPORTED || !s.passkeys.is_empty() {
-        ui.add_space(12.0);
-        ui.separator();
-        ui.heading("Security keys");
-        ui.label(
-            RichText::new(
-                "Unlock with a hardware security key (FIDO2) in addition to your passphrase. \
-                 Your passphrase always keeps working — a lost key is never a lockout.",
-            )
-            .color(MUTED)
-            .small(),
-        );
-        ui.add_space(6.0);
-        if s.passkeys.is_empty() {
-            ui.label(RichText::new("No security keys enrolled.").color(MUTED));
-        } else {
-            for (i, pk) in s.passkeys.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("🔑 {}", pk.label)).strong());
-                    ui.label(
-                        RichText::new(format!("added {}", fmt_date(pk.added_at)))
-                            .color(MUTED)
-                            .small(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Remove").clicked() {
-                            *action = Some(Action::RemovePasskey(i));
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        theme::card(ui, |ui| {
+            egui::Grid::new("ident")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Name").color(cc.text_muted));
+                    ui.label(RichText::new(&s.identity.name).strong());
+                    ui.end_row();
+                    ui.label(RichText::new("Fingerprint").color(cc.text_muted));
+                    ui.label(RichText::new(pubid.fingerprint_hex()).monospace().small());
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Safety number (read this aloud to verify with others):")
+                    .color(cc.text_muted)
+                    .small(),
+            );
+            ui.label(RichText::new(pubid.safety_number()).monospace().color(cc.accent));
+
+            // Post-quantum status + one-click upgrade (pqc builds only).
+            #[cfg(feature = "pqc")]
+            {
+                ui.add_space(10.0);
+                if s.identity.is_hybrid_capable() {
+                    ui.horizontal(|ui| {
+                        ui.label(theme::icon_text(theme::icon::SHIELD, 16.0).color(cc.accent));
+                        ui.label(
+                            RichText::new(
+                                "Post-quantum: hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65",
+                            )
+                            .color(cc.accent),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Post-quantum: not enabled (classical identity)")
+                                .color(cc.text_muted),
+                        );
+                        if theme::secondary_button(ui, "Upgrade…").clicked() {
+                            *action = Some(Action::BeginMigrate);
                         }
                     });
-                });
+                }
             }
-        }
-        if passkey::SUPPORTED {
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::secondary_button(ui, "Copy public key").clicked() {
+                    *action = Some(Action::CopyPubKey);
+                }
+                if theme::secondary_button(ui, "Save public key…").clicked() {
+                    *action = Some(Action::SavePubKey);
+                }
+            });
             ui.add_space(6.0);
-            if ui
-                .button(RichText::new("➕ Add security key…").strong())
-                .clicked()
-            {
-                *action = Some(Action::BeginAddPasskey);
-            }
-        }
-    }
+            ui.label(
+                RichText::new("Share your public key with others so they can send you vaults. It contains no secrets.")
+                    .color(cc.text_muted)
+                    .small(),
+            );
+        });
 
-    ui.add_space(12.0);
-    ui.separator();
-    ui.label(
-        RichText::new(format!("Encrypted data is stored at: {}", s.data_dir))
-            .color(MUTED)
-            .small(),
-    );
+        // Security keys (passkeys). Shown when this build supports them, or
+        // whenever any are already enrolled.
+        if passkey::SUPPORTED || !s.passkeys.is_empty() {
+            theme::card(ui, |ui| {
+                ui.label(RichText::new("Security keys").size(16.0).strong());
+                ui.label(
+                    RichText::new(
+                        "Unlock with a hardware security key (FIDO2) in addition to your \
+                         passphrase. Your passphrase always keeps working — a lost key is \
+                         never a lockout.",
+                    )
+                    .color(cc.text_muted)
+                    .small(),
+                );
+                ui.add_space(8.0);
+                if s.passkeys.is_empty() {
+                    ui.label(RichText::new("No security keys enrolled.").color(cc.text_muted));
+                } else {
+                    for (i, pk) in s.passkeys.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(theme::icon_text(theme::icon::KEY, 16.0).color(cc.text_muted));
+                            ui.label(RichText::new(pk.label.as_str()).strong());
+                            ui.label(
+                                RichText::new(format!("added {}", fmt_date(pk.added_at)))
+                                    .color(cc.text_muted)
+                                    .small(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::secondary_button(ui, "Remove").clicked() {
+                                        *action = Some(Action::RemovePasskey(i));
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+                if passkey::SUPPORTED {
+                    ui.add_space(8.0);
+                    if theme::primary_button(ui, "+  Add security key…").clicked() {
+                        *action = Some(Action::BeginAddPasskey);
+                    }
+                }
+            });
+        }
+
+        // This-device convenience: remember the passphrase in the OS keychain so
+        // this machine can auto-unlock. Shown when this build supports it, or
+        // whenever a secret is already saved (so it can always be turned off).
+        if autounlock::SUPPORTED || s.auto_unlock {
+            theme::card(ui, |ui| {
+                ui.label(RichText::new("This device").size(16.0).strong());
+                ui.label(
+                    RichText::new(
+                        "Save your passphrase in this computer's keychain so FileSec unlocks \
+                         automatically here. Your passphrase still works and stays your \
+                         recovery secret. Anyone with access to your logged-in account could \
+                         then open FileSec, so only enable this on a trusted personal device.",
+                    )
+                    .color(cc.text_muted)
+                    .small(),
+                );
+                ui.add_space(8.0);
+                if s.auto_unlock {
+                    ui.horizontal(|ui| {
+                        ui.label(theme::icon_text(theme::icon::LOCK_KEY, 15.0).color(cc.ok));
+                        ui.colored_label(cc.ok, "Auto-unlock is on for this device.");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::secondary_button(ui, "Forget on this device").clicked() {
+                                *action = Some(Action::DisableAutoUnlock);
+                            }
+                        });
+                    });
+                } else if autounlock::SUPPORTED
+                    && theme::secondary_button(ui, "Remember on this device…").clicked()
+                {
+                    *action = Some(Action::BeginEnableAutoUnlock);
+                }
+            });
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!("Encrypted data is stored at: {}", s.data_dir))
+                .color(cc.text_muted)
+                .small(),
+        );
+    });
 }
 
 /// The "Upgrade to post-quantum" confirmation dialog.
@@ -3031,58 +3978,54 @@ fn migrate_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Acti
         Some(f) => f,
         None => return,
     };
-    let mut open = true;
-    egui::Window::new("Upgrade to post-quantum")
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(
-                "This adds ML-KEM-768 and ML-DSA-65 keys to your identity and re-encrypts your \
-                 whole local vault store under the hybrid post-quantum suite. Your existing \
-                 X25519/Ed25519 keys are kept.",
-            );
-            ui.add_space(8.0);
-            ui.colored_label(ERR_RED, "⚠ Your safety number will change.");
-            ui.label(
-                RichText::new(
-                    "Your identity now commits to its post-quantum keys, so your fingerprint and \
-                     safety number change. After upgrading, re-share your public key and have your \
-                     contacts re-verify it.",
-                )
-                .color(MUTED)
-                .small(),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "Import any pending .fsec files first — containers others already sent to your \
-                     old identity won't be openable afterwards.",
-                )
-                .color(MUTED)
-                .small(),
-            );
-            ui.add_space(10.0);
-            ui.label("Confirm your passphrase to re-seal the keystore:");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.pass)
-                    .password(true)
-                    .desired_width(260.0),
-            );
-            if let Some(e) = &form.error {
-                ui.colored_label(ERR_RED, e);
+    let (close, ()) = theme::modal(ctx, "Upgrade to post-quantum", |ui| {
+        let c = theme::colors(ui);
+        ui.label(
+            "This adds ML-KEM-768 and ML-DSA-65 keys to your identity and re-encrypts your \
+             whole local vault store under the hybrid post-quantum suite. Your existing \
+             X25519/Ed25519 keys are kept.",
+        );
+        ui.add_space(8.0);
+        ui.colored_label(c.err, "⚠ Your safety number will change.");
+        ui.label(
+            RichText::new(
+                "Your identity now commits to its post-quantum keys, so your fingerprint and \
+                 safety number change. After upgrading, re-share your public key and have your \
+                 contacts re-verify it.",
+            )
+            .color(c.text_muted)
+            .small(),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Import any pending .fsec files first — containers others already sent to your \
+                 old identity won't be openable afterwards.",
+            )
+            .color(c.text_muted)
+            .small(),
+        );
+        ui.add_space(10.0);
+        ui.label("Confirm your passphrase to re-seal the keystore:");
+        ui.add(
+            egui::TextEdit::singleline(&mut form.pass)
+                .password(true)
+                .desired_width(f32::INFINITY),
+        );
+        if let Some(e) = &form.error {
+            ui.colored_label(c.err, e);
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Upgrade now").clicked() {
+                *action = Some(Action::DoMigrate);
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Upgrade now").strong()).clicked() {
-                    *action = Some(Action::DoMigrate);
-                }
-                if ui.button("Cancel").clicked() {
-                    *action = Some(Action::CancelMigrate);
-                }
-            });
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelMigrate);
+            }
         });
-    if !open {
+    });
+    if close {
         *action = Some(Action::CancelMigrate);
     }
 }
@@ -3093,65 +4036,107 @@ fn add_passkey_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
         Some(f) => f,
         None => return,
     };
-    let mut open = true;
-    egui::Window::new("Add security key")
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(
-                "Enroll a FIDO2 hardware key (YubiKey, SoloKey, …) as an extra way to unlock. \
-                 You'll be asked to touch it twice — once to create the key, once to set up \
-                 unlock. Your passphrase keeps working too.",
-            );
-            ui.add_space(10.0);
-            egui::Grid::new("add_passkey_grid")
-                .num_columns(2)
-                .spacing([10.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.label)
-                            .hint_text("e.g. YubiKey 5C")
-                            .desired_width(240.0),
-                    );
-                    ui.end_row();
-                    ui.label("Passphrase");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.pass)
-                            .password(true)
-                            .hint_text("authorizes the change")
-                            .desired_width(240.0),
-                    );
-                    ui.end_row();
-                    ui.label("Key PIN");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.pin)
-                            .password(true)
-                            .hint_text("optional — only if your key has one")
-                            .desired_width(240.0),
-                    );
-                    ui.end_row();
-                });
-            if let Some(e) = &form.error {
-                ui.add_space(4.0);
-                ui.colored_label(ERR_RED, e);
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button(RichText::new("Touch key to enroll").strong())
-                    .clicked()
-                {
-                    *action = Some(Action::AddPasskey);
-                }
-                if ui.button("Cancel").clicked() {
-                    *action = Some(Action::CancelAddPasskey);
-                }
+    let (close, ()) = theme::modal(ctx, "Add security key", |ui| {
+        let c = theme::colors(ui);
+        ui.label(
+            "Enroll a FIDO2 hardware key (YubiKey, SoloKey, …) as an extra way to unlock. \
+             You'll be asked to touch it twice — once to create the key, once to set up \
+             unlock. Your passphrase keeps working too.",
+        );
+        ui.add_space(10.0);
+        egui::Grid::new("add_passkey_grid")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.label)
+                        .hint_text("e.g. YubiKey 5C")
+                        .desired_width(240.0),
+                );
+                ui.end_row();
+                ui.label("Passphrase");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.pass)
+                        .password(true)
+                        .hint_text("authorizes the change")
+                        .desired_width(240.0),
+                );
+                ui.end_row();
+                ui.label("Key PIN");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.pin)
+                        .password(true)
+                        .hint_text("optional — only if your key has one")
+                        .desired_width(240.0),
+                );
+                ui.end_row();
             });
+        if let Some(e) = &form.error {
+            ui.add_space(4.0);
+            ui.colored_label(c.err, e);
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Touch key to enroll").clicked() {
+                *action = Some(Action::AddPasskey);
+            }
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelAddPasskey);
+            }
         });
-    if !open {
+    });
+    if close {
         *action = Some(Action::CancelAddPasskey);
+    }
+}
+
+/// The "Remember on this device" dialog: confirm the passphrase before saving it
+/// to the OS keychain.
+fn autounlock_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let form = match &mut s.auto_unlock_form {
+        Some(f) => f,
+        None => return,
+    };
+    let (close, ()) = theme::modal(ctx, "Remember on this device", |ui| {
+        let c = theme::colors(ui);
+        ui.label(
+            "Save your passphrase in this computer's keychain so FileSec unlocks \
+             automatically on this device. Your passphrase still works everywhere and \
+             remains your recovery secret.",
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Only do this on a trusted personal device: anyone who can use your \
+                 logged-in account could then open FileSec here.",
+            )
+            .color(c.warn)
+            .small(),
+        );
+        ui.add_space(10.0);
+        ui.label("Confirm your passphrase:");
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut form.pass)
+                .password(true)
+                .desired_width(f32::INFINITY),
+        );
+        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if let Some(e) = &form.error {
+            ui.colored_label(c.err, e);
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Save on this device").clicked() || submit {
+                *action = Some(Action::ConfirmEnableAutoUnlock);
+            }
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelEnableAutoUnlock);
+            }
+        });
+    });
+    if close {
+        *action = Some(Action::CancelEnableAutoUnlock);
     }
 }
 
@@ -3171,18 +4156,20 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
         Some(f) => f,
         None => return,
     };
-    let mut open = true;
-    egui::Window::new("Send vault")
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label("Choose recipients. Each will be able to open the container with their private key.");
-            ui.add_space(6.0);
-            if s.contacts.contacts.is_empty() {
-                ui.colored_label(MUTED, "You have no contacts yet — add one first, or just include yourself.");
-            }
-            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+    let (close, ()) = theme::modal(ctx, "Send vault", |ui| {
+        ui.label(
+            "Choose recipients. Each will be able to open the container with their private key.",
+        );
+        ui.add_space(6.0);
+        if s.contacts.contacts.is_empty() {
+            ui.colored_label(
+                MUTED,
+                "You have no contacts yet — add one first, or just include yourself.",
+            );
+        }
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .show(ui, |ui| {
                 for c in &s.contacts.contacts {
                     let fpr_hex = hex(&c.fingerprint());
                     let mut checked = form.selected.contains(&fpr_hex);
@@ -3200,119 +4187,123 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                     }
                 }
             });
-            ui.separator();
-            let mut include_self = form.include_self;
-            if ui.checkbox(&mut include_self, "Also include myself (so I can re-open it)").changed() {
-                *action = Some(Action::ToggleIncludeSelf);
-            }
-            // Algorithm-suite picker (post-quantum builds only). The classical
-            // build has a single suite and shows no picker.
-            #[cfg(feature = "pqc")]
-            {
-                // Hybrid needs a post-quantum *sender* identity; a non-migrated
-                // classical identity can only pick the classical suites.
-                let sender_hybrid = s.identity.is_hybrid_capable();
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Encryption suite:");
-                    for opt in [SuiteId::Classic, SuiteId::Aes256Gcm, SuiteId::Hybrid] {
-                        let enabled = sender_hybrid || !opt.is_hybrid();
-                        let resp = ui
-                            .add_enabled_ui(enabled, |ui| {
-                                ui.selectable_label(form.suite == opt, suite_short(opt))
-                            })
-                            .inner;
-                        if enabled && resp.clicked() {
-                            *action = Some(Action::SetExportSuite(opt));
-                        }
+        ui.separator();
+        let mut include_self = form.include_self;
+        if ui
+            .checkbox(
+                &mut include_self,
+                "Also include myself (so I can re-open it)",
+            )
+            .changed()
+        {
+            *action = Some(Action::ToggleIncludeSelf);
+        }
+        // Algorithm-suite picker (post-quantum builds only). The classical
+        // build has a single suite and shows no picker.
+        #[cfg(feature = "pqc")]
+        {
+            // Hybrid needs a post-quantum *sender* identity; a non-migrated
+            // classical identity can only pick the classical suites.
+            let sender_hybrid = s.identity.is_hybrid_capable();
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Encryption suite:");
+                for opt in [SuiteId::Classic, SuiteId::Aes256Gcm, SuiteId::Hybrid] {
+                    let enabled = sender_hybrid || !opt.is_hybrid();
+                    let resp = ui
+                        .add_enabled_ui(enabled, |ui| {
+                            ui.selectable_label(form.suite == opt, suite_short(opt))
+                        })
+                        .inner;
+                    if enabled && resp.clicked() {
+                        *action = Some(Action::SetExportSuite(opt));
                     }
-                });
-                if !sender_hybrid {
-                    ui.label(
-                        RichText::new(
-                            "Hybrid PQC needs a post-quantum identity — upgrade yours in “My \
-                             Identity” to enable it.",
-                        )
-                        .color(MUTED)
-                        .small(),
-                    );
                 }
-                ui.label(RichText::new(form.suite.label()).color(MUTED).small());
-                if form.suite.is_hybrid() {
-                    let missing: Vec<&str> = s
-                        .contacts
-                        .contacts
-                        .iter()
-                        .filter(|c| {
-                            form.selected.contains(&hex(&c.fingerprint()))
-                                && !c.identity.is_hybrid_capable()
-                        })
-                        .map(|c| {
-                            if c.identity.name.is_empty() {
-                                "(unnamed)"
-                            } else {
-                                c.identity.name.as_str()
-                            }
-                        })
-                        .collect();
-                    if missing.is_empty() {
-                        ui.colored_label(
-                            MUTED,
-                            "Every recipient also gets post-quantum protection.",
-                        );
-                    } else {
-                        ui.colored_label(
+            });
+            if !sender_hybrid {
+                ui.label(
+                    RichText::new(
+                        "Hybrid PQC needs a post-quantum identity — upgrade yours in “My \
+                             Identity” to enable it.",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
+            }
+            ui.label(RichText::new(form.suite.label()).color(MUTED).small());
+            if form.suite.is_hybrid() {
+                let missing: Vec<&str> = s
+                    .contacts
+                    .contacts
+                    .iter()
+                    .filter(|c| {
+                        form.selected.contains(&hex(&c.fingerprint()))
+                            && !c.identity.is_hybrid_capable()
+                    })
+                    .map(|c| {
+                        if c.identity.name.is_empty() {
+                            "(unnamed)"
+                        } else {
+                            c.identity.name.as_str()
+                        }
+                    })
+                    .collect();
+                if missing.is_empty() {
+                    ui.colored_label(MUTED, "Every recipient also gets post-quantum protection.");
+                } else {
+                    ui.colored_label(
                             ERR_RED,
                             format!(
                                 "⚠ No post-quantum key for: {}. Pick another suite or ask them to re-share.",
                                 missing.join(", ")
                             ),
                         );
-                    }
                 }
             }
-            ui.add_space(6.0);
-            // Downgrade/trust warning: spell out exactly which selected
-            // recipients have not been verified out-of-band, so sending to an
-            // unverified key is always a deliberate, informed choice.
-            let unverified: Vec<&str> = s
-                .contacts
-                .contacts
-                .iter()
-                .filter(|c| {
-                    c.trust == Trust::Unverified && form.selected.contains(&hex(&c.fingerprint()))
-                })
-                .map(|c| {
-                    if c.identity.name.is_empty() {
-                        "(unnamed)"
-                    } else {
-                        c.identity.name.as_str()
-                    }
-                })
-                .collect();
-            if !unverified.is_empty() {
-                ui.colored_label(
-                    ERR_RED,
-                    format!("⚠ Unverified recipient(s): {}", unverified.join(", ")),
-                );
-                ui.label(
+        }
+        ui.add_space(6.0);
+        // Downgrade/trust warning: spell out exactly which selected
+        // recipients have not been verified out-of-band, so sending to an
+        // unverified key is always a deliberate, informed choice.
+        let unverified: Vec<&str> = s
+            .contacts
+            .contacts
+            .iter()
+            .filter(|c| {
+                c.trust == Trust::Unverified && form.selected.contains(&hex(&c.fingerprint()))
+            })
+            .map(|c| {
+                if c.identity.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    c.identity.name.as_str()
+                }
+            })
+            .collect();
+        if !unverified.is_empty() {
+            ui.colored_label(
+                ERR_RED,
+                format!("⚠ Unverified recipient(s): {}", unverified.join(", ")),
+            );
+            ui.label(
                     RichText::new(
                         "You haven't confirmed these keys out-of-band. Anyone could have supplied them.",
                     )
                     .color(MUTED)
                     .small(),
                 );
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Choose file & export").clicked() {
+                *action = Some(Action::DoExport);
             }
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Choose file & export").strong()).clicked() {
-                    *action = Some(Action::DoExport);
-                }
-                if ui.button("Cancel").clicked() {
-                    *action = Some(Action::CancelExport);
-                }
-            });
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelExport);
+            }
         });
-    if !open {
+    });
+    if close {
         *action = Some(Action::CancelExport);
     }
 }
@@ -3322,76 +4313,71 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
         Some(i) => i,
         None => return,
     };
-    let mut open = true;
-    egui::Window::new("Imported vault")
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(RichText::new(format!("\"{}\"", info.vault_name)).strong());
-            ui.label(format!("{} file(s)", info.file_count));
-            ui.separator();
-            ui.label("Sender's signature is cryptographically valid. Identity:");
-            // `signature valid` only proves the bytes came from whoever holds
-            // these keys — NOT that those keys belong to who you think. The
-            // out-of-band safety-number check is what closes that gap, so the
-            // dialog nudges toward it whenever the sender isn't verified.
-            let fpr_hex = info.sender_fpr_hex.clone();
-            match (&info.sender_name, info.verified) {
-                (Some(name), true) => {
-                    ui.colored_label(OK_GREEN, format!("✔ {name} (verified contact)"));
-                }
-                (Some(name), false) => {
-                    ui.colored_label(
-                        WARN_AMBER,
-                        format!("● {name} — a known but UNVERIFIED contact"),
-                    );
-                    ui.label(
-                        RichText::new("Verify their safety number before you trust this content.")
-                            .color(MUTED)
-                            .small(),
-                    );
-                }
-                (None, _) => {
-                    ui.colored_label(ERR_RED, "● Unknown sender — not in your contacts");
-                    ui.label(
-                        RichText::new(
-                            "Add them as a contact, then verify their safety number out-of-band.",
-                        )
+    let (close, ()) = theme::modal(ctx, "Imported vault", |ui| {
+        ui.label(RichText::new(format!("\"{}\"", info.vault_name)).strong());
+        ui.label(format!("{} file(s)", info.file_count));
+        ui.separator();
+        ui.label("Sender's signature is cryptographically valid. Identity:");
+        // `signature valid` only proves the bytes came from whoever holds
+        // these keys — NOT that those keys belong to who you think. The
+        // out-of-band safety-number check is what closes that gap, so the
+        // dialog nudges toward it whenever the sender isn't verified.
+        let fpr_hex = info.sender_fpr_hex.clone();
+        match (&info.sender_name, info.verified) {
+            (Some(name), true) => {
+                ui.colored_label(OK_GREEN, format!("✔ {name} (verified contact)"));
+            }
+            (Some(name), false) => {
+                ui.colored_label(
+                    WARN_AMBER,
+                    format!("● {name} — a known but UNVERIFIED contact"),
+                );
+                ui.label(
+                    RichText::new("Verify their safety number before you trust this content.")
                         .color(MUTED)
                         .small(),
-                    );
-                }
+                );
             }
-            ui.label(
-                RichText::new(format!("fingerprint: {}", info.sender_fpr_hex))
-                    .monospace()
-                    .small()
-                    .color(MUTED),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    *action = Some(Action::DismissImportInfo);
-                }
-                match (&info.sender_name, info.verified) {
-                    // Known but unverified → jump straight into verification.
-                    (Some(_), false) => {
-                        if ui.button("Verify sender…").clicked() {
-                            *action = Some(Action::BeginVerify(fpr_hex));
-                        }
+            (None, _) => {
+                ui.colored_label(ERR_RED, "● Unknown sender — not in your contacts");
+                ui.label(
+                    RichText::new(
+                        "Add them as a contact, then verify their safety number out-of-band.",
+                    )
+                    .color(MUTED)
+                    .small(),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(format!("fingerprint: {}", info.sender_fpr_hex))
+                .monospace()
+                .small()
+                .color(MUTED),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            match (&info.sender_name, info.verified) {
+                // Known but unverified → jump straight into verification.
+                (Some(_), false) => {
+                    if theme::primary_button(ui, "Verify sender…").clicked() {
+                        *action = Some(Action::BeginVerify(fpr_hex));
                     }
-                    // Unknown → offer to add them as a contact first.
-                    (None, _) => {
-                        if ui.button("Add sender to contacts…").clicked() {
-                            *action = Some(Action::AddSenderToContacts);
-                        }
-                    }
-                    _ => {}
                 }
-            });
+                // Unknown → offer to add them as a contact first.
+                (None, _) => {
+                    if theme::primary_button(ui, "Add sender to contacts…").clicked() {
+                        *action = Some(Action::AddSenderToContacts);
+                    }
+                }
+                _ => {}
+            }
+            if theme::secondary_button(ui, "OK").clicked() {
+                *action = Some(Action::DismissImportInfo);
+            }
         });
-    if !open {
+    });
+    if close {
         *action = Some(Action::DismissImportInfo);
     }
 }
@@ -3411,95 +4397,104 @@ fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
         preview.pubid.name.clone()
     };
     let is_self = matches!(preview.status, PreviewStatus::SelfKey);
-    let mut open = true;
-    egui::Window::new("Add contact?")
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            egui::Grid::new("preview_grid")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Name");
-                    ui.label(RichText::new(&name).strong());
-                    ui.end_row();
-                    ui.label("Fingerprint");
-                    ui.label(
-                        RichText::new(preview.pubid.fingerprint_hex())
-                            .monospace()
-                            .small(),
-                    );
-                    ui.end_row();
-                });
-            ui.add_space(4.0);
-            ui.label("Safety number:");
-            ui.label(
-                RichText::new(preview.pubid.safety_number())
-                    .monospace()
-                    .color(ACCENT),
-            );
-            ui.add_space(8.0);
-            ui.separator();
-            match &preview.status {
-                PreviewStatus::New => {
-                    ui.label(
-                        RichText::new(
-                            "New contact. You'll verify their safety number before trusting them.",
-                        )
-                        .color(MUTED),
-                    );
-                }
-                PreviewStatus::Existing { verified: true } => {
-                    ui.colored_label(OK_GREEN, "Already a verified contact — nothing will change.");
-                }
-                PreviewStatus::Existing { verified: false } => {
-                    ui.colored_label(MUTED, "Already a contact (unverified) — nothing will change.");
-                }
-                PreviewStatus::Renamed { old, verified: true } => {
-                    ui.colored_label(
-                        ERR_RED,
-                        format!("⚠ This renames a VERIFIED contact: \"{old}\" → \"{name}\"."),
-                    );
-                    ui.label(
+    let (close, ()) = theme::modal(ctx, "Add contact?", |ui| {
+        egui::Grid::new("preview_grid")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Name");
+                ui.label(RichText::new(&name).strong());
+                ui.end_row();
+                ui.label("Fingerprint");
+                ui.label(
+                    RichText::new(preview.pubid.fingerprint_hex())
+                        .monospace()
+                        .small(),
+                );
+                ui.end_row();
+            });
+        ui.add_space(4.0);
+        ui.label("Safety number:");
+        ui.label(
+            RichText::new(preview.pubid.safety_number())
+                .monospace()
+                .color(ACCENT),
+        );
+        ui.add_space(8.0);
+        ui.separator();
+        match &preview.status {
+            PreviewStatus::New => {
+                ui.label(
+                    RichText::new(
+                        "New contact. You'll verify their safety number before trusting them.",
+                    )
+                    .color(MUTED),
+                );
+            }
+            PreviewStatus::Existing { verified: true } => {
+                ui.colored_label(
+                    OK_GREEN,
+                    "Already a verified contact — nothing will change.",
+                );
+            }
+            PreviewStatus::Existing { verified: false } => {
+                ui.colored_label(
+                    MUTED,
+                    "Already a contact (unverified) — nothing will change.",
+                );
+            }
+            PreviewStatus::Renamed {
+                old,
+                verified: true,
+            } => {
+                ui.colored_label(
+                    ERR_RED,
+                    format!("⚠ This renames a VERIFIED contact: \"{old}\" → \"{name}\"."),
+                );
+                ui.label(
                         RichText::new(
                             "The keys are identical, so verification still holds — but confirm you expected this rename.",
                         )
                         .color(MUTED)
                         .small(),
                     );
-                }
-                PreviewStatus::Renamed { old, verified: false } => {
-                    ui.colored_label(
-                        WARN_AMBER,
-                        format!("Display name will change: \"{old}\" → \"{name}\"."),
-                    );
-                }
-                PreviewStatus::SelfKey => {
-                    ui.colored_label(
-                        ERR_RED,
-                        "⚠ This is your OWN public key — you don't need to add yourself.",
-                    );
-                }
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let add_label = match &preview.status {
-                    PreviewStatus::Renamed { .. } => "Update contact",
-                    _ => "Add contact",
-                };
-                if ui
-                    .add_enabled(!is_self, egui::Button::new(RichText::new(add_label).strong()))
-                    .clicked()
-                {
-                    *action = Some(Action::ConfirmAddContact);
-                }
-                if ui.button("Cancel").clicked() {
-                    *action = Some(Action::CancelPreview);
-                }
-            });
+            PreviewStatus::Renamed {
+                old,
+                verified: false,
+            } => {
+                ui.colored_label(
+                    WARN_AMBER,
+                    format!("Display name will change: \"{old}\" → \"{name}\"."),
+                );
+            }
+            PreviewStatus::SelfKey => {
+                ui.colored_label(
+                    ERR_RED,
+                    "⚠ This is your OWN public key — you don't need to add yourself.",
+                );
+            }
+        }
+        ui.add_space(12.0);
+        let c = theme::colors(ui);
+        ui.horizontal(|ui| {
+            let add_label = match &preview.status {
+                PreviewStatus::Renamed { .. } => "Update contact",
+                _ => "Add contact",
+            };
+            let btn = egui::Button::new(RichText::new(add_label).color(c.on_accent).strong())
+                .fill(c.accent)
+                .corner_radius(egui::CornerRadius::same(theme::RADIUS_SM))
+                .min_size(egui::vec2(0.0, 32.0));
+            if ui.add_enabled(!is_self, btn).clicked() {
+                *action = Some(Action::ConfirmAddContact);
+            }
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelPreview);
+            }
         });
-    if !open {
+    });
+    if close {
         *action = Some(Action::CancelPreview);
     }
 }
@@ -3518,67 +4513,59 @@ fn verify_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
     let typed_match = !form.input.trim().is_empty()
         && filesec_core::util::normalize_safety_number(&form.input)
             == filesec_core::util::normalize_safety_number(&form.safety_number);
-    let mut open = true;
-    egui::Window::new(format!("Verify {}", form.name))
-        .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(
+    let title = format!("Verify {}", form.name);
+    let (close, ()) = theme::modal(ctx, &title, |ui| {
+        ui.label(
                 RichText::new(
                     "Compare this safety number with the contact over a trusted channel — in person, a video call, or a line you already trust. Mark verified only once both sides match exactly.",
                 )
                 .color(MUTED),
             );
-            ui.add_space(8.0);
-            ui.label("Their safety number should read:");
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&form.safety_number)
-                        .monospace()
-                        .color(ACCENT),
-                );
-                if ui.small_button("Copy").clicked() {
-                    *action = Some(Action::CopyVerifySafetyNumber);
-                }
-            });
-            ui.add_space(8.0);
-            ui.label("Type what they read back (optional — the app checks it for you):");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.input)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("e.g. ABCD-EFGH-…"),
-            );
-            if !form.input.trim().is_empty() {
-                if typed_match {
-                    ui.colored_label(OK_GREEN, "✔ Matches.");
-                } else {
-                    ui.colored_label(ERR_RED, "✗ Does not match — do not verify.");
-                }
+        ui.add_space(8.0);
+        ui.label("Their safety number should read:");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&form.safety_number).monospace().color(ACCENT));
+            if ui.small_button("Copy").clicked() {
+                *action = Some(Action::CopyVerifySafetyNumber);
             }
-            ui.add_space(4.0);
-            ui.checkbox(
-                &mut form.manual_ok,
-                "I compared it myself and it matches exactly.",
-            );
-            ui.add_space(10.0);
-            let can_verify = typed_match || form.manual_ok;
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        can_verify,
-                        egui::Button::new(RichText::new("Mark verified").strong()),
-                    )
-                    .clicked()
-                {
-                    *action = Some(Action::ConfirmVerify(fpr_hex.clone()));
-                }
-                if ui.button("Cancel").clicked() {
-                    *action = Some(Action::CancelVerify);
-                }
-            });
         });
-    if !open {
+        ui.add_space(8.0);
+        ui.label("Type what they read back (optional — the app checks it for you):");
+        ui.add(
+            egui::TextEdit::singleline(&mut form.input)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. ABCD-EFGH-…"),
+        );
+        if !form.input.trim().is_empty() {
+            if typed_match {
+                ui.colored_label(OK_GREEN, "✔ Matches.");
+            } else {
+                ui.colored_label(ERR_RED, "✗ Does not match — do not verify.");
+            }
+        }
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut form.manual_ok,
+            "I compared it myself and it matches exactly.",
+        );
+        ui.add_space(12.0);
+        let can_verify = typed_match || form.manual_ok;
+        let cc = theme::colors(ui);
+        ui.horizontal(|ui| {
+            let btn =
+                egui::Button::new(RichText::new("Mark verified").color(cc.on_accent).strong())
+                    .fill(cc.accent)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SM))
+                    .min_size(egui::vec2(0.0, 32.0));
+            if ui.add_enabled(can_verify, btn).clicked() {
+                *action = Some(Action::ConfirmVerify(fpr_hex.clone()));
+            }
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelVerify);
+            }
+        });
+    });
+    if close {
         *action = Some(Action::CancelVerify);
     }
 }
@@ -3645,6 +4632,86 @@ fn unique_name_in(existing: &HashSet<String>, base: &str) -> String {
         }
     }
     base.to_string()
+}
+
+/// Plan the entries to add for a set of OS source paths placed under `into` (the
+/// current folder; "" = vault root). A file becomes `into/leaf` (de-duplicated
+/// against existing paths); a folder is walked and each member added under
+/// `into/folder/rel`, skipping path collisions. Unreadable files are counted in
+/// the returned `failed`. Reads metadata only — contents are streamed later by the
+/// append worker. Shared by "Add files…", "Add folder…", and drag-and-drop.
+fn plan_additions(
+    reader: &VaultReader,
+    into: &str,
+    sources: &[std::path::PathBuf],
+) -> (Vec<format::AddedFile>, Vec<String>, usize) {
+    let mut existing: HashSet<String> = reader.entries().iter().map(|e| e.path.clone()).collect();
+    let mut added: Vec<format::AddedFile> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    let under = |name: &str| {
+        if into.is_empty() {
+            name.to_string()
+        } else {
+            format!("{into}/{name}")
+        }
+    };
+    for src in sources {
+        let meta = match std::fs::metadata(src) {
+            Ok(m) => m,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        if meta.is_dir() {
+            let root = src
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "folder".into());
+            for entry in walkdir::WalkDir::new(src).into_iter().flatten() {
+                let rel = match entry.path().strip_prefix(src) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let vault_path = under(&format!("{root}/{}", rel.to_string_lossy()));
+                if existing.contains(&vault_path) {
+                    continue; // skip collisions, as the in-memory path did
+                }
+                if entry.file_type().is_dir() {
+                    existing.insert(vault_path.clone());
+                    dirs.push(vault_path);
+                } else if entry.file_type().is_file() && std::fs::File::open(entry.path()).is_ok() {
+                    existing.insert(vault_path.clone());
+                    added.push(format::AddedFile {
+                        vault_path,
+                        source: entry.path().to_path_buf(),
+                        mtime: file_mtime(entry.path()),
+                        mode: None,
+                    });
+                }
+            }
+        } else if std::fs::File::open(src).is_err() {
+            failed += 1;
+        } else {
+            let base = src
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".into());
+            let name = unique_name_in(&existing, &under(&base));
+            existing.insert(name.clone());
+            added.push(format::AddedFile {
+                vault_path: name,
+                source: src.clone(),
+                mtime: file_mtime(src),
+                mode: None,
+            });
+        }
+    }
+    (added, dirs, failed)
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -3797,5 +4864,444 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-browser model: folder navigation, filtering, and sorting. These are pure
+// functions over the vault's metadata (path / kind / plaintext size) — no
+// decryption happens here — so they are unit-tested directly below.
+// ---------------------------------------------------------------------------
+
+/// A flattened snapshot of a reader's entries, taken once per frame so the UI can
+/// mutate session state without holding the reader borrow.
+fn snapshot_entries(reader: &VaultReader) -> Vec<(String, EntryKind, u64)> {
+    reader
+        .entries()
+        .iter()
+        .map(|e| (e.path.clone(), e.kind, e.size))
+        .collect()
+}
+
+/// The parent directory of a normalized vault path ("" for a top-level entry).
+fn parent_dir(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => parent,
+        None => "",
+    }
+}
+
+/// The final path segment (the display name) of a vault path.
+fn leaf_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Clamp `dir` to the nearest existing ancestor directory (or the root, ""), so a
+/// folder removed/renamed out from under the browser never strands the view.
+fn clamp_dir(entries: &[(String, EntryKind, u64)], dir: &str) -> String {
+    let exists = |d: &str| {
+        d.is_empty()
+            || entries
+                .iter()
+                .any(|(p, k, _)| p == d && *k == EntryKind::Dir)
+    };
+    let mut cur = dir.to_string();
+    while !cur.is_empty() && !exists(&cur) {
+        cur = parent_dir(&cur).to_string();
+    }
+    cur
+}
+
+/// How many entries sit directly inside `dir`.
+fn dir_child_count(entries: &[(String, EntryKind, u64)], dir: &str) -> usize {
+    entries
+        .iter()
+        .filter(|(p, _, _)| parent_dir(p) == dir)
+        .count()
+}
+
+/// A single browser row: a file or folder to display.
+struct Row {
+    path: String,
+    kind: EntryKind,
+    size: u64,
+    /// For a folder, the number of entries directly inside it (0 for files).
+    children: usize,
+}
+
+/// Build the ordered rows to show: either the direct children of `dir`, or — when
+/// `search` is non-empty — every entry in the vault whose name matches, anywhere.
+/// Directories always sort before files; `sort` orders within each group.
+fn visible_rows(
+    entries: &[(String, EntryKind, u64)],
+    dir: &str,
+    search: &str,
+    sort: SortMode,
+) -> Vec<Row> {
+    let q = search.trim().to_lowercase();
+    let mut rows: Vec<Row> = entries
+        .iter()
+        .filter(|(p, _, _)| {
+            if q.is_empty() {
+                parent_dir(p) == dir
+            } else {
+                leaf_name(p).to_lowercase().contains(&q)
+            }
+        })
+        .map(|(p, k, sz)| Row {
+            path: p.clone(),
+            kind: *k,
+            size: *sz,
+            children: if *k == EntryKind::Dir {
+                dir_child_count(entries, p)
+            } else {
+                0
+            },
+        })
+        .collect();
+    sort_rows(&mut rows, sort);
+    rows
+}
+
+/// Sort rows in place: directories first, then by the chosen key. Names compare
+/// case-insensitively by leaf; size ties break by name for a stable order.
+fn sort_rows(rows: &mut [Row], sort: SortMode) {
+    rows.sort_by(|a, b| {
+        let dirs_first = (a.kind != EntryKind::Dir).cmp(&(b.kind != EntryKind::Dir));
+        dirs_first.then_with(|| {
+            let an = leaf_name(&a.path).to_lowercase();
+            let bn = leaf_name(&b.path).to_lowercase();
+            match sort {
+                SortMode::NameAsc => an.cmp(&bn),
+                SortMode::NameDesc => bn.cmp(&an),
+                SortMode::SizeDesc => b.size.cmp(&a.size).then(an.cmp(&bn)),
+                SortMode::SizeAsc => a.size.cmp(&b.size).then(an.cmp(&bn)),
+            }
+        })
+    });
+}
+
+/// Breadcrumb segments for `dir`, each `(label, navigation target)`. Always starts
+/// with `("Home", "")`; e.g. "a/b" → [Home→"", a→"a", b→"a/b"].
+fn breadcrumb_segments(dir: &str) -> Vec<(String, String)> {
+    let mut out = vec![("Home".to_string(), String::new())];
+    let mut acc = String::new();
+    for seg in dir.split('/').filter(|s| !s.is_empty()) {
+        if acc.is_empty() {
+            acc = seg.to_string();
+        } else {
+            acc = format!("{acc}/{seg}");
+        }
+        out.push((seg.to_string(), acc.clone()));
+    }
+    out
+}
+
+/// Broad file categories, used only to tint the file icon for quick scanning.
+#[derive(PartialEq, Debug)]
+enum FileCat {
+    Image,
+    Media,
+    Archive,
+    Code,
+    Other,
+}
+
+/// Classify a filename by extension into a coarse [`FileCat`].
+fn file_category(name: &str) -> FileCat {
+    let ext = match name.rsplit_once('.') {
+        Some((_, e)) => e.to_lowercase(),
+        None => return FileCat::Other,
+    };
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "heic" | "tif" | "tiff"
+        | "ico" => FileCat::Image,
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "mp4" | "mov" | "mkv" | "avi" | "webm"
+        | "wmv" | "m4v" => FileCat::Media,
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "7z" | "rar" | "xz" | "zst" => FileCat::Archive,
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "h" | "cpp" | "hpp" | "java" | "go"
+        | "rb" | "php" | "html" | "css" | "json" | "toml" | "yaml" | "yml" | "sh" => FileCat::Code,
+        _ => FileCat::Other,
+    }
+}
+
+/// The icon tint for a file, by category — subtle, palette-only differentiation.
+fn file_tint(name: &str, c: theme::Colors) -> Color32 {
+    match file_category(name) {
+        FileCat::Image => c.ok,
+        FileCat::Media => c.accent_hi,
+        FileCat::Archive => c.warn,
+        FileCat::Code => c.accent,
+        FileCat::Other => c.text_muted,
+    }
+}
+
+#[cfg(test)]
+mod browse_tests {
+    //! Unit tests for the pure file-browser model (navigation, filtering,
+    //! sorting, classification) over synthetic vault metadata — no egui, no disk.
+    use super::*;
+
+    fn ent(path: &str, kind: EntryKind, size: u64) -> (String, EntryKind, u64) {
+        (path.to_string(), kind, size)
+    }
+
+    /// docs/ {a.txt(10), b.txt(30), sub/ {deep.bin(5)}}, photo.png(100), notes.md(20)
+    fn sample() -> Vec<(String, EntryKind, u64)> {
+        vec![
+            ent("docs", EntryKind::Dir, 0),
+            ent("docs/a.txt", EntryKind::File, 10),
+            ent("docs/b.txt", EntryKind::File, 30),
+            ent("docs/sub", EntryKind::Dir, 0),
+            ent("docs/sub/deep.bin", EntryKind::File, 5),
+            ent("photo.png", EntryKind::File, 100),
+            ent("notes.md", EntryKind::File, 20),
+        ]
+    }
+
+    fn names(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| leaf_name(&r.path)).collect()
+    }
+
+    #[test]
+    fn parent_and_leaf() {
+        assert_eq!(parent_dir("a/b/c"), "a/b");
+        assert_eq!(parent_dir("top"), "");
+        assert_eq!(leaf_name("a/b/c.txt"), "c.txt");
+        assert_eq!(leaf_name("solo"), "solo");
+    }
+
+    #[test]
+    fn breadcrumbs() {
+        assert_eq!(
+            breadcrumb_segments(""),
+            vec![("Home".to_string(), String::new())]
+        );
+        assert_eq!(
+            breadcrumb_segments("a/b"),
+            vec![
+                ("Home".to_string(), String::new()),
+                ("a".to_string(), "a".to_string()),
+                ("b".to_string(), "a/b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn clamp_keeps_existing_drops_missing() {
+        let e = sample();
+        assert_eq!(clamp_dir(&e, "docs/sub"), "docs/sub");
+        assert_eq!(clamp_dir(&e, ""), "");
+        // A folder that no longer exists clamps to the nearest real ancestor.
+        assert_eq!(clamp_dir(&e, "docs/gone"), "docs");
+        assert_eq!(clamp_dir(&e, "gone/deeper"), "");
+    }
+
+    #[test]
+    fn root_view_lists_direct_children_dirs_first() {
+        let e = sample();
+        let rows = visible_rows(&e, "", "", SortMode::NameAsc);
+        // The folder before files; files alphabetical.
+        assert_eq!(names(&rows), vec!["docs", "notes.md", "photo.png"]);
+        // The folder reports its direct child count (a.txt, b.txt, sub = 3).
+        let docs = rows.iter().find(|r| r.path == "docs").unwrap();
+        assert_eq!(docs.children, 3);
+    }
+
+    #[test]
+    fn subfolder_view_is_scoped() {
+        let e = sample();
+        let rows = visible_rows(&e, "docs", "", SortMode::NameAsc);
+        assert_eq!(names(&rows), vec!["sub", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn size_sort_orders_files_within_group() {
+        let e = sample();
+        let rows = visible_rows(&e, "docs", "", SortMode::SizeDesc);
+        // Dir first, then files largest→smallest: b.txt(30), a.txt(10).
+        assert_eq!(names(&rows), vec!["sub", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn search_is_global_and_case_insensitive() {
+        let e = sample();
+        let rows = visible_rows(&e, "docs", "TXT", SortMode::NameAsc);
+        let mut found = names(&rows);
+        found.sort();
+        assert_eq!(found, vec!["a.txt", "b.txt"]);
+        // Matches reach into other folders, not just the current one.
+        let deep = visible_rows(&e, "", "deep", SortMode::NameAsc);
+        assert_eq!(deep.len(), 1);
+        assert_eq!(deep[0].path, "docs/sub/deep.bin");
+    }
+
+    #[test]
+    fn categories() {
+        assert_eq!(file_category("a.PNG"), FileCat::Image);
+        assert_eq!(file_category("song.mp3"), FileCat::Media);
+        assert_eq!(file_category("bundle.tar.gz"), FileCat::Archive);
+        assert_eq!(file_category("main.rs"), FileCat::Code);
+        assert_eq!(file_category("README"), FileCat::Other);
+        assert_eq!(file_category("data.unknownext"), FileCat::Other);
+    }
+}
+
+#[cfg(test)]
+mod ui_smoke {
+    //! Headless render smoke tests: drive each redesigned screen and overlay
+    //! through a real `egui` frame so the custom fonts, painter icon glyphs, and
+    //! modal/toast code paths are exercised — a panic here fails the test.
+    use super::*;
+
+    fn test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        ctx
+    }
+
+    fn test_session() -> Session {
+        let id = Identity::generate("Tester", 0).expect("generate identity");
+        Session::new(
+            Arc::new(id),
+            ContactBook::default(),
+            Registry::default(),
+            Vec::new(),
+            false,
+            "/tmp/filesec-ui-test".to_string(),
+        )
+    }
+
+    /// Run one full frame with the given central-panel contents.
+    fn frame(ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui)) {
+        ctx.begin_pass(egui::RawInput::default());
+        egui::CentralPanel::default().show(ctx, add);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn screens_render_without_panic() {
+        let ctx = test_ctx();
+        let mut s = test_session();
+        let mut action = None;
+        frame(&ctx, |ui| {
+            first_run_ui(&mut FirstRun::default(), ui, &mut action)
+        });
+        frame(&ctx, |ui| {
+            unlock_ui(&mut Unlock::default(), ui, &mut action)
+        });
+        frame(&ctx, |ui| fatal_ui("boom", ui));
+        frame(&ctx, |ui| vaults_ui(&mut s, ui, &mut action));
+        frame(&ctx, |ui| contacts_ui(&mut s, ui, &mut action));
+        frame(&ctx, |ui| identity_ui(&mut s, ui, &mut action));
+        // The novel painter path: icon-font glyphs drawn directly.
+        frame(&ctx, |ui| {
+            sidebar_nav_item(ui, crate::theme::icon::VAULT, "Vaults", true);
+            sidebar_nav_item(ui, crate::theme::icon::CONTACTS, "Contacts", false);
+        });
+    }
+
+    #[test]
+    fn widgets_and_overlays_render_without_panic() {
+        let ctx = test_ctx();
+        frame(&ctx, |ui| {
+            crate::theme::card(ui, |ui| ui.label("card"));
+            crate::theme::badge(ui, "Verified", crate::theme::BadgeKind::Ok);
+            crate::theme::badge(ui, "Unverified", crate::theme::BadgeKind::Warn);
+            crate::theme::empty_state(
+                ui,
+                crate::theme::icon::VAULT,
+                "Empty",
+                "Nothing here",
+                |_| {},
+            );
+            let _ = crate::theme::primary_button(ui, "Primary");
+            let _ = crate::theme::secondary_button(ui, "Secondary");
+            let _ = crate::theme::danger_button(ui, "Danger");
+        });
+        // Overlays that own the whole context (Area + Modal).
+        ctx.begin_pass(egui::RawInput::default());
+        let _ = crate::theme::toast(&ctx, "Saved.", false);
+        let _ = crate::theme::modal(&ctx, "Dialog", |ui| ui.label("body"));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn browser_renders_populated_vault_without_panic() {
+        // A real on-disk vault so the file browser's reader / row / breadcrumb /
+        // selection paths (custom allocate + new_child + painter, the sort combo)
+        // run through real egui frames — a panic in any of them fails the test.
+        let dir =
+            std::env::temp_dir().join(format!("filesec-browser-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::at(&dir).expect("store");
+        let id = Identity::generate("Tester", 0).expect("identity");
+        let vid = new_vault_id();
+        store
+            .save_vault(&id, &vid, &Vault::new("Demo", 0))
+            .expect("save vault");
+        // Stage source files to add (one nested in a folder, one image at root).
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(src.join("a.txt"), b"hello").expect("write a");
+        std::fs::write(src.join("pic.png"), b"img").expect("write pic");
+        let reader = store.open_vault(&id, &vid).expect("open");
+        let added = vec![
+            format::AddedFile {
+                vault_path: "folder/a.txt".into(),
+                source: src.join("a.txt"),
+                mtime: None,
+                mode: None,
+            },
+            format::AddedFile {
+                vault_path: "pic.png".into(),
+                source: src.join("pic.png"),
+                mtime: None,
+                mode: None,
+            },
+        ];
+        store
+            .append_files_to_vault(&id, &vid, &reader, &added, &["folder".to_string()])
+            .expect("append");
+        let reader = store.open_vault(&id, &vid).expect("reopen");
+
+        let ctx = test_ctx();
+        let mut s = Session::new(
+            Arc::new(id),
+            ContactBook::default(),
+            Registry::default(),
+            Vec::new(),
+            false,
+            dir.display().to_string(),
+        );
+        s.open = Some(OpenVault { id: vid, reader });
+        let mut action = None;
+        // Root view: a folder row + a (type-tinted) file row, breadcrumb, combo.
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        // Inside the folder: scoped view + deeper breadcrumb.
+        s.current_dir = "folder".to_string();
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        // Global search + an active selection (selection bar + a selected row).
+        s.current_dir.clear();
+        s.file_search = "a".to_string();
+        s.selected.insert("folder/a.txt".to_string());
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        // Empty-vault state.
+        s.file_search.clear();
+        s.selected.clear();
+        let empty_vid = new_vault_id();
+        store
+            .save_vault(s.identity.as_ref(), &empty_vid, &Vault::new("Empty", 0))
+            .expect("save empty");
+        let empty_reader = store
+            .open_vault(s.identity.as_ref(), &empty_vid)
+            .expect("open empty");
+        s.open = Some(OpenVault {
+            id: empty_vid,
+            reader: empty_reader,
+        });
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

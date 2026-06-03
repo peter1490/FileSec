@@ -10,13 +10,17 @@ encrypted file (`.fsec`) that you send to a recipient over any channel (email,
 cloud, USB). Only the intended recipients — selected by their public key — can
 open it.
 
-> **Status: MVP + opt-in PQC & passkeys.** The classical crypto suite, vault
-> management, in-place editing, and the full export/import/verify flow are
-> implemented and tested. An **opt-in post-quantum** build (`--features pqc`) adds
-> a hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65 suite and an AES-256-GCM suite;
-> an **opt-in passkey** build (`--features passkey`) lets you unlock with a FIDO2
-> hardware key in addition to your passphrase. OS installers and a transparent
-> filesystem mount are planned but not in this build (see [Roadmap](#roadmap)).
+> **Status: MVP + opt-in PQC & passkeys, with signed installers.** The classical
+> crypto suite, vault management, in-place editing, and the full
+> export/import/verify flow are implemented and tested. An **opt-in post-quantum**
+> build (`--features pqc`) adds a hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65
+> suite and an AES-256-GCM suite; an **opt-in passkey** build
+> (`--features passkey`) lets you unlock with a FIDO2 hardware key, and an
+> **opt-in keyring** build (`--features keyring`) can remember your passphrase in
+> the OS keychain for automatic unlock on a trusted device. FileSec now ships as
+> **two signed installer builds — classical and post-quantum — for macOS, Windows,
+> and Linux**, with published checksums (see [Packaging & releases](#packaging--releases)).
+> A transparent filesystem mount is the remaining planned item (see [Roadmap](#roadmap)).
 
 ---
 
@@ -143,6 +147,25 @@ Upgrading to post-quantum re-seals a fresh keystore, so re-enroll any keys after
 > that builds on the project's Rust 1.86 MSRV. The keyslot crypto itself lives in
 > `filesec-core` with no hardware dependency and is fully unit-tested.
 
+#### Opt-in keyring auto-unlock (`--features keyring`)
+
+For a trusted personal device you can ask FileSec to **remember your passphrase
+in the OS keychain** — macOS Keychain, Windows Credential Manager, or the Linux
+Secret Service (GNOME Keyring / KWallet) — so it unlocks automatically. Enable it
+under *My Identity → This device → Remember on this device…* (it re-confirms your
+passphrase first); the unlock screen then offers *🔓 Unlock with saved passphrase*
+and the next launch auto-unlocks. Turn it off any time with *Forget on this
+device*.
+
+This is strictly **opt-in and per-device**. Your passphrase is never replaced —
+it remains your recovery secret and keeps working everywhere — so this can never
+become a lockout. The trade-off is explicit: the keychain becomes a second way in,
+gated by your logged-in OS account, so only enable it on a machine you trust.
+The signed installer builds enable this feature; the default `cargo` build leaves
+it (and its secret-store dependency) out entirely. The backend crate is
+target-gated so each OS pulls only its own (no `zbus` on macOS/Windows). See
+[`crates/filesec-gui/src/autounlock.rs`](crates/filesec-gui/src/autounlock.rs).
+
 ### Threat model — what is *not* protected
 
 FileSec protects data **in transit and at rest**. It explicitly does **not**
@@ -172,7 +195,10 @@ and a thin GUI:
 crates/
   filesec-core/   # all cryptography + the .fsec container format. NO GUI.
                   # forbids unsafe, denies unwrap/expect/panic. Fuzz/audit target.
-  filesec-gui/    # egui/eframe desktop app (lib + `filesec` binary).
+  filesec-gui/    # egui/eframe desktop app (lib + classical `filesec` binary).
+  filesec-pqc/    # same GUI compiled with the post-quantum suites on
+                  # (the `filesec-pqc` binary). Built separately so PQC features
+                  # never leak into the classical binary.
 ```
 
 The `.fsec` container layout (front to back):
@@ -220,24 +246,46 @@ Files are created with `0600`/`0700` permissions on Unix.
 Requires a recent stable Rust toolchain (built and tested with 1.86).
 
 ```sh
-# Run the desktop app
+# Run the desktop app (classical)
 cargo run -p filesec-gui --release
 
 # Run all tests (crypto round-trips, tamper detection, persistence)
-cargo test --workspace
+cargo test
 
 # Lint & format
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 
-# Opt-in builds: post-quantum suites, and/or hardware-passkey unlock
+# Opt-in builds: post-quantum suites, hardware-passkey unlock, OS-keychain unlock
 cargo run -p filesec-gui --release --features pqc
 cargo run -p filesec-gui --release --features passkey   # needs a FIDO2 key to use
+cargo run -p filesec-gui --release --features keyring   # "remember on this device"
+
+# The post-quantum desktop build (hybrid suites on by default)
+cargo run -p filesec-pqc --release
 ```
+
+> **Workspace layout.** The bare `cargo build` / `cargo test` / `cargo clippy`
+> commands run against the **default members** (`filesec-core` + `filesec-gui`),
+> i.e. the dependency-light classical path. The post-quantum binary lives in its
+> own `filesec-pqc` package (built with `-p filesec-pqc`) so its features are
+> never unified into the classical `filesec` binary. Use `--workspace` only when
+> you intentionally want everything (it pulls the PQC/keychain dependencies in).
 
 The `filesec` binary is self-contained (single executable per OS). The `passkey`
 feature compiles a USB-HID FIDO2 client (vendored `hidapi` C); it is off by
 default and requires a physical security key to exercise.
+
+### Packaging & releases
+
+Tagging `v*` builds, signs, and publishes **two installer families** — classical
+(`filesec`) and post-quantum (`filesec-pqc`) — for macOS (`.dmg`), Windows
+(`.msi` + NSIS) and Linux (`.deb`), each with a portable archive and a published
+`SHA256SUMS`. macOS builds are codesigned + notarized and Windows builds are
+Authenticode-signed when the maintainer's certificates are configured as repo
+secrets. A complementary `cargo-dist` configuration provides `curl | sh`
+installers. See [RELEASE.md](RELEASE.md) for the full process and required
+secrets.
 
 ### A typical two-party exchange
 
@@ -339,16 +387,19 @@ distinguishes a valid *signature* from a *trusted identity*, offering one-click
 verify / add-to-contacts shortcuts.
 
 **Delivered:** an opt-in hybrid post-quantum suite (X25519+ML-KEM-768,
-Ed25519+ML-DSA-65) and an AES-256-GCM suite, behind `--features pqc`; and
+Ed25519+ML-DSA-65) and an AES-256-GCM suite, behind `--features pqc`;
 **opt-in passkey unlock** (FIDO2 `hmac-secret` hardware keys, behind
 `--features passkey`) as a co-equal alternative to the passphrase — see
-[Cryptography](#cryptography-suite-0x0001-the-default) above.
+[Cryptography](#cryptography-suite-0x0001-the-default) above; **opt-in OS-keychain
+auto-unlock** (`--features keyring`); and **packaging & signing** — two signed
+installer builds (classical + post-quantum) for macOS (`.dmg`, notarized),
+Windows (`.msi` + NSIS, Authenticode) and Linux (`.deb`), plus portable archives
+and published checksums, driven by GitHub Actions with a complementary
+`cargo-dist` config (see [RELEASE.md](RELEASE.md)).
 
-Planned, in dependency order:
+Planned:
 
-1. **Packaging & signing** — cross-platform installers (`cargo-dist`), macOS
-   notarization, Windows Authenticode.
-2. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
+1. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
 
 ---
 

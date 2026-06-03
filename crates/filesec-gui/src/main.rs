@@ -2,6 +2,10 @@
 //!
 //! Pure-Rust egui front-end over the `filesec-core` cryptography and `.fsec`
 //! container format. No webview, no network.
+//!
+//! This is the **classical** build (default suite `0x0001`). The post-quantum
+//! build is the sibling `filesec-pqc` binary, which is the same app compiled
+//! with `--features pqc`. Both call [`filesec_gui::run`].
 
 // On Windows, don't pop up a console window alongside the GUI in release.
 #![cfg_attr(
@@ -9,19 +13,6 @@
     windows_subsystem = "windows"
 )]
 
-use filesec_gui::app::App;
-
 fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 640.0])
-            .with_min_inner_size([640.0, 480.0])
-            .with_title("FileSec"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "FileSec",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
-    )
+    filesec_gui::run("FileSec")
 }

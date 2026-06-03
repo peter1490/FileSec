@@ -2,6 +2,13 @@
 **/*.rs.bk
 *.pdb
 
+# Packaging / release build outputs (produced in CI)
+/dist
+*.dmg
+*.msi
+*.deb
+*-setup.exe
+
 # FileSec runtime artifacts that must never be committed
 *.fsec
 *.fsecpub
@@ -9,3 +16,6 @@
 
 # macOS Finder metadata
 .DS_Store
+
+# Local signing secrets — never commit
+.env

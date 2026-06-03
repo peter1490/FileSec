@@ -6,10 +6,36 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "filesec"
 path = "src/main.rs"
+
+# cargo-dist builds the classical installer with OS-keychain auto-unlock on (the
+# release workflow passes the same `--features keyring`).
+[package.metadata.dist]
+features = ["keyring"]
+
+# `cargo deb` (Linux .deb). The release workflow builds the binary first with the
+# right features, then runs `cargo deb --no-build` to package this already-built
+# `target/release/filesec`.
+[package.metadata.deb]
+maintainer = "FileSec contributors"
+copyright = "FileSec contributors"
+extended-description = """\
+FileSec is a native, offline desktop app for securely exchanging files between \
+parties using public/private-key cryptography. This is the classical build \
+(XChaCha20-Poly1305 / X25519 / Ed25519); the post-quantum build is the separate \
+`filesec-pqc` package."""
+section = "utils"
+priority = "optional"
+# `target/release/...` is remapped by cargo-deb to the real (workspace) target
+# dir; other paths are relative to this crate's directory.
+assets = [
+    ["target/release/filesec", "usr/bin/", "755"],
+    ["packaging/filesec.desktop", "usr/share/applications/", "644"],
+]
 
 [features]
 default = []
@@ -20,6 +46,11 @@ pqc = ["filesec-core/pqc"]
 # CI/sandbox build (which can't compile vendored hidapi or test real hardware)
 # is unaffected. See src/passkey.rs.
 passkey = ["dep:ctap-hid-fido2"]
+# Opt-in "remember on this device" auto-unlock via the OS keychain (macOS
+# Keychain / Windows Credential Manager / Linux Secret Service). Optional so the
+# default build keeps the passphrase-only stance and pulls no secret-store
+# dependency. The backend crate is target-gated below. See src/autounlock.rs.
+keyring = ["dep:keyring"]
 
 [dependencies]
 directories = "6.0.0"
@@ -39,3 +70,29 @@ zeroize = "1.8.2"
 # and uses `ring` for crypto, so getrandom stays 0.2. Vendors hidapi (C) and is
 # compiled only when the feature is enabled.
 ctap-hid-fido2 = { version = "=3.5.7", optional = true }
+
+# OS-keychain backend (opt-in via the `keyring` feature). 3.6 declares a 1.75
+# MSRV and target-gates every platform backend, so each OS pulls only its own:
+# macOS gets `security-framework`, Windows `windows-sys`, Linux the D-Bus Secret
+# Service (which drags in `zbus` — already required on Linux by rfd/directories,
+# so it doesn't raise the Linux MSRV further; the macOS/Windows hosts never
+# compile it). 4.x needs Rust 1.88, so it is held at 3.6 for the 1.86 MSRV.
+[target.'cfg(target_os = "macos")'.dependencies.keyring]
+version = "3.6"
+optional = true
+default-features = false
+features = ["apple-native"]
+
+[target.'cfg(target_os = "windows")'.dependencies.keyring]
+version = "3.6"
+optional = true
+default-features = false
+features = ["windows-native"]
+
+[target.'cfg(target_os = "linux")'.dependencies.keyring]
+version = "3.6"
+optional = true
+default-features = false
+# Persistent Secret Service (GNOME Keyring / KWallet) over D-Bus, with the
+# pure-Rust transport crypto (avoids an OpenSSL build dependency).
+features = ["sync-secret-service", "crypto-rust"]

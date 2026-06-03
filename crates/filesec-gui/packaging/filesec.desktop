@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FileSec
+GenericName=Secure File Exchange
+Comment=Offline secure file exchange with public-key cryptography
+Exec=filesec
+Icon=filesec
+Terminal=false
+Categories=Utility;Security;
+StartupWMClass=FileSec

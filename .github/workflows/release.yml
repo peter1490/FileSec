@@ -1,0 +1,272 @@
+name: Release
+
+# Authoritative release pipeline. On a version tag it builds BOTH variants —
+# classical (`filesec`) and post-quantum (`filesec-pqc`) — for macOS, Windows and
+# Linux, packages each into native installers (.dmg / .msi + NSIS / .deb) plus a
+# portable archive, code-signs and notarizes where credentials are configured,
+# and publishes everything with a SHA256SUMS file to a GitHub Release.
+#
+# Each variant is built in its own `cargo build -p <package>` invocation so the
+# post-quantum features are never unified into the classical binary. Signing and
+# notarization are gated on secrets, so the build runs end-to-end (producing
+# unsigned artifacts) on a fork that has none. See RELEASE.md for the secrets.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ------------------------------------------------------------------ macOS
+  macos:
+    name: macOS (${{ matrix.variant }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [classical, pqc]
+    env:
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER: ${{ secrets.AC_API_ISSUER }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set variant parameters
+        run: |
+          if [ "${{ matrix.variant }}" = "pqc" ]; then
+            echo "BUILD_ARGS=-p filesec-pqc"                          >> "$GITHUB_ENV"
+            echo "BIN=filesec-pqc"                                    >> "$GITHUB_ENV"
+            echo "APP_NAME=FileSec (post-quantum)"                    >> "$GITHUB_ENV"
+            echo "BUNDLE_ID=dev.FileSec.FileSec.pqc"                  >> "$GITHUB_ENV"
+          else
+            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring" >> "$GITHUB_ENV"
+            echo "BIN=filesec"                                        >> "$GITHUB_ENV"
+            echo "APP_NAME=FileSec"                                   >> "$GITHUB_ENV"
+            echo "BUNDLE_ID=dev.FileSec.FileSec"                      >> "$GITHUB_ENV"
+          fi
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build (aarch64 + x86_64 → universal)
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin $BUILD_ARGS
+          cargo build --locked --release --target x86_64-apple-darwin $BUILD_ARGS
+          mkdir -p dist
+          lipo -create -output "dist/$BIN" \
+            "target/aarch64-apple-darwin/release/$BIN" \
+            "target/x86_64-apple-darwin/release/$BIN"
+
+      - name: Import signing certificate
+        if: env.MACOS_CERT_P12_BASE64 != ''
+        run: |
+          KP="$(openssl rand -hex 16)"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KP" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KP" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" build.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Prepare notarization API key
+        if: env.AC_API_KEY_BASE64 != ''
+        run: |
+          echo "$AC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/ac_api_key.p8"
+          echo "AC_API_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8" >> "$GITHUB_ENV"
+
+      - name: Package archive + signed/notarized .dmg
+        run: |
+          BASE="$BIN-$VERSION-universal-apple-darwin"
+          ( cd dist && tar -czf "$BASE.tar.gz" "$BIN" )
+          BIN_PATH="dist/$BIN" OUT_DMG="dist/$BASE.dmg" \
+            bash packaging/macos/package_macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.variant }}
+          path: |
+            dist/*.tar.gz
+            dist/*.dmg
+
+  # ---------------------------------------------------------------- Windows
+  windows:
+    name: Windows (${{ matrix.variant }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [classical, pqc]
+    env:
+      WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install NSIS
+        run: |
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Set variant parameters
+        shell: bash
+        run: |
+          if [ "${{ matrix.variant }}" = "pqc" ]; then
+            echo "BUILD_ARGS=-p filesec-pqc"  >> "$GITHUB_ENV"
+            echo "BIN=filesec-pqc"            >> "$GITHUB_ENV"
+            echo "PKG=filesec-pqc"            >> "$GITHUB_ENV"
+            echo "APP_NAME=FileSec (post-quantum)" >> "$GITHUB_ENV"
+            echo "REG_KEY=FileSec-pqc"        >> "$GITHUB_ENV"
+          else
+            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring" >> "$GITHUB_ENV"
+            echo "BIN=filesec"                >> "$GITHUB_ENV"
+            echo "PKG=filesec-gui"            >> "$GITHUB_ENV"
+            echo "APP_NAME=FileSec"           >> "$GITHUB_ENV"
+            echo "REG_KEY=FileSec"            >> "$GITHUB_ENV"
+          fi
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release $BUILD_ARGS
+
+      - name: Sign executable
+        shell: pwsh
+        run: ./packaging/windows/sign.ps1 -File "target/release/$env:BIN.exe"
+
+      - name: Portable .zip
+        shell: bash
+        run: |
+          mkdir -p dist
+          ( cd target/release && 7z a "$GITHUB_WORKSPACE/dist/$BIN-$VERSION-x86_64-pc-windows-msvc.zip" "$BIN.exe" )
+
+      - name: NSIS installer
+        shell: bash
+        run: |
+          OUT="dist/$BIN-$VERSION-x86_64-windows-setup.exe"
+          makensis -DAPP_NAME="$APP_NAME" -DAPP_EXE="$BIN.exe" -DAPP_VERSION="$VERSION" \
+            -DSRC_EXE="target/release/$BIN.exe" -DOUT_FILE="$OUT" -DREG_KEY="$REG_KEY" \
+            packaging/windows/filesec.nsi
+
+      # MSI via cargo-wix. Marked best-effort: cargo-wix's first `init` generates
+      # a default WiX source that occasionally needs hand-tuning per project;
+      # commit crates/<pkg>/wix/main.wxs once to make this deterministic.
+      - name: MSI installer
+        continue-on-error: true
+        shell: bash
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix init -p "$PKG" --force
+          cargo wix -p "$PKG" --no-build --nocapture \
+            --output "dist/$BIN-$VERSION-x86_64.msi"
+
+      - name: Sign installers
+        shell: pwsh
+        run: |
+          $setup = "dist/$env:BIN-$env:VERSION-x86_64-windows-setup.exe"
+          if (Test-Path $setup) { ./packaging/windows/sign.ps1 -File $setup }
+          $msi = "dist/$env:BIN-$env:VERSION-x86_64.msi"
+          if (Test-Path $msi) { ./packaging/windows/sign.ps1 -File $msi }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.variant }}
+          path: dist/*
+
+  # ------------------------------------------------------------------ Linux
+  linux:
+    name: Linux (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [classical, pqc]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set variant parameters
+        run: |
+          if [ "${{ matrix.variant }}" = "pqc" ]; then
+            echo "BUILD_ARGS=-p filesec-pqc"  >> "$GITHUB_ENV"
+            echo "BIN=filesec-pqc"            >> "$GITHUB_ENV"
+            echo "PKG=filesec-pqc"            >> "$GITHUB_ENV"
+          else
+            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring" >> "$GITHUB_ENV"
+            echo "BIN=filesec"                >> "$GITHUB_ENV"
+            echo "PKG=filesec-gui"            >> "$GITHUB_ENV"
+          fi
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --locked --release $BUILD_ARGS
+
+      - name: Portable tarball
+        run: |
+          mkdir -p dist
+          ( cd target/release && tar -czf "$GITHUB_WORKSPACE/dist/$BIN-$VERSION-x86_64-unknown-linux-gnu.tar.gz" "$BIN" )
+
+      - name: Build .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p "$PKG" --no-build
+          cp target/debian/*.deb dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.variant }}
+          path: dist/*
+
+  # ----------------------------------------------------------------- Publish
+  publish:
+    name: Publish GitHub Release
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect artifacts and compute checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f \( \
+            -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \
+            -o -name '*.deb' -o -name '*.msi' -o -name '*-setup.exe' \
+          \) -exec cp -n {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

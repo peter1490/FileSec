@@ -1,12 +1,19 @@
 # FileSec workspace — a native, offline secure file-exchange app.
 #
-# Two crates:
+# Crates:
 #   - filesec-core: pure crypto + on-disk `.fsec` container format. No GUI. The
 #     unit/fuzz/audit target where the entire security story lives.
-#   - filesec-gui:  thin egui/eframe presentation layer over filesec-core.
+#   - filesec-gui:  thin egui/eframe presentation layer over filesec-core. Ships
+#     the classical `filesec` binary.
+#   - filesec-pqc:  the same GUI compiled with the post-quantum suites, shipping
+#     the `filesec-pqc` binary. It is NOT a default member, so the bare
+#     `cargo build`/`cargo test`/`cargo clippy` commands stay on the classical,
+#     dependency-light path (no feature unification dragging PQC/keychain deps
+#     into the default build). Build it explicitly with `-p filesec-pqc`.
 [workspace]
 resolver = "2"
-members = ["crates/filesec-core", "crates/filesec-gui"]
+members = ["crates/filesec-core", "crates/filesec-gui", "crates/filesec-pqc"]
+default-members = ["crates/filesec-core", "crates/filesec-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +21,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["FileSec contributors"]
 rust-version = "1.86"
+repository = "https://github.com/peter1490/FileSec"
 
 # Release profile tuned for a small, fast single binary per OS.
 [profile.release]
@@ -22,3 +30,35 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Profile cargo-dist builds under (`dist build` / `dist plan`). Inherits the
+# tuned release profile above.
+[profile.dist]
+inherits = "release"
+
+# ---------------------------------------------------------------------------
+# cargo-dist (the `dist` tool) — cross-platform archives + curl-pipe installers
+# + a Windows MSI, with published SHA-256 checksums. This is the "cargo-dist"
+# half of Phase 6 packaging; the authoritative pipeline that also produces the
+# native .dmg / .deb / NSIS installers and does code signing + notarization is
+# .github/workflows/release.yml (cargo-dist does not emit those formats). Run
+# `dist init` to (re)generate dist's own CI if you want the hosted installers.
+# See RELEASE.md.
+# ---------------------------------------------------------------------------
+[workspace.metadata.dist]
+# Pin the dist CLI version for reproducible installer output.
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "powershell", "msi"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+# One cargo invocation per package, so the post-quantum features of filesec-pqc
+# are never unified into the classical `filesec` binary.
+precise-builds = true
+# Publish SHA-256 checksums next to every artifact.
+checksum = "sha256"
+install-updater = false

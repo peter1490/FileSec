@@ -1,0 +1,42 @@
+[package]
+name = "filesec-pqc"
+description = "FileSec desktop app — post-quantum build (hybrid ML-KEM/ML-DSA suites enabled)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "filesec-pqc"
+path = "src/main.rs"
+
+# `cargo deb` (Linux .deb) for the post-quantum build. Built with `--no-build`
+# after the release workflow compiles `target/release/filesec-pqc`.
+[package.metadata.deb]
+maintainer = "FileSec contributors"
+copyright = "FileSec contributors"
+extended-description = """\
+FileSec is a native, offline desktop app for securely exchanging files between \
+parties using public/private-key cryptography. This is the post-quantum build: \
+new identities are hybrid (X25519+ML-KEM-768 / Ed25519+ML-DSA-65) and the local \
+store is encrypted at rest under the hybrid suite. It installs alongside the \
+classical `filesec` package."""
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/filesec-pqc", "usr/bin/", "755"],
+    ["packaging/filesec-pqc.desktop", "usr/share/applications/", "644"],
+]
+
+[dependencies]
+# The post-quantum variant is the same GUI compiled with the hybrid PQC suites
+# (and OS-keychain auto-unlock) turned on. Keeping it in its own package means a
+# per-package build — what the release workflow and cargo-dist's `precise-builds`
+# do — compiles these features into THIS binary only, never into the classical
+# `filesec` binary in filesec-gui. (A whole-workspace `cargo build --workspace`
+# would unify features across both; `default-members` in the root manifest keeps
+# the bare `cargo build`/`test` classical, and CI builds each variant separately.)
+eframe = "0.32.3"
+filesec-gui = { path = "../filesec-gui", features = ["pqc", "keyring"] }
