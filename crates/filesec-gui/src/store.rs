@@ -100,7 +100,6 @@ pub struct Store {
     data_dir: PathBuf,
     vaults_dir: PathBuf,
     checkout_dir: PathBuf,
-    mounts_dir: PathBuf,
 }
 
 impl Store {
@@ -123,19 +122,15 @@ impl Store {
         let data_dir = data_dir.into();
         let vaults_dir = data_dir.join("vaults");
         let checkout_dir = data_dir.join("checkout");
-        let mounts_dir = data_dir.join("mounts");
         std::fs::create_dir_all(&vaults_dir).map_err(err)?;
         std::fs::create_dir_all(&checkout_dir).map_err(err)?;
-        std::fs::create_dir_all(&mounts_dir).map_err(err)?;
         harden_dir(&data_dir);
         harden_dir(&vaults_dir);
         harden_dir(&checkout_dir);
-        harden_dir(&mounts_dir);
         Ok(Self {
             data_dir,
             vaults_dir,
             checkout_dir,
-            mounts_dir,
         })
     }
 
@@ -474,35 +469,6 @@ impl Store {
         if let Ok(rd) = std::fs::read_dir(&self.checkout_dir) {
             for entry in rd.flatten() {
                 let _ = secure_wipe(&entry.path());
-            }
-        }
-    }
-
-    /// Create (and harden, 0700 on Unix) the mount-point directory for vault
-    /// `id`, returning its path. The directory must exist and be empty for a FUSE
-    /// driver to mount over it. Lives under `data_dir/mounts/<id>`.
-    pub fn mount_point_for(&self, id: &str) -> StoreResult<PathBuf> {
-        let path = self.mounts_dir.join(id);
-        std::fs::create_dir_all(&path).map_err(err)?;
-        harden_dir(&path);
-        Ok(path)
-    }
-
-    /// Best-effort removal of a vault's (now-unmounted) mount-point directory.
-    /// Non-recursive, so it only succeeds when the directory is empty — i.e. when
-    /// nothing is still mounted there.
-    pub fn remove_mount_point(&self, id: &str) {
-        let _ = std::fs::remove_dir(self.mounts_dir.join(id));
-    }
-
-    /// Best-effort cleanup of stale mount-point directories left by a prior crash
-    /// (a clean unmount removes its own). Called on unlock, mirroring
-    /// [`Self::clean_checkout_dir`]. Only empty (unmounted) directories are
-    /// removed; anything the OS has not finished tearing down is left untouched.
-    pub fn clean_mounts_dir(&self) {
-        if let Ok(rd) = std::fs::read_dir(&self.mounts_dir) {
-            for entry in rd.flatten() {
-                let _ = std::fs::remove_dir(entry.path());
             }
         }
     }

@@ -6,7 +6,6 @@
 
 pub mod app;
 pub mod autounlock;
-pub mod mount;
 pub mod passkey;
 pub mod store;
 pub mod theme;

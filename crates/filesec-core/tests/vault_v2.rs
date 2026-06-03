@@ -122,36 +122,6 @@ fn v2_roundtrip_reads_match_and_reopen() {
 }
 
 #[test]
-fn v2_read_at_matches_read_entry_over_random_windows() {
-    let id = ident("Alice");
-    let dir = tmp_dir("readat.fsv2");
-    let v = build_sample(&dir, &id, SuiteId::Classic);
-    let full = v.read_entry("data/big.bin").unwrap();
-    let size = full.len() as u64;
-
-    for _ in 0..200 {
-        let r = filesec_core::secret::random_vec(8).unwrap();
-        let offset = u64::from(u32::from_le_bytes([r[0], r[1], r[2], r[3]])) % (size + 1);
-        let len = (u64::from(u32::from_le_bytes([r[4], r[5], r[6], r[7]])) % (size + 200)) as usize;
-        let mut buf = vec![0u8; len];
-        let n = v.read_at("data/big.bin", offset, &mut buf).unwrap();
-        let expected: &[u8] = if offset >= size {
-            &[]
-        } else {
-            let end = (offset + len as u64).min(size) as usize;
-            &full[offset as usize..end]
-        };
-        assert_eq!(n, expected.len(), "len at offset={offset} len={len}");
-        assert_eq!(&buf[..n], expected, "bytes at offset={offset} len={len}");
-    }
-    // EOF / empty behave like the v1 reader.
-    let mut buf = [0u8; 32];
-    assert_eq!(v.read_at("data/big.bin", size, &mut buf).unwrap(), 0);
-    assert_eq!(v.read_at("empty.bin", 0, &mut buf).unwrap(), 0);
-    cleanup(&dir);
-}
-
-#[test]
 fn v2_put_is_local() {
     let id = ident("Alice");
     let dir = tmp_dir("local.fsv2");

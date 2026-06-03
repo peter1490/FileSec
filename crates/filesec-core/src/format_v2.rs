@@ -29,9 +29,8 @@
 //! The header is stable for the vault's life (only the manifest nonce and blob
 //! keys rotate), so a normal mutation never invalidates other files' blobs.
 //!
-//! Like a lazy v1 open, a ranged [`VaultReaderV2::read_at`] authenticates each
-//! chunk it touches but cannot verify a file's whole-file BLAKE3;
-//! [`VaultReaderV2::read_entry_to_writer`] reads every chunk and does verify it.
+//! [`VaultReaderV2::read_entry_to_writer`] reads every chunk and verifies the
+//! file's whole-file BLAKE3 as it streams.
 
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -138,8 +137,8 @@ pub struct VaultReaderV2 {
     header_bytes: Vec<u8>,
     manifest_key: SymKey,
     manifest: ManifestV2,
-    /// v1-shaped view of `manifest.entries` (kept in sync), so callers — the
-    /// mount, the store — see the same [`Entry`] type a [`VaultReader`] exposes.
+    /// v1-shaped view of `manifest.entries` (kept in sync), so callers see the
+    /// same [`Entry`] type a [`VaultReader`] exposes.
     view: Vec<Entry>,
 }
 
@@ -329,43 +328,6 @@ impl VaultReaderV2 {
             is_last,
             &ct,
         )?))
-    }
-
-    /// Decrypt up to `out.len()` bytes of the file at `path` starting at plaintext
-    /// `offset`; returns the byte count (short at EOF, 0 past it). Only the
-    /// covering chunks are decrypted (per-chunk AEAD; no whole-file hash check).
-    pub fn read_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize> {
-        let entry = self.file_entry(path)?;
-        if out.is_empty() || offset >= entry.size {
-            return Ok(0);
-        }
-        let chunk = u64::from(entry.chunk_size);
-        if chunk == 0 {
-            return Err(Error::Format("bad chunk size"));
-        }
-        let key = SymKey::from_bytes(entry.key.ok_or(Error::Format("missing blob key"))?);
-        let nonce = entry
-            .nonce
-            .as_ref()
-            .ok_or(Error::Format("missing blob nonce"))?;
-        let want = (out.len() as u64).min(entry.size - offset);
-        let file_end = offset + want;
-        let first = offset / chunk;
-        let last = (file_end - 1) / chunk;
-        let mut file = fs_err::File::open(self.blob_path(blob_id(entry)?))?;
-        let mut written = 0usize;
-        for c in first..=last {
-            let pt = self.decrypt_blob_chunk(&mut file, entry, &key, nonce, c)?;
-            let chunk_start = c * chunk;
-            let lo = offset.saturating_sub(chunk_start) as usize;
-            let hi = (file_end.min(chunk_start + pt.len() as u64) - chunk_start) as usize;
-            if hi > pt.len() || lo > hi {
-                return Err(Error::Format("chunk range mismatch"));
-            }
-            out[written..written + (hi - lo)].copy_from_slice(&pt[lo..hi]);
-            written += hi - lo;
-        }
-        Ok(written)
     }
 
     /// Decrypt the whole file at `path` into `out`, one chunk at a time, verifying

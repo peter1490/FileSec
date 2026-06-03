@@ -296,9 +296,6 @@ struct Session {
     open: Option<OpenVault>,
     checkout: Option<Checkout>,
     views: Vec<ActiveView>,
-    /// The active read-only virtual-drive mount of the open vault, if any. Held
-    /// for the session and torn down (unmounted) on lock / close / nav / exit.
-    mount: Option<crate::mount::ActiveMount>,
     new_vault_name: String,
     show_new_vault: bool,
     new_folder_name: String,
@@ -351,7 +348,6 @@ impl Session {
             open: None,
             checkout: None,
             views: Vec::new(),
-            mount: None,
             new_vault_name: String::new(),
             show_new_vault: false,
             new_folder_name: String::new(),
@@ -401,11 +397,6 @@ enum Action {
     ImportContainer,
     AddFiles,
     AddFolder,
-    /// Mount the open vault as a read-only virtual drive (requires the `mount`
-    /// feature and an installed FUSE driver; gated in the UI on `mount::SUPPORTED`).
-    MountVault,
-    /// Unmount the open vault's virtual drive.
-    UnmountVault,
     /// Add OS files/folders dropped onto the window into the current folder.
     DropPaths(Vec<std::path::PathBuf>),
     NewFolder,
@@ -733,12 +724,10 @@ impl eframe::App for App {
     /// temps on a clean exit. A hard crash (SIGKILL/power loss) bypasses this; the
     /// next-unlock `clean_checkout_dir` is the backstop.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let store = self.store.clone();
         if let State::Unlocked(s) = &mut self.state {
             if let Some(c) = &s.checkout {
                 let _ = crate::store::secure_wipe(&c.temp_path);
             }
-            unmount_session(store.as_ref(), s);
             wipe_all_views(&mut s.views);
         }
     }
@@ -861,64 +850,6 @@ impl App {
             }
         }
         None
-    }
-
-    /// Mount the open vault as a read-only virtual drive. Synchronous: building
-    /// the inode tree from the metadata-only reader is cheap, and
-    /// `mount_readonly` returns as soon as the background FUSE session is up — so
-    /// unlike the crypto jobs this does not go through `spawn_job`.
-    fn mount_open_vault(&mut self) {
-        if !crate::mount::SUPPORTED {
-            self.set_toast("This build was compiled without mount support.", true);
-            return;
-        }
-        if matches!(&self.state, State::Unlocked(s) if s.mount.is_some()) {
-            self.set_toast("This vault is already mounted.", true);
-            return;
-        }
-        let (id, reader) = match self.open_reader() {
-            Some(x) => x,
-            None => return,
-        };
-        let store = match self.store_arc() {
-            Some(s) => s,
-            None => return,
-        };
-        let mount_point = match store.mount_point_for(&id) {
-            Ok(p) => p,
-            Err(e) => {
-                self.set_toast(format!("Could not create the mount point: {e}"), true);
-                return;
-            }
-        };
-        match crate::mount::mount_readonly(reader, &mount_point) {
-            Ok(active) => {
-                let shown = active.mount_point().display().to_string();
-                // Best-effort: reveal the mounted drive in the OS file manager.
-                let _ = open_in_default_app(active.mount_point());
-                if let State::Unlocked(s) = &mut self.state {
-                    s.mount = Some(active);
-                }
-                self.set_toast(format!("Mounted at {shown}"), false);
-            }
-            Err(e) => {
-                store.remove_mount_point(&id);
-                self.set_toast(format!("Could not mount the vault: {e}"), true);
-            }
-        }
-    }
-
-    /// Unmount the open vault's virtual drive (best-effort) and remove its now-
-    /// empty mount-point directory.
-    fn unmount_open_vault(&mut self) {
-        let store = self.store.clone();
-        if let State::Unlocked(s) = &mut self.state {
-            if s.mount.is_none() {
-                return;
-            }
-            unmount_session(store.as_ref(), s);
-        }
-        self.set_toast("Unmounted.", false);
     }
 
     /// Spawn `work` on a background thread and show a spinner labelled `label`.
@@ -1102,9 +1033,7 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
-                let store = self.store.clone();
                 if let State::Unlocked(s) = &mut self.state {
-                    unmount_session(store.as_ref(), s);
                     wipe_all_views(&mut s.views);
                 }
                 self.state = match &self.store {
@@ -1124,9 +1053,7 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
-                let store = self.store.clone();
                 if let State::Unlocked(s) = &mut self.state {
-                    unmount_session(store.as_ref(), s);
                     wipe_all_views(&mut s.views);
                     s.nav = n;
                     s.open = None;
@@ -1145,16 +1072,12 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
-                let store = self.store.clone();
                 if let State::Unlocked(s) = &mut self.state {
-                    unmount_session(store.as_ref(), s);
                     wipe_all_views(&mut s.views);
                     s.open = None;
                     s.reset_browse();
                 }
             }
-            Action::MountVault => self.mount_open_vault(),
-            Action::UnmountVault => self.unmount_open_vault(),
             Action::EnterDir(dir) => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.current_dir = dir;
@@ -1472,9 +1395,8 @@ impl App {
             let passkeys = ks.passkey_slots();
             let data_dir = store.data_dir().display().to_string();
             // Securely wipe any checkout temp files orphaned by a prior crash,
-            // and remove any mount-point dirs left behind by a crash mid-mount.
+            // plus any vault-migration scratch dirs left behind by a crash.
             store.clean_checkout_dir();
-            store.clean_mounts_dir();
             store.clean_partial_dirs();
             JobReport::ok(
                 Outcome::Unlocked(Box::new(SessionInit {
@@ -1552,7 +1474,6 @@ impl App {
                         let passkeys = ks.passkey_slots();
                         let data_dir = store.data_dir().display().to_string();
                         store.clean_checkout_dir();
-                        store.clean_mounts_dir();
                         store.clean_partial_dirs();
                         return JobReport::ok(
                             Outcome::Unlocked(Box::new(SessionInit {
@@ -1726,7 +1647,6 @@ impl App {
             let registry = store.load_registry(&identity).unwrap_or_default();
             let passkeys = ks.passkey_slots();
             store.clean_checkout_dir();
-            store.clean_mounts_dir();
             store.clean_partial_dirs();
             JobReport::ok(
                 Outcome::Unlocked(Box::new(SessionInit {
@@ -3495,23 +3415,6 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         });
     });
 
-    // ---- Mount as a read-only virtual drive. Shown only in builds with mount
-    // support; the action itself reports if no FUSE driver is installed. ----
-    if crate::mount::SUPPORTED {
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
-            if s.mount.is_some() {
-                if theme::secondary_button(ui, "Unmount drive").clicked() {
-                    *action = Some(Action::UnmountVault);
-                }
-                if let Some(m) = &s.mount {
-                    ui.label(format!("Mounted at {}", m.mount_point().display()));
-                }
-            } else if theme::secondary_button(ui, "Mount as drive…").clicked() {
-                *action = Some(Action::MountVault);
-            }
-        });
-    }
     if s.show_new_folder && idle {
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4961,22 +4864,6 @@ fn start_view(path: &std::path::Path) -> ViewLaunch {
 fn wipe_all_views(views: &mut Vec<ActiveView>) {
     for v in views.drain(..) {
         let _ = crate::store::secure_wipe(&v.temp_path);
-    }
-}
-
-/// Unmount the session's active virtual-drive mount, if any (best-effort), and
-/// remove its now-empty mount-point directory. Called from every path that drops
-/// the open vault — lock, close, nav-away, and exit — so a mount never outlives
-/// the session that owns its decrypted view. A no-op when nothing is mounted
-/// (including every build without the `mount` feature, where `mount` stays
-/// `None`).
-fn unmount_session(store: Option<&std::sync::Arc<Store>>, s: &mut Session) {
-    if let Some(active) = s.mount.take() {
-        let id = s.open.as_ref().map(|o| o.id.clone());
-        let _ = active.unmount();
-        if let (Some(store), Some(id)) = (store, id) {
-            store.remove_mount_point(&id);
-        }
     }
 }
 

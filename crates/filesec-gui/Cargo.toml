@@ -59,22 +59,6 @@ passkey = ["dep:ctap-hid-fido2"]
 # default build keeps the passphrase-only stance and pulls no secret-store
 # dependency. The backend crate is target-gated below. See src/autounlock.rs.
 keyring = ["dep:keyring"]
-# Opt-in "mount the vault as a virtual drive" via a native filesystem driver.
-# Linux/macOS use FUSE (fuser, MIT / MSRV 1.85), target-gated below so the
-# default build pulls nothing and stays dependency-light. See src/mount.rs.
-# Windows (Dokany) is a separate, stubbed backend pending a Windows build env;
-# its dependency is intentionally not added until it can be compiled/verified.
-#
-# Real mounting: on Linux fuser uses its pure-Rust backend (no build-time
-# system library; mounts via `fusermount` at runtime). On macOS fuser links
-# libfuse, so a real macOS build needs FUSE-T (kext-less) or macFUSE installed
-# at *build* time (the macOS release runner installs FUSE-T).
-mount = ["dep:fuser"]
-# Compile-only variant for a macOS host that has NO FUSE-T/macFUSE installed
-# (e.g. CI lint jobs and local dev): turns on fuser's `macos-no-mount`, which
-# compiles the backend but cannot actually mount on macOS. Use `mount` (not
-# `mount-dev`) for any build that must really mount. No effect on Linux.
-mount-dev = ["mount", "fuser/macos-no-mount"]
 
 [dependencies]
 directories = "6.0.0"
@@ -120,16 +104,6 @@ default-features = false
 # Persistent Secret Service (GNOME Keyring / KWallet) over D-Bus, with the
 # pure-Rust transport crypto (avoids an OpenSSL build dependency).
 features = ["sync-secret-service", "crypto-rust"]
-
-# FUSE backend for the `mount` feature (Linux + macOS). MIT, MSRV 1.85.
-# `default-features = false` drops fuser's build-time `libfuse` link, so the
-# crate compiles on a host that has no macFUSE/FUSE-T installed; the actual
-# mount syscalls reach the installed driver at runtime. A real macOS mount needs
-# FUSE-T (kext-less) or macFUSE present.
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies.fuser]
-version = "0.17"
-optional = true
-default-features = false
 
 # Embeds the app icon into the Windows `filesec.exe` (see build.rs).
 # `default-features = false` drops winresource's `toml` feature, leaving it

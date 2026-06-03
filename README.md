@@ -20,7 +20,6 @@ open it.
 > the OS keychain for automatic unlock on a trusted device. FileSec now ships as
 > **two signed installer builds — classical and post-quantum — for macOS, Windows,
 > and Linux**, with published checksums (see [Packaging & releases](#packaging--releases)).
-> A transparent filesystem mount is the remaining planned item (see [Roadmap](#roadmap)).
 
 ---
 
@@ -396,10 +395,6 @@ installer builds (classical + post-quantum) for macOS (`.dmg`, notarized),
 Windows (`.msi` + NSIS, Authenticode) and Linux (`.deb`), plus portable archives
 and published checksums, driven by GitHub Actions with a complementary
 `cargo-dist` config (see [RELEASE.md](RELEASE.md)).
-
-Planned:
-
-1. **Transparent OS mount** — FUSE / macFUSE / WinFsp virtual drive.
 
 ---
 

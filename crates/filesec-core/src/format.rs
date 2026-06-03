@@ -983,52 +983,6 @@ impl VaultReader {
         self.decrypt_entry_to_writer(&mut file, entry, out)
     }
 
-    /// Decrypt up to `out.len()` bytes of the file at `path`, starting at
-    /// plaintext byte `offset`, into `out`; return the number of bytes written.
-    /// Returns a short count at end of file, and `0` when `offset >= size` or
-    /// `out` is empty.
-    ///
-    /// Only the chunks overlapping the requested window are read and decrypted,
-    /// so this is the random-access primitive a filesystem mount uses to serve
-    /// `read(offset, size)` calls without touching the rest of the file.
-    ///
-    /// Integrity: every chunk it touches is AEAD-authenticated (tampering fails
-    /// with [`Error::Auth`]), but — unlike [`Self::read_entry_to_writer`] — a
-    /// ranged read **cannot** verify the file's whole BLAKE3 hash, since it never
-    /// necessarily sees every chunk. This is the same per-chunk trust model a
-    /// lazy open already relies on; a caller needing whole-file integrity must
-    /// read the entire file.
-    pub fn read_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize> {
-        let entry = self.file_entry(path)?;
-        if out.is_empty() || offset >= entry.size {
-            return Ok(0);
-        }
-        let chunk = self.data_chunk_size;
-        let want = (out.len() as u64).min(entry.size - offset);
-        let file_start = entry
-            .data_offset
-            .checked_add(offset)
-            .ok_or(Error::Format("entry range overflow"))?;
-        let file_end = file_start
-            .checked_add(want)
-            .ok_or(Error::Format("entry range overflow"))?;
-        let (first, last) = self.chunk_span(file_start, file_end)?;
-        let mut file = fs_err::File::open(&self.path)?;
-        let mut written = 0usize;
-        for c in first..=last {
-            let pt = self.decrypt_one_chunk(&mut file, c)?;
-            let chunk_start = c * chunk;
-            let lo = file_start.saturating_sub(chunk_start) as usize;
-            let hi = (file_end.min(chunk_start + pt.len() as u64) - chunk_start) as usize;
-            if hi > pt.len() || lo > hi {
-                return Err(Error::Format("chunk range mismatch"));
-            }
-            out[written..written + (hi - lo)].copy_from_slice(&pt[lo..hi]);
-            written += hi - lo;
-        }
-        Ok(written)
-    }
-
     /// Look up a file entry by path, erroring if it is missing or is a directory.
     fn file_entry(&self, path: &str) -> Result<&Entry> {
         let norm = normalize_path(path)?;
@@ -1441,49 +1395,6 @@ impl VaultReader {
         self.total_plaintext + u64::from(self.num_chunks) * aead::TAG_LEN as u64
     }
 
-    /// Map a half-open plaintext byte range `[start, end)` in the whole-vault
-    /// data stream to the inclusive span of chunk indices covering it,
-    /// bounds-checked against the stream's chunk count. `end` must be `> start`.
-    fn chunk_span(&self, start: u64, end: u64) -> Result<(u64, u64)> {
-        let chunk = self.data_chunk_size;
-        let last_index = u64::from(self.num_chunks) - 1;
-        let first = start / chunk;
-        let last = (end - 1) / chunk;
-        if last > last_index {
-            return Err(Error::Format("entry range out of bounds"));
-        }
-        Ok((first, last))
-    }
-
-    /// Read and AEAD-decrypt a single chunk `c` of the whole-vault data stream by
-    /// random access, returning its plaintext (the full chunk size, or the
-    /// shorter remainder for the final chunk). Peak memory is one chunk; tampered
-    /// ciphertext fails with [`Error::Auth`] before any plaintext is returned.
-    fn decrypt_one_chunk(&self, file: &mut fs_err::File, c: u64) -> Result<Zeroizing<Vec<u8>>> {
-        let chunk = self.data_chunk_size;
-        let last_index = u64::from(self.num_chunks) - 1;
-        let is_last = c == last_index;
-        let pt_len = if is_last {
-            self.total_plaintext - last_index * chunk
-        } else {
-            chunk
-        };
-        let ct_len = (pt_len + aead::TAG_LEN as u64) as usize;
-        let ct_off = self.data_section_offset + c * (chunk + aead::TAG_LEN as u64);
-        file.seek(SeekFrom::Start(ct_off))?;
-        let mut ct = vec![0u8; ct_len];
-        file.read_exact(&mut ct)?;
-        Ok(Zeroizing::new(aead::decrypt_chunk_with(
-            self.suite.aead_alg(),
-            &self.cek,
-            &self.data_stream_nonce,
-            &self.header_bytes,
-            c as u32,
-            is_last,
-            &ct,
-        )?))
-    }
-
     /// Decrypt the chunks covering `entry` and write **only** that file's exact
     /// bytes to `out`, one chunk at a time. Peak memory is a single decrypted
     /// chunk; nothing the size of the file is ever held. The per-file BLAKE3 hash
@@ -1505,18 +1416,42 @@ impl VaultReader {
             return Ok(());
         }
         let chunk = self.data_chunk_size;
+        let last_index = u64::from(self.num_chunks) - 1;
         let file_start = entry.data_offset;
         let file_end = file_start
             .checked_add(entry.size)
             .ok_or(Error::Format("entry range overflow"))?;
-        let (first, last) = self.chunk_span(file_start, file_end)?;
+        let first = file_start / chunk;
+        let last = (file_end - 1) / chunk;
+        if last > last_index {
+            return Err(Error::Format("entry range out of bounds"));
+        }
         let mut hasher = blake3::Hasher::new();
         for c in first..=last {
-            let pt = self.decrypt_one_chunk(file, c)?;
+            let is_last = c == last_index;
+            let pt_len = if is_last {
+                self.total_plaintext - last_index * chunk
+            } else {
+                chunk
+            };
+            let ct_len = (pt_len + aead::TAG_LEN as u64) as usize;
+            let ct_off = self.data_section_offset + c * (chunk + aead::TAG_LEN as u64);
+            file.seek(SeekFrom::Start(ct_off))?;
+            let mut ct = vec![0u8; ct_len];
+            file.read_exact(&mut ct)?;
+            let pt = Zeroizing::new(aead::decrypt_chunk_with(
+                self.suite.aead_alg(),
+                &self.cek,
+                &self.data_stream_nonce,
+                &self.header_bytes,
+                c as u32,
+                is_last,
+                &ct,
+            )?);
             // Write only the part of this chunk that overlaps the wanted file.
             let chunk_start = c * chunk;
             let lo = file_start.saturating_sub(chunk_start) as usize;
-            let hi = (file_end.min(chunk_start + pt.len() as u64) - chunk_start) as usize;
+            let hi = (file_end.min(chunk_start + pt_len) - chunk_start) as usize;
             if hi > pt.len() || lo > hi {
                 return Err(Error::Format("chunk range mismatch"));
             }
