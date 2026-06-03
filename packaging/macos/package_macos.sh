@@ -12,7 +12,7 @@
 #
 # Required env:
 #   BIN_PATH      path to the built binary (e.g. target/universal/filesec)
-#   APP_NAME      bundle/display name (e.g. "FileSec" or "FileSec (post-quantum)")
+#   APP_NAME      bundle/display name (e.g. "FileSec")
 #   BUNDLE_ID     CFBundleIdentifier (e.g. dev.FileSec.FileSec)
 #   VERSION       version string (e.g. 0.1.0)
 #   OUT_DMG       output .dmg path

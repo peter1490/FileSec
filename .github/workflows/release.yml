@@ -50,7 +50,7 @@ jobs:
           if [ "${{ matrix.variant }}" = "pqc" ]; then
             echo "BUILD_ARGS=-p filesec-pqc"                          >> "$GITHUB_ENV"
             echo "BIN=filesec-pqc"                                    >> "$GITHUB_ENV"
-            echo "APP_NAME=FileSec (post-quantum)"                    >> "$GITHUB_ENV"
+            echo "APP_NAME=FileSec"                                   >> "$GITHUB_ENV"
             echo "BUNDLE_ID=dev.FileSec.FileSec.pqc"                  >> "$GITHUB_ENV"
           else
             echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring,passkey" >> "$GITHUB_ENV"
@@ -131,7 +131,7 @@ jobs:
             echo "BUILD_ARGS=-p filesec-pqc"  >> "$GITHUB_ENV"
             echo "BIN=filesec-pqc"            >> "$GITHUB_ENV"
             echo "PKG=filesec-pqc"            >> "$GITHUB_ENV"
-            echo "APP_NAME=FileSec (post-quantum)" >> "$GITHUB_ENV"
+            echo "APP_NAME=FileSec"           >> "$GITHUB_ENV"
             echo "REG_KEY=FileSec-pqc"        >> "$GITHUB_ENV"
           else
             echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring,passkey" >> "$GITHUB_ENV"
