@@ -28,6 +28,14 @@ priority = "optional"
 assets = [
     ["target/release/filesec-pqc", "usr/bin/", "755"],
     ["packaging/filesec-pqc.desktop", "usr/share/applications/", "644"],
+    # Icons live in the filesec-gui crate; install them under the pqc name so the
+    # .desktop's `Icon=filesec-pqc` resolves in app menus.
+    ["../filesec-gui/assets/icon/icon-16.png", "usr/share/icons/hicolor/16x16/apps/filesec-pqc.png", "644"],
+    ["../filesec-gui/assets/icon/icon-32.png", "usr/share/icons/hicolor/32x32/apps/filesec-pqc.png", "644"],
+    ["../filesec-gui/assets/icon/icon-64.png", "usr/share/icons/hicolor/64x64/apps/filesec-pqc.png", "644"],
+    ["../filesec-gui/assets/icon/icon-128.png", "usr/share/icons/hicolor/128x128/apps/filesec-pqc.png", "644"],
+    ["../filesec-gui/assets/icon/icon-256.png", "usr/share/icons/hicolor/256x256/apps/filesec-pqc.png", "644"],
+    ["../filesec-gui/assets/icon/icon-512.png", "usr/share/icons/hicolor/512x512/apps/filesec-pqc.png", "644"],
 ]
 
 [dependencies]

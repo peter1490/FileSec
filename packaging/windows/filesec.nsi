@@ -1,9 +1,13 @@
 ; NSIS installer for FileSec. The same script builds both the classical and the
 ; post-quantum installers; the variant is selected with /D defines, e.g.:
 ;
-;   makensis /DAPP_NAME="FileSec" /DAPP_EXE="filesec.exe" /DAPP_VERSION="0.1.0" \
+;   makensis -NOCD /DAPP_NAME="FileSec" /DAPP_EXE="filesec.exe" /DAPP_VERSION="0.1.0" \
 ;            /DSRC_EXE="target\release\filesec.exe" /DOUT_FILE="FileSec-0.1.0-setup.exe" \
 ;            /DREG_KEY="FileSec" packaging\windows\filesec.nsi
+;
+; Run from the repo root with -NOCD: without it makensis switches its working
+; directory to the script's folder and the relative SRC_EXE / APP_ICON paths
+; (which point under the repo root) would no longer resolve.
 ;
 ; A per-user install (no admin) keeps it simple and matches the app's per-user
 ; data directory.
@@ -28,6 +32,11 @@ Unicode true
 !ifndef REG_KEY
   !define REG_KEY "${APP_NAME}"
 !endif
+!ifndef APP_ICON
+  ; Relative to the repo root (makensis is invoked there with -NOCD). Used for
+  ; the installer/uninstaller icon and shipped so the shortcut shows it too.
+  !define APP_ICON "crates\filesec-gui\assets\icon\filesec.ico"
+!endif
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${REG_KEY}"
 
@@ -39,6 +48,8 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 
 !define MUI_ABORTWARNING
+!define MUI_ICON "${APP_ICON}"
+!define MUI_UNICON "${APP_ICON}"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -51,13 +62,17 @@ SetCompressor /SOLID lzma
 Section "Install"
   SetOutPath "$INSTDIR"
   File "/oname=${APP_EXE}" "${SRC_EXE}"
+  ; Ship the icon next to the app so the shortcut and the Add/Remove Programs
+  ; entry display it even though the bare .exe carries no embedded icon. The
+  ; /nonfatal keeps a missing/misresolved icon from aborting the build.
+  File "/nonfatal" "/oname=app.ico" "${APP_ICON}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\app.ico"
   WriteRegStr HKCU "Software\${REG_KEY}" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "${APP_NAME}"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\${APP_EXE}"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\app.ico"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "FileSec contributors"
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
@@ -65,6 +80,7 @@ SectionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\${APP_EXE}"
+  Delete "$INSTDIR\app.ico"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$SMPROGRAMS\${APP_NAME}.lnk"
   RMDir "$INSTDIR"
