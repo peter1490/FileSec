@@ -34,6 +34,20 @@ exe_name="$(basename "$BIN_PATH")"
 cp "$BIN_PATH" "$app/Contents/MacOS/$exe_name"
 chmod 755 "$app/Contents/MacOS/$exe_name"
 
+# Bundle the app icon. Resolve it relative to this script so the lookup does
+# not depend on the caller's working directory. A missing icon is non-fatal
+# (matching the optional-signing philosophy) but warns loudly; without it the
+# .app falls back to the generic placeholder icon in Finder.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+icon_src="$script_dir/../../crates/filesec-gui/assets/icon/AppIcon.icns"
+icon_plist=""
+if [[ -f "$icon_src" ]]; then
+  cp "$icon_src" "$app/Contents/Resources/AppIcon.icns"
+  icon_plist="  <key>CFBundleIconFile</key>       <string>AppIcon</string>"
+else
+  echo "WARNING: app icon not found at $icon_src — bundling without an icon." >&2
+fi
+
 cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -46,6 +60,7 @@ cat >"$app/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key>         <string>${VERSION}</string>
   <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
+${icon_plist}
   <key>LSMinimumSystemVersion</key>  <string>11.0</string>
   <key>NSHighResolutionCapable</key> <true/>
 </dict>
