@@ -104,3 +104,11 @@ default-features = false
 # Persistent Secret Service (GNOME Keyring / KWallet) over D-Bus, with the
 # pure-Rust transport crypto (avoids an OpenSSL build dependency).
 features = ["sync-secret-service", "crypto-rust"]
+
+# Embeds the app icon into the Windows `filesec.exe` (see build.rs).
+# `default-features = false` drops winresource's `toml` feature, leaving it
+# dependency-free — no toml/winnow MSRV exposure; it declares no rust-version
+# and builds on the 1.86 MSRV. The build script no-ops unless targeting Windows,
+# so the macOS/Linux builds are unaffected. Installer-side icon: packaging/windows.
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }

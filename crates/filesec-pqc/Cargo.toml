@@ -48,3 +48,8 @@ assets = [
 # the bare `cargo build`/`test` classical, and CI builds each variant separately.)
 eframe = "0.32.3"
 filesec-gui = { path = "../filesec-gui", features = ["pqc", "keyring", "passkey"] }
+
+# Embeds the app icon into `filesec-pqc.exe` (see build.rs). Dependency-free at
+# default-features = false; no MSRV impact — see filesec-gui's build-dependency.
+[build-dependencies]
+winresource = { version = "0.1.31", default-features = false }

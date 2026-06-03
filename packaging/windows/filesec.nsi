@@ -62,9 +62,10 @@ SetCompressor /SOLID lzma
 Section "Install"
   SetOutPath "$INSTDIR"
   File "/oname=${APP_EXE}" "${SRC_EXE}"
-  ; Ship the icon next to the app so the shortcut and the Add/Remove Programs
-  ; entry display it even though the bare .exe carries no embedded icon. The
-  ; /nonfatal keeps a missing/misresolved icon from aborting the build.
+  ; The .exe normally carries its own embedded icon (see build.rs), but also
+  ; ship the .ico and point the shortcut / Add-Remove entry at it as a
+  ; belt-and-suspenders fallback for the case where embedding was skipped (it is
+  ; best-effort). /nonfatal keeps a missing/misresolved icon from aborting.
   File "/nonfatal" "/oname=app.ico" "${APP_ICON}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\app.ico"
