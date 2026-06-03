@@ -39,4 +39,4 @@ assets = [
 # would unify features across both; `default-members` in the root manifest keeps
 # the bare `cargo build`/`test` classical, and CI builds each variant separately.)
 eframe = "0.32.3"
-filesec-gui = { path = "../filesec-gui", features = ["pqc", "keyring"] }
+filesec-gui = { path = "../filesec-gui", features = ["pqc", "keyring", "passkey"] }

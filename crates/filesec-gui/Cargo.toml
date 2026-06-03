@@ -12,10 +12,11 @@ repository.workspace = true
 name = "filesec"
 path = "src/main.rs"
 
-# cargo-dist builds the classical installer with OS-keychain auto-unlock on (the
-# release workflow passes the same `--features keyring`).
+# cargo-dist builds the classical installer with OS-keychain auto-unlock and
+# hardware-passkey unlock on (the release workflow passes the same
+# `--features keyring,passkey`).
 [package.metadata.dist]
-features = ["keyring"]
+features = ["keyring", "passkey"]
 
 # `cargo deb` (Linux .deb). The release workflow builds the binary first with the
 # right features, then runs `cargo deb --no-build` to package this already-built
