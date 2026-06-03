@@ -160,8 +160,11 @@ jobs:
         shell: bash
         run: |
           OUT="dist/$BIN-$VERSION-x86_64-windows-setup.exe"
+          # NSIS's File command resolves its source with backslashes only — a
+          # forward-slash path compiles fine everywhere else but yields
+          # "no files found" here. Pass the .exe path with backslashes.
           makensis -DAPP_NAME="$APP_NAME" -DAPP_EXE="$BIN.exe" -DAPP_VERSION="$VERSION" \
-            -DSRC_EXE="target/release/$BIN.exe" -DOUT_FILE="$OUT" -DREG_KEY="$REG_KEY" \
+            -DSRC_EXE="target\\release\\$BIN.exe" -DOUT_FILE="$OUT" -DREG_KEY="$REG_KEY" \
             packaging/windows/filesec.nsi
 
       # MSI via cargo-wix. Marked best-effort: cargo-wix's first `init` generates
