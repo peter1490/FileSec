@@ -160,10 +160,12 @@ jobs:
         shell: bash
         run: |
           OUT="dist/$BIN-$VERSION-x86_64-windows-setup.exe"
-          # NSIS's File command resolves its source with backslashes only — a
-          # forward-slash path compiles fine everywhere else but yields
-          # "no files found" here. Pass the .exe path with backslashes.
-          makensis -DAPP_NAME="$APP_NAME" -DAPP_EXE="$BIN.exe" -DAPP_VERSION="$VERSION" \
+          # makensis cd's to the script's directory (packaging/windows) before
+          # resolving relative paths, so SRC_EXE/OUT_FILE would be looked up
+          # under packaging/windows/ and not be found. -NOCD keeps the working
+          # directory at the repo root, where target/release/ and dist/ live.
+          # Backslashes in SRC_EXE: NSIS's File command wants the native sep.
+          makensis -NOCD -DAPP_NAME="$APP_NAME" -DAPP_EXE="$BIN.exe" -DAPP_VERSION="$VERSION" \
             -DSRC_EXE="target\\release\\$BIN.exe" -DOUT_FILE="$OUT" -DREG_KEY="$REG_KEY" \
             packaging/windows/filesec.nsi
 
