@@ -382,6 +382,44 @@ impl Store {
         Ok(())
     }
 
+    /// Apply a batch of manifest-only renames (`from` -> `to`) to an existing v2
+    /// vault. No blob is read or rewritten — only the manifest tree changes — so
+    /// this is the cheap engine behind moving, renaming, soft-delete (move into
+    /// the trash) and restore (move back out). Each pair is applied in order; a
+    /// later pair sees the tree left by the earlier ones.
+    pub fn rename_in_vault(
+        &self,
+        _identity: &Identity,
+        _id: &str,
+        reader: &VaultReaderV2,
+        pairs: &[(String, String)],
+    ) -> StoreResult<()> {
+        let mut writer = reader.clone();
+        for (from, to) in pairs {
+            writer.rename(from, to).map_err(err)?;
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` to `vault_path` inside an existing v2 vault (creating or
+    /// overwriting that one file as a fresh blob + manifest reseal). Backs the
+    /// in-app text editor's "new file" and "save".
+    pub fn put_bytes_in_vault(
+        &self,
+        _identity: &Identity,
+        _id: &str,
+        reader: &VaultReaderV2,
+        vault_path: &str,
+        bytes: &[u8],
+        mtime: Option<i64>,
+    ) -> StoreResult<()> {
+        let mut writer = reader.clone();
+        writer
+            .put_file_bytes(vault_path, bytes, mtime, None)
+            .map_err(err)?;
+        Ok(())
+    }
+
     /// Replace a single file's contents inside an existing v2 vault: the new file
     /// is written as a fresh blob, the old blob is unlinked, and the manifest is
     /// resealed. Only that one file's storage changes.

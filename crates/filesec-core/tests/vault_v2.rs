@@ -323,6 +323,55 @@ fn v2_exports_to_v1_and_reimports() {
     cleanup(&dir2);
 }
 
+#[test]
+fn export_omits_the_trash_subtree() {
+    use filesec_core::format_v2::{is_trashed, TRASH_DIR};
+
+    // `is_trashed` recognizes the root and anything under it, but not look-alikes.
+    assert!(is_trashed(TRASH_DIR));
+    assert!(is_trashed(".trash/123-ab/report.pdf"));
+    assert!(!is_trashed(".trashy"));
+    assert!(!is_trashed("docs/.trash"));
+
+    let id = ident("Alice");
+    let dir = tmp_dir("trash-export.fsv2");
+    let mut v = build_sample(&dir, &id, SuiteId::Classic);
+    // A soft-deleted file lives under the trash subtree (a plain manifest entry).
+    v.put_file_bytes(".trash/9-deadbeef/secret.txt", b"top secret", None, None)
+        .unwrap();
+    // The trashed file is still readable locally (restorable) ...
+    assert_eq!(
+        &*v.read_entry(".trash/9-deadbeef/secret.txt").unwrap(),
+        b"top secret"
+    );
+
+    // ... but a faithful materialization keeps it while an export drops it.
+    assert!(v
+        .to_vault()
+        .unwrap()
+        .entries()
+        .iter()
+        .any(|e| e.path == ".trash/9-deadbeef/secret.txt"));
+    assert!(v
+        .to_vault_for_export()
+        .unwrap()
+        .entries()
+        .iter()
+        .all(|e| !is_trashed(&e.path)));
+
+    // The exported, re-imported container has no trace of the trashed file.
+    let fsec = tmp_file("trash-export.fsec");
+    export_v2_to_path(&v, &id, &[id.public()], &ExportOptions::default(), &fsec).unwrap();
+    let (reader, _sender) = format::verify_and_open(&fsec, &id).unwrap();
+    assert!(reader.entries().iter().all(|e| !is_trashed(&e.path)));
+    assert!(reader.read_entry(".trash/9-deadbeef/secret.txt").is_err());
+    // The live files survived the round-trip untouched.
+    assert_eq!(&*reader.read_entry("readme.txt").unwrap(), b"hello world");
+
+    let _ = std::fs::remove_file(&fsec);
+    cleanup(&dir);
+}
+
 #[cfg(feature = "pqc")]
 #[test]
 fn v2_hybrid_suite_roundtrips_at_rest() {

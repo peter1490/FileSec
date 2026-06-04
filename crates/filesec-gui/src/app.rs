@@ -18,7 +18,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use filesec_core::contacts::{ContactBook, Trust, UpsertOutcome};
 use filesec_core::format::{self, ExportOptions};
-use filesec_core::format_v2::VaultReaderV2;
+use filesec_core::format_v2::{is_trashed, VaultReaderV2, TRASH_DIR};
 use filesec_core::identity::{Identity, PublicIdentity};
 use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::{KeystoreFile, PasskeyInfo, HMAC_SECRET_LEN};
@@ -348,6 +348,24 @@ struct Session {
     selected: HashSet<String>,
     /// Sort order for the browser's file/folder list.
     sort: SortMode,
+    /// Whether the trash view (soft-deleted entries) is shown instead of files.
+    show_trash: bool,
+    /// Whether the inline "empty the trash?" confirmation is armed (a guard on the
+    /// one irreversible bulk action in the browser).
+    confirm_empty_trash: bool,
+    /// The entry currently being renamed inline (its vault path) and the draft
+    /// name being typed; `None` when no rename is in progress.
+    rename_target: Option<String>,
+    rename_input: String,
+    /// The open "move to folder" dialog, if any.
+    move_form: Option<MoveForm>,
+    /// Anchor row (vault path) for shift-range selection, à la a file explorer.
+    select_anchor: Option<String>,
+    /// The inline "new text file" composer state.
+    show_new_file: bool,
+    new_file_name: String,
+    /// The open in-app quick text editor, if any.
+    text_editor: Option<TextEditor>,
     contact_paste: String,
     /// A parsed key staged for confirmation before it joins the contact book.
     contact_preview: Option<ContactPreview>,
@@ -397,6 +415,15 @@ impl Session {
             file_search: String::new(),
             selected: HashSet::new(),
             sort: SortMode::default(),
+            show_trash: false,
+            confirm_empty_trash: false,
+            rename_target: None,
+            rename_input: String::new(),
+            move_form: None,
+            select_anchor: None,
+            show_new_file: false,
+            new_file_name: String::new(),
+            text_editor: None,
             contact_paste: String::new(),
             contact_preview: None,
             verify: None,
@@ -422,6 +449,50 @@ impl Session {
         self.new_folder_name.clear();
         self.file_search.clear();
         self.selected.clear();
+        self.show_trash = false;
+        self.confirm_empty_trash = false;
+        self.rename_target = None;
+        self.rename_input.clear();
+        self.move_form = None;
+        self.select_anchor = None;
+        self.show_new_file = false;
+        self.new_file_name.clear();
+        // Drop any open editor, scrubbing its plaintext buffer.
+        if let Some(mut te) = self.text_editor.take() {
+            te.zeroize();
+        }
+    }
+}
+
+/// The open "move to folder" dialog: the entries being moved and the destination
+/// folder currently chosen ("" = the vault root).
+struct MoveForm {
+    paths: Vec<String>,
+    dest: String,
+}
+
+/// The in-app quick text editor: a file's plaintext held in memory (never written
+/// to a temp on disk, unlike check-out), edited in place and saved back as a fresh
+/// blob. `original` is the loaded content, to flag unsaved changes.
+struct TextEditor {
+    /// Vault path being edited.
+    path: String,
+    /// Display name (with extension).
+    leaf: String,
+    /// The editable buffer.
+    content: String,
+    /// Content as loaded, for the dirty check.
+    original: String,
+}
+
+impl TextEditor {
+    fn dirty(&self) -> bool {
+        self.content != self.original
+    }
+    /// Scrub the plaintext buffers from memory when the editor closes.
+    fn zeroize(&mut self) {
+        self.content.zeroize();
+        self.original.zeroize();
     }
 }
 
@@ -444,27 +515,58 @@ enum Action {
     NewFolder,
     /// Toggle the inline "new folder" composer in the browser.
     ToggleNewFolder(bool),
+    /// Toggle the inline "new text file" composer in the browser.
+    ToggleNewFile(bool),
+    /// Create the composed text file and open it in the quick editor.
+    NewFile,
+    /// Open an existing text file in the in-app quick editor.
+    QuickEdit(String),
+    /// Save the quick editor's buffer back to the vault.
+    SaveTextFile,
+    /// Close the quick editor, discarding any unsaved changes.
+    CloseTextEditor,
     /// Navigate the browser into a folder ("" = vault root).
     EnterDir(String),
-    DeleteEntry(String),
+    /// Soft-delete an entry: move it (and any subtree) into the trash.
+    Trash(String),
     SaveEntryAs(String),
     ViewFile(String),
     CheckOut(String),
     CheckIn,
     Discard,
     ExtractAll,
-    /// Toggle a file's membership in the browser selection.
-    ToggleSelect(String),
-    /// Select every file in the current folder view.
+    /// Select every file or folder in the current view.
     SelectAllVisible,
     /// Clear the browser selection.
     ClearSelection,
-    /// Remove every selected file (and selected nothing-else) from the vault.
-    RemoveSelected,
+    /// Soft-delete every selected file into the trash.
+    TrashSelected,
     /// Decrypt every selected file to a chosen folder.
     ExtractSelected,
     /// Change the browser's sort order.
     SetSort(SortMode),
+    /// Begin renaming an entry inline (carries its vault path).
+    BeginRename(String),
+    /// Commit / cancel the inline rename.
+    ConfirmRename,
+    CancelRename,
+    /// Open the "move to folder" dialog for these entries.
+    BeginMove(Vec<String>),
+    /// Choose the destination folder in the open move dialog ("" = root).
+    SetMoveDest(String),
+    /// Commit / cancel the move.
+    ConfirmMove,
+    CancelMove,
+    /// Show or hide the trash view.
+    ShowTrash(bool),
+    /// Restore a soft-deleted entry to its original location (by trashed path).
+    RestoreTrashed(String),
+    /// Permanently delete one trashed entry (by trashed path).
+    PurgeTrashed(String),
+    /// Arm / disarm the inline "empty the trash?" confirmation.
+    PromptEmptyTrash(bool),
+    /// Permanently delete everything in the trash.
+    EmptyTrash,
     BeginExport(String),
     CancelExport,
     DoExport,
@@ -603,6 +705,23 @@ enum Outcome {
     },
     /// Replace the open vault's reader after a successful mutate + re-encrypt.
     ReplaceOpen {
+        id: String,
+        reader: Box<VaultReaderV2>,
+        registry: Registry,
+    },
+    /// Like [`Outcome::ReplaceOpen`], but also open the just-created file in the
+    /// in-app quick editor (with an empty buffer).
+    CreatedTextFile {
+        id: String,
+        reader: Box<VaultReaderV2>,
+        registry: Registry,
+        path: String,
+        leaf: String,
+    },
+    /// Open an existing file's decrypted text in the quick editor.
+    OpenTextEditor(Box<TextEditor>),
+    /// A quick-editor save landed: swap the reader and close the editor.
+    SavedTextFile {
         id: String,
         reader: Box<VaultReaderV2>,
         registry: Registry,
@@ -1005,6 +1124,51 @@ impl App {
                     });
                 }
             }
+            Outcome::CreatedTextFile {
+                id,
+                reader,
+                registry,
+                path,
+                leaf,
+            } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.registry = registry;
+                    s.open = Some(OpenVault {
+                        id,
+                        reader: *reader,
+                    });
+                    s.show_new_file = false;
+                    s.new_file_name.clear();
+                    // Open the (empty) new file straight into the quick editor.
+                    s.text_editor = Some(TextEditor {
+                        path,
+                        leaf,
+                        content: String::new(),
+                        original: String::new(),
+                    });
+                }
+            }
+            Outcome::OpenTextEditor(te) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.text_editor = Some(*te);
+                }
+            }
+            Outcome::SavedTextFile {
+                id,
+                reader,
+                registry,
+            } => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.registry = registry;
+                    s.open = Some(OpenVault {
+                        id,
+                        reader: *reader,
+                    });
+                    if let Some(mut te) = s.text_editor.take() {
+                        te.zeroize();
+                    }
+                }
+            }
             Outcome::Deleted {
                 registry,
                 closed_id,
@@ -1143,9 +1307,10 @@ impl App {
             Action::EnterDir(dir) => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.current_dir = dir;
-                    // Selection and search are scoped to a folder view; leaving the
-                    // folder (or a breadcrumb jump) starts fresh.
+                    // Selection, anchor, and search are scoped to a folder view;
+                    // leaving the folder (or a breadcrumb jump) starts fresh.
                     s.selected.clear();
+                    s.select_anchor = None;
                     s.file_search.clear();
                 }
             }
@@ -1157,10 +1322,18 @@ impl App {
                     }
                 }
             }
-            Action::ToggleSelect(path) => {
+            Action::ToggleNewFile(b) => {
                 if let State::Unlocked(s) = &mut self.state {
-                    if !s.selected.insert(path.clone()) {
-                        s.selected.remove(&path);
+                    s.show_new_file = b;
+                    if !b {
+                        s.new_file_name.clear();
+                    }
+                }
+            }
+            Action::CloseTextEditor => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(mut te) = s.text_editor.take() {
+                        te.zeroize();
                     }
                 }
             }
@@ -1168,10 +1341,9 @@ impl App {
                 if let State::Unlocked(s) = &mut self.state {
                     if let Some(o) = &s.open {
                         let entries = snapshot_entries(&o.reader);
+                        // Select every visible row — files and folders alike.
                         for row in visible_rows(&entries, &s.current_dir, &s.file_search, s.sort) {
-                            if row.kind == EntryKind::File {
-                                s.selected.insert(row.path);
-                            }
+                            s.selected.insert(row.path);
                         }
                     }
                 }
@@ -1179,11 +1351,62 @@ impl App {
             Action::ClearSelection => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.selected.clear();
+                    s.select_anchor = None;
                 }
             }
             Action::SetSort(mode) => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.sort = mode;
+                }
+            }
+            Action::ShowTrash(b) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.show_trash = b;
+                    // Leaving file/trash views resets the transient browser bits
+                    // so a half-typed rename, stale selection, or armed "empty
+                    // trash" confirmation never lingers.
+                    s.selected.clear();
+                    s.rename_target = None;
+                    s.rename_input.clear();
+                    s.confirm_empty_trash = false;
+                }
+            }
+            Action::PromptEmptyTrash(b) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.confirm_empty_trash = b;
+                }
+            }
+            Action::BeginRename(path) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.rename_input = leaf_name(&path).to_string();
+                    s.rename_target = Some(path);
+                }
+            }
+            Action::CancelRename => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.rename_target = None;
+                    s.rename_input.clear();
+                }
+            }
+            Action::BeginMove(paths) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if !paths.is_empty() {
+                        // Default the destination to the parent of the first item.
+                        let dest = parent_dir(&paths[0]).to_string();
+                        s.move_form = Some(MoveForm { paths, dest });
+                    }
+                }
+            }
+            Action::SetMoveDest(dest) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(f) = &mut s.move_form {
+                        f.dest = dest;
+                    }
+                }
+            }
+            Action::CancelMove => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.move_form = None;
                 }
             }
             Action::CancelExport => {
@@ -1356,8 +1579,16 @@ impl App {
             Action::AddFolder => self.spawn_add_folder(ctx),
             Action::DropPaths(paths) => self.spawn_add_paths(ctx, paths),
             Action::NewFolder => self.spawn_new_folder(ctx),
-            Action::DeleteEntry(p) => self.spawn_delete_entry(ctx, p),
-            Action::RemoveSelected => self.spawn_remove_selected(ctx),
+            Action::NewFile => self.spawn_new_file(ctx),
+            Action::QuickEdit(p) => self.spawn_quick_edit(ctx, p),
+            Action::SaveTextFile => self.spawn_save_text_file(ctx),
+            Action::Trash(p) => self.spawn_trash_entry(ctx, p),
+            Action::TrashSelected => self.spawn_trash_selected(ctx),
+            Action::RestoreTrashed(p) => self.spawn_restore(ctx, p),
+            Action::PurgeTrashed(p) => self.spawn_purge(ctx, p),
+            Action::EmptyTrash => self.spawn_empty_trash(ctx),
+            Action::ConfirmRename => self.spawn_rename(ctx),
+            Action::ConfirmMove => self.spawn_move(ctx),
             Action::ExtractSelected => self.spawn_extract_selected(ctx),
             Action::ExtractAll => self.spawn_extract_all(ctx),
             Action::SaveEntryAs(p) => self.spawn_save_entry_as(ctx, p),
@@ -2046,14 +2277,170 @@ impl App {
         });
     }
 
-    /// Remove every file in the browser selection in one streaming pass.
-    fn spawn_remove_selected(&mut self, ctx: &egui::Context) {
+    /// Create an empty text file (any name/extension) in the current folder and
+    /// open it straight in the in-app quick editor.
+    fn spawn_new_file(&mut self, ctx: &egui::Context) {
+        let (leaf, into) = match &self.state {
+            State::Unlocked(s) => (s.new_file_name.trim().to_string(), s.current_dir.clone()),
+            _ => return,
+        };
+        if leaf.is_empty() {
+            self.set_toast("Enter a file name.", true);
+            return;
+        }
+        if leaf.contains('/') {
+            self.set_toast("File names can't contain “/”.", true);
+            return;
+        }
+        if let State::Unlocked(s) = &mut self.state {
+            s.new_file_name.clear();
+            s.show_new_file = false;
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        let vault_path = if into.is_empty() {
+            leaf.clone()
+        } else {
+            format!("{into}/{leaf}")
+        };
+        self.spawn_job(ctx, "Creating…", move || {
+            if reader.entries().iter().any(|e| e.path == vault_path) {
+                return JobReport::err(format!("\"{leaf}\" already exists here."));
+            }
+            if let Err(e) = store.put_bytes_in_vault(
+                &identity,
+                &id,
+                &reader,
+                &vault_path,
+                b"",
+                Some(now_unix()),
+            ) {
+                return JobReport::err(e);
+            }
+            match reopen_after_save(&store, &identity, id, registry) {
+                Ok((id, reader, registry)) => JobReport::ok(
+                    Outcome::CreatedTextFile {
+                        id,
+                        reader: Box::new(reader),
+                        registry,
+                        path: vault_path,
+                        leaf,
+                    },
+                    // The editor opening is the feedback — no toast.
+                    String::new(),
+                ),
+                Err(e) => JobReport::err(e),
+            }
+        });
+    }
+
+    /// Decrypt a file and, if it is valid UTF-8 text within the size cap, open it
+    /// in the in-app quick editor (the plaintext only ever lives in memory).
+    fn spawn_quick_edit(&mut self, ctx: &egui::Context, path: String) {
+        let (_, reader) = match self.open_reader() {
+            Some(x) => x,
+            None => return,
+        };
+        let leaf = leaf_name(&path).to_string();
+        // Guard the in-memory editor against huge files (and non-files).
+        const MAX_EDIT: u64 = 4 * 1024 * 1024;
+        match reader.entries().iter().find(|e| e.path == path) {
+            Some(e) if e.kind == EntryKind::File => {
+                if e.size > MAX_EDIT {
+                    self.set_toast(
+                        "That file is too large for the quick editor — use Save as… instead.",
+                        true,
+                    );
+                    return;
+                }
+            }
+            _ => {
+                self.set_toast("Only files can be edited.", true);
+                return;
+            }
+        }
+        self.spawn_job(ctx, "Opening…", move || {
+            let bytes = match reader.read_entry(&path) {
+                Ok(b) => b,
+                Err(e) => return JobReport::err(e.to_string()),
+            };
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => JobReport::ok(
+                    Outcome::OpenTextEditor(Box::new(TextEditor {
+                        path,
+                        leaf,
+                        content: text.to_string(),
+                        original: text.to_string(),
+                    })),
+                    String::new(),
+                ),
+                Err(_) => JobReport::err(
+                    "This file isn't text — use “Check out & edit” to open it in an app.",
+                ),
+            }
+        });
+    }
+
+    /// Save the quick editor's buffer back to the vault as a fresh blob.
+    fn spawn_save_text_file(&mut self, ctx: &egui::Context) {
+        let (path, content) = match &self.state {
+            State::Unlocked(s) => match &s.text_editor {
+                Some(te) => (te.path.clone(), te.content.clone()),
+                None => return,
+            },
+            _ => return,
+        };
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        let leaf = leaf_name(&path).to_string();
+        self.spawn_job(ctx, "Saving…", move || {
+            if let Err(e) = store.put_bytes_in_vault(
+                &identity,
+                &id,
+                &reader,
+                &path,
+                content.as_bytes(),
+                Some(now_unix()),
+            ) {
+                return JobReport::err(e);
+            }
+            match reopen_after_save(&store, &identity, id, registry) {
+                Ok((id, reader, registry)) => JobReport::ok(
+                    Outcome::SavedTextFile {
+                        id,
+                        reader: Box::new(reader),
+                        registry,
+                    },
+                    format!("Saved “{leaf}”."),
+                ),
+                Err(e) => JobReport::err(e),
+            }
+        });
+    }
+
+    /// Soft-delete the browser selection (files and/or folders): each top-level
+    /// entry is moved into the trash in one manifest-only pass (no blob is
+    /// decrypted or rewritten), so it can be restored later. Each gets its own
+    /// trash token, so two items with the same name never collide.
+    fn spawn_trash_selected(&mut self, ctx: &egui::Context) {
         let paths: Vec<String> = match &self.state {
-            State::Unlocked(s) => s.selected.iter().cloned().collect(),
+            State::Unlocked(s) => prune_nested(&s.selected.iter().cloned().collect::<Vec<_>>()),
             _ => return,
         };
         if paths.is_empty() {
-            self.set_toast("Select files to remove first.", true);
+            self.set_toast("Select something first.", true);
             return;
         }
         let (store, identity) = match (self.store_arc(), self.ident_arc()) {
@@ -2064,9 +2451,14 @@ impl App {
             Some(x) => x,
             None => return,
         };
-        let n = paths.len();
-        self.spawn_job(ctx, "Removing…", move || {
-            if let Err(e) = store.remove_paths_from_vault(&identity, &id, &reader, &paths) {
+        let now = now_unix();
+        let pairs: Vec<(String, String)> = paths
+            .iter()
+            .map(|p| (p.clone(), trash_dest(now, &trash_tag(), p)))
+            .collect();
+        let n = pairs.len();
+        self.spawn_job(ctx, "Moving to Trash…", move || {
+            if let Err(e) = store.rename_in_vault(&identity, &id, &reader, &pairs) {
                 return JobReport::err(e);
             }
             finalize_after_save(
@@ -2074,27 +2466,51 @@ impl App {
                 &identity,
                 id,
                 registry,
-                format!("Removed {n} file(s)."),
+                format!("Moved {n} item(s) to Trash."),
             )
         });
     }
 
-    /// Decrypt every file in the browser selection to a chosen folder, recreating
-    /// each file's vault-relative path underneath it.
+    /// Decrypt the browser selection to a chosen folder, recreating each file's
+    /// vault-relative path underneath it. A selected folder expands to all of its
+    /// files (its subtree is recreated).
     fn spawn_extract_selected(&mut self, ctx: &egui::Context) {
-        let mut paths: Vec<String> = match &self.state {
+        let selected: Vec<String> = match &self.state {
             State::Unlocked(s) => s.selected.iter().cloned().collect(),
             _ => return,
         };
-        if paths.is_empty() {
-            self.set_toast("Select files to extract first.", true);
+        if selected.is_empty() {
+            self.set_toast("Select something to extract first.", true);
             return;
         }
-        paths.sort();
         let (_, reader) = match self.open_reader() {
             Some(x) => x,
             None => return,
         };
+        // Expand any selected folder into the files it contains.
+        let entries = snapshot_entries(&reader);
+        let mut paths: Vec<String> = Vec::new();
+        for sel in &selected {
+            let is_dir = entries
+                .iter()
+                .any(|(p, k, _)| p == sel && *k == EntryKind::Dir);
+            if is_dir {
+                let prefix = format!("{sel}/");
+                for (p, k, _) in &entries {
+                    if *k == EntryKind::File && p.starts_with(&prefix) {
+                        paths.push(p.clone());
+                    }
+                }
+            } else {
+                paths.push(sel.clone());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            self.set_toast("Nothing to extract (the selected folders are empty).", true);
+            return;
+        }
         let dest = match rfd::FileDialog::new().pick_folder() {
             Some(p) => p,
             None => return,
@@ -2142,7 +2558,9 @@ impl App {
         });
     }
 
-    fn spawn_delete_entry(&mut self, ctx: &egui::Context, path: String) {
+    /// Soft-delete a single entry (a file, or a folder and its whole subtree) by
+    /// moving it into the trash. Restorable until the trash is emptied.
+    fn spawn_trash_entry(&mut self, ctx: &egui::Context, path: String) {
         let (store, identity) = match (self.store_arc(), self.ident_arc()) {
             (Some(s), Some(i)) => (s, i),
             _ => return,
@@ -2151,15 +2569,234 @@ impl App {
             Some(x) => x,
             None => return,
         };
-        self.spawn_job(ctx, "Saving…", move || {
-            // Stream the surviving data through and drop the removed entry — the
-            // vault is never decrypted into memory.
-            if let Err(e) =
-                store.remove_paths_from_vault(&identity, &id, &reader, std::slice::from_ref(&path))
+        let dest = trash_dest(now_unix(), &trash_tag(), &path);
+        let leaf = leaf_name(&path).to_string();
+        self.spawn_job(ctx, "Moving to Trash…", move || {
+            // A manifest-only rename: the blobs stay put, nothing is decrypted.
+            if let Err(e) = store.rename_in_vault(&identity, &id, &reader, &[(path, dest)]) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Moved “{leaf}” to Trash."),
+            )
+        });
+    }
+
+    /// Restore a trashed entry to its original location — recreating any parent
+    /// folders that were removed meanwhile, and de-duplicating the name if
+    /// something already lives there (so a restore never clobbers a live file).
+    fn spawn_restore(&mut self, ctx: &egui::Context, trashed_path: String) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        let orig = match parse_trash_token(&trashed_path) {
+            Some((_, orig)) => orig,
+            None => {
+                self.set_toast("That item's original name couldn't be read.", true);
+                return;
+            }
+        };
+        let taken: HashSet<String> = snapshot_entries(&reader)
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+        let dest = dedup_path(&taken, &orig);
+        let leaf = leaf_name(&dest).to_string();
+        self.spawn_job(ctx, "Restoring…", move || {
+            if let Err(e) = store.rename_in_vault(&identity, &id, &reader, &[(trashed_path, dest)])
             {
                 return JobReport::err(e);
             }
-            finalize_after_save(&store, &identity, id, registry, "Removed.".into())
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Restored “{leaf}”."),
+            )
+        });
+    }
+
+    /// Permanently delete one trashed entry (unlinks its blobs — unrecoverable).
+    fn spawn_purge(&mut self, ctx: &egui::Context, trashed_path: String) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Deleting…", move || {
+            if let Err(e) = store.remove_paths_from_vault(
+                &identity,
+                &id,
+                &reader,
+                std::slice::from_ref(&trashed_path),
+            ) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                "Deleted permanently.".into(),
+            )
+        });
+    }
+
+    /// Permanently delete everything in the trash in one pass.
+    fn spawn_empty_trash(&mut self, ctx: &egui::Context) {
+        if let State::Unlocked(s) = &mut self.state {
+            s.confirm_empty_trash = false;
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Emptying Trash…", move || {
+            if let Err(e) =
+                store.remove_paths_from_vault(&identity, &id, &reader, &[TRASH_DIR.to_string()])
+            {
+                return JobReport::err(e);
+            }
+            finalize_after_save(&store, &identity, id, registry, "Trash emptied.".into())
+        });
+    }
+
+    /// Apply the inline rename: move the target entry to a sibling with the typed
+    /// name (manifest-only; a folder keeps its whole subtree).
+    fn spawn_rename(&mut self, ctx: &egui::Context) {
+        let (from, leaf) = match &self.state {
+            State::Unlocked(s) => match &s.rename_target {
+                Some(p) => (p.clone(), s.rename_input.trim().to_string()),
+                None => return,
+            },
+            _ => return,
+        };
+        // Close the composer up front; validation errors surface as a toast.
+        if let State::Unlocked(s) = &mut self.state {
+            s.rename_target = None;
+            s.rename_input.clear();
+        }
+        if leaf.is_empty() {
+            self.set_toast("Enter a name.", true);
+            return;
+        }
+        if leaf.contains('/') {
+            self.set_toast("Names can't contain “/”.", true);
+            return;
+        }
+        let parent = parent_dir(&from);
+        let to = if parent.is_empty() {
+            leaf.clone()
+        } else {
+            format!("{parent}/{leaf}")
+        };
+        if to == from {
+            return; // No change.
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Renaming…", move || {
+            if reader.entries().iter().any(|e| e.path == to) {
+                return JobReport::err(format!("“{leaf}” already exists here."));
+            }
+            if let Err(e) = store.rename_in_vault(&identity, &id, &reader, &[(from, to)]) {
+                return JobReport::err(e);
+            }
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Renamed to “{leaf}”."),
+            )
+        });
+    }
+
+    /// Apply the move: relocate each chosen entry into the destination folder
+    /// (manifest-only). A name clash in the destination aborts with a clear
+    /// message rather than silently overwriting or merging.
+    fn spawn_move(&mut self, ctx: &egui::Context) {
+        let (paths, dest) = match &self.state {
+            State::Unlocked(s) => match &s.move_form {
+                Some(f) => (prune_nested(&f.paths), f.dest.clone()),
+                None => return,
+            },
+            _ => return,
+        };
+        if let State::Unlocked(s) = &mut self.state {
+            s.move_form = None;
+        }
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let (id, reader, registry) = match self.open_ctx() {
+            Some(x) => x,
+            None => return,
+        };
+        self.spawn_job(ctx, "Moving…", move || {
+            let existing: HashSet<String> =
+                reader.entries().iter().map(|e| e.path.clone()).collect();
+            let mut pairs = Vec::new();
+            for from in &paths {
+                if parent_dir(from) == dest {
+                    continue; // Already in the destination.
+                }
+                let to = if dest.is_empty() {
+                    leaf_name(from).to_string()
+                } else {
+                    format!("{dest}/{}", leaf_name(from))
+                };
+                if existing.contains(&to) {
+                    return JobReport::err(format!(
+                        "“{}” already exists in that folder.",
+                        leaf_name(from)
+                    ));
+                }
+                pairs.push((from.clone(), to));
+            }
+            if pairs.is_empty() {
+                return JobReport::err("Those items are already there.");
+            }
+            let n = pairs.len();
+            if let Err(e) = store.rename_in_vault(&identity, &id, &reader, &pairs) {
+                return JobReport::err(e);
+            }
+            let where_to = if dest.is_empty() {
+                "the top level".to_string()
+            } else {
+                format!("“{}”", leaf_name(&dest))
+            };
+            finalize_after_save(
+                &store,
+                &identity,
+                id,
+                registry,
+                format!("Moved {n} item(s) to {where_to}."),
+            )
         });
     }
 
@@ -2173,10 +2810,56 @@ impl App {
             None => return,
         };
         self.spawn_job(ctx, "Decrypting…", move || {
-            match reader.extract_to(&dest) {
-                Ok(()) => JobReport::ok(Outcome::Noop, format!("Extracted to {}", dest.display())),
-                Err(e) => JobReport::err(e.to_string()),
+            // Extract the live tree only — soft-deleted files stay in the trash
+            // and are never written to disk (matching what "Send…" exports).
+            let mut failed = 0usize;
+            let mut files = 0usize;
+            for (path, kind, _) in snapshot_entries(&reader) {
+                if is_trashed(&path) {
+                    continue;
+                }
+                // Vault paths are normalized (never absolute, never `..`), so the
+                // join stays confined to `dest`.
+                let out_path = dest.join(&path);
+                match kind {
+                    EntryKind::Dir => {
+                        if std::fs::create_dir_all(&out_path).is_err() {
+                            failed += 1;
+                        }
+                    }
+                    EntryKind::File => {
+                        files += 1;
+                        if let Some(parent) = out_path.parent() {
+                            if std::fs::create_dir_all(parent).is_err() {
+                                failed += 1;
+                                continue;
+                            }
+                        }
+                        let out = match std::fs::File::create(&out_path) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                failed += 1;
+                                continue;
+                            }
+                        };
+                        let mut out = std::io::BufWriter::new(out);
+                        if reader.read_entry_to_writer(&path, &mut out).is_err()
+                            || std::io::Write::flush(&mut out).is_err()
+                        {
+                            failed += 1;
+                        }
+                    }
+                }
             }
+            if files == 0 && failed == 0 {
+                return JobReport::err("There are no files to extract.");
+            }
+            let msg = if failed > 0 {
+                format!("Extracted to {} ({failed} item(s) failed).", dest.display())
+            } else {
+                format!("Extracted to {}.", dest.display())
+            };
+            JobReport::ok(Outcome::Noop, msg)
         });
     }
 
@@ -3056,37 +3739,38 @@ impl App {
                     }
                 }
             };
-            let identity =
-                match filesec_core::keystore::import_identity_armored(&text, backup_pass.as_bytes())
-                {
-                    Ok(i) => i,
-                    Err(filesec_core::error::Error::BadPassphrase) => {
-                        return JobReport {
-                            outcome: Outcome::FirstRunFailed(
-                                "The backup passphrase is incorrect.".into(),
-                            ),
-                            toast: None,
-                        }
+            let identity = match filesec_core::keystore::import_identity_armored(
+                &text,
+                backup_pass.as_bytes(),
+            ) {
+                Ok(i) => i,
+                Err(filesec_core::error::Error::BadPassphrase) => {
+                    return JobReport {
+                        outcome: Outcome::FirstRunFailed(
+                            "The backup passphrase is incorrect.".into(),
+                        ),
+                        toast: None,
                     }
-                    Err(e) => {
-                        return JobReport {
-                            outcome: Outcome::FirstRunFailed(format!(
-                                "This file isn't a valid FileSec identity backup ({e})."
-                            )),
-                            toast: None,
-                        }
-                    }
-                };
-            let ks = match KeystoreFile::create(&identity, new_pass.as_bytes(), KdfParams::default())
-            {
-                Ok(k) => k,
+                }
                 Err(e) => {
                     return JobReport {
-                        outcome: Outcome::FirstRunFailed(e.to_string()),
+                        outcome: Outcome::FirstRunFailed(format!(
+                            "This file isn't a valid FileSec identity backup ({e})."
+                        )),
                         toast: None,
                     }
                 }
             };
+            let ks =
+                match KeystoreFile::create(&identity, new_pass.as_bytes(), KdfParams::default()) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        return JobReport {
+                            outcome: Outcome::FirstRunFailed(e.to_string()),
+                            toast: None,
+                        }
+                    }
+                };
             if let Err(e) = store.save_keystore(&ks) {
                 return JobReport {
                     outcome: Outcome::FirstRunFailed(e),
@@ -3120,13 +3804,16 @@ fn reopen_after_save(
     mut registry: Registry,
 ) -> Result<(String, VaultReaderV2, Registry), String> {
     let new_reader = store.open_vault(identity, &id)?;
+    // Count only live entries: a trashed file is still stored, but the vault card
+    // should reflect what the user actually sees in the browser.
+    let (files, size) = live_counts(&snapshot_entries(&new_reader));
     registry.upsert(VaultMeta {
         id: id.clone(),
         name: new_reader.name().to_string(),
         created_at: new_reader.created_at(),
         modified_at: now_unix(),
-        file_count: new_reader.file_count() as u64,
-        total_size: new_reader.total_size(),
+        file_count: files,
+        total_size: size,
     });
     store.save_registry(identity, &registry)?;
     Ok((id, new_reader, registry))
@@ -3302,7 +3989,12 @@ fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>
                     );
                     ui.add_space(12.0);
                     field_label(ui, "Backup passphrase");
-                    theme::text_input(ui, &mut r.backup_pass, "Passphrase that protects the backup", true);
+                    theme::text_input(
+                        ui,
+                        &mut r.backup_pass,
+                        "Passphrase that protects the backup",
+                        true,
+                    );
                     ui.add_space(10.0);
                     field_label(ui, "New passphrase for this device");
                     theme::text_input(ui, &mut r.new_pass, "At least 8 characters", true);
@@ -3447,6 +4139,12 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         }
     }
 
+    if s.move_form.is_some() {
+        move_window(s, ui.ctx(), action);
+    }
+    if s.text_editor.is_some() {
+        text_editor_window(s, ui.ctx(), action);
+    }
     if s.export.is_some() {
         export_window(s, ui.ctx(), action);
     }
@@ -3569,16 +4267,21 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     // the banner reflects what is actually still open.
     s.views.retain(|v| v.temp_path.exists());
     // Keep the browse state coherent with the (possibly just-mutated) vault: clamp
-    // the current folder to one that still exists, and drop any selection whose
-    // files were removed/renamed out from under us.
+    // the current folder to one that still exists, and drop any selection (or
+    // anchor) whose entries were removed / renamed / trashed out from under us.
     s.current_dir = clamp_dir(&entries, &s.current_dir);
     {
-        let files: HashSet<&str> = entries
+        let live: HashSet<&str> = entries
             .iter()
-            .filter(|(_, k, _)| *k == EntryKind::File)
+            .filter(|(p, _, _)| !is_trashed(p))
             .map(|(p, _, _)| p.as_str())
             .collect();
-        s.selected.retain(|p| files.contains(p.as_str()));
+        s.selected.retain(|p| live.contains(p.as_str()));
+        if let Some(a) = &s.select_anchor {
+            if !live.contains(a.as_str()) {
+                s.select_anchor = None;
+            }
+        }
     }
 
     // Leaf of the file currently checked out for editing (if any). While set, all
@@ -3588,6 +4291,8 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let idle = editing.is_none();
     let c = theme::colors(ui);
     let cur = s.current_dir.clone();
+    let trash = trashed_items(&entries);
+    let in_trash = s.show_trash;
 
     // ---- Header: back, title, and whole-vault actions ----
     ui.horizontal(|ui| {
@@ -3597,11 +4302,27 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         ui.add_space(4.0);
         ui.heading(&name);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::primary_button(ui, "Send…").clicked() {
-                *action = Some(Action::BeginExport(id.clone()));
+            // The trash entry point lives in the header in both modes: it opens the
+            // trash view, or (when already there) returns to the files. Plain text,
+            // like the other header buttons — the Phosphor glyph family renders only
+            // via `icon_text`, never inside a button label.
+            let trash_label = if in_trash {
+                "←  Back to files".to_string()
+            } else if trash.is_empty() {
+                "Trash".to_string()
+            } else {
+                format!("Trash ({})", trash.len())
+            };
+            if theme::secondary_button(ui, trash_label).clicked() {
+                *action = Some(Action::ShowTrash(!in_trash));
             }
-            if theme::secondary_button(ui, "Extract all…").clicked() {
-                *action = Some(Action::ExtractAll);
+            if !in_trash {
+                if theme::primary_button(ui, "Send…").clicked() {
+                    *action = Some(Action::BeginExport(id.clone()));
+                }
+                if theme::secondary_button(ui, "Extract all…").clicked() {
+                    *action = Some(Action::ExtractAll);
+                }
             }
         });
     });
@@ -3657,13 +4378,21 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         });
     }
 
+    // ---- Trash view: a separate mode that replaces the file list ----
+    if in_trash {
+        trash_panel(ui, c, &trash, idle, s.confirm_empty_trash, action);
+        return;
+    }
+
     // ---- Drag-and-drop from the OS (into the current folder) ----
     let modal_open = s.export.is_some()
         || s.last_import.is_some()
         || s.contact_preview.is_some()
         || s.verify.is_some()
         || s.add_passkey.is_some()
-        || s.auto_unlock_form.is_some();
+        || s.auto_unlock_form.is_some()
+        || s.move_form.is_some()
+        || s.text_editor.is_some();
     let dnd_enabled = idle && !modal_open;
     let hovering_files = dnd_enabled && ui.input(|i| !i.raw.hovered_files.is_empty());
     if dnd_enabled {
@@ -3711,6 +4440,32 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     });
     ui.add_space(4.0);
 
+    // ---- Keyboard shortcuts (only when not typing in a field or a dialog) ----
+    //   Esc       clear the selection, then the search
+    //   Del / ⌘⌫  move the selection to the trash
+    //   ⌘/Ctrl-A  select every item in this view
+    if idle && !modal_open && s.rename_target.is_none() && !ui.memory(|m| m.focused().is_some()) {
+        let (clear, trash_sel, select_all) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Delete)
+                    || (i.modifiers.command && i.key_pressed(egui::Key::Backspace)),
+                i.modifiers.command && i.key_pressed(egui::Key::A),
+            )
+        });
+        if clear {
+            if !s.selected.is_empty() {
+                *action = Some(Action::ClearSelection);
+            } else if !s.file_search.trim().is_empty() {
+                s.file_search.clear();
+            }
+        } else if select_all {
+            *action = Some(Action::SelectAllVisible);
+        } else if trash_sel && !s.selected.is_empty() {
+            *action = Some(Action::TrashSelected);
+        }
+    }
+
     // ---- Add content (targets the current folder) ----
     ui.add_enabled_ui(idle, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -3722,6 +4477,9 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             }
             if theme::secondary_button(ui, "+  New folder").clicked() {
                 *action = Some(Action::ToggleNewFolder(!s.show_new_folder));
+            }
+            if theme::secondary_button(ui, "+  New file").clicked() {
+                *action = Some(Action::ToggleNewFile(!s.show_new_file));
             }
         });
     });
@@ -3744,11 +4502,56 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             });
         });
     }
+
+    if s.show_new_file && idle {
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut s.new_file_name)
+                        .hint_text("Name with extension, e.g. notes.txt")
+                        .desired_width(260.0),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if theme::primary_button(ui, "Create & edit").clicked() || submit {
+                    *action = Some(Action::NewFile);
+                }
+                if theme::secondary_button(ui, "Cancel").clicked() {
+                    *action = Some(Action::ToggleNewFile(false));
+                }
+            });
+        });
+    }
+
+    // ---- Inline rename composer ----
+    if idle {
+        if let Some(target) = s.rename_target.clone() {
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Rename “{}”", leaf_name(&target))).color(c.text),
+                    );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut s.rename_input)
+                            .hint_text("New name")
+                            .desired_width(220.0),
+                    );
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if theme::primary_button(ui, "Save").clicked() || submit {
+                        *action = Some(Action::ConfirmRename);
+                    }
+                    if theme::secondary_button(ui, "Cancel").clicked() {
+                        *action = Some(Action::CancelRename);
+                    }
+                });
+            });
+        }
+    }
     ui.add_space(6.0);
 
     // ---- Selection action bar ----
     if idle && !s.selected.is_empty() {
         let n = s.selected.len();
+        let selected: Vec<String> = s.selected.iter().cloned().collect();
         theme::banner(ui, c.accent, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -3760,8 +4563,11 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
                     if theme::secondary_button(ui, "Clear").clicked() {
                         *action = Some(Action::ClearSelection);
                     }
-                    if theme::danger_button(ui, "Remove").clicked() {
-                        *action = Some(Action::RemoveSelected);
+                    if theme::danger_button(ui, "Delete").clicked() {
+                        *action = Some(Action::TrashSelected);
+                    }
+                    if theme::secondary_button(ui, "Move…").clicked() {
+                        *action = Some(Action::BeginMove(selected.clone()));
                     }
                     if theme::primary_button(ui, "Extract…").clicked() {
                         *action = Some(Action::ExtractSelected);
@@ -3776,7 +4582,9 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let searching = !search.trim().is_empty();
     let rows = visible_rows(&entries, &cur, &search, s.sort);
 
-    if entries.is_empty() {
+    // A vault holding only trashed files still reads as empty here (the live tree
+    // is what the browser shows; the trash has its own view).
+    if !has_live_entries(&entries) {
         theme::empty_state(
             ui,
             theme::icon::FOLDER,
@@ -3810,42 +4618,54 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             );
         }
     } else {
-        if searching {
+        // An at-a-glance summary of the current view, plus a "select all"
+        // affordance on the right when there's more than one item to select.
+        ui.horizontal(|ui| {
             ui.label(
-                RichText::new("Showing matches across the whole vault")
+                RichText::new(view_summary(&rows, searching))
                     .color(c.text_muted)
                     .small(),
             );
-            ui.add_space(2.0);
-        } else if idle {
-            // A subtle "select all" affordance for the current folder's files.
-            let files_here = rows.iter().filter(|r| r.kind == EntryKind::File).count();
-            if files_here > 1 {
-                ui.horizontal(|ui| {
+            if !searching && idle && rows.len() > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add(
-                            egui::Button::new(
-                                RichText::new("Select all").color(c.text_muted).small(),
-                            )
-                            .frame(false),
+                            egui::Button::new(RichText::new("Select all").color(c.accent).small())
+                                .frame(false),
                         )
                         .clicked()
                     {
                         *action = Some(Action::SelectAllVisible);
                     }
                 });
-                ui.add_space(2.0);
             }
-        }
+        });
+        ui.add_space(2.0);
+        let mut clicked: Option<(usize, RowClick)> = None;
+        let mut bg_clicked = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                for row in &rows {
-                    let selected = s.selected.contains(&row.path);
-                    entry_row(ui, c, row, selected, idle, searching, action);
+                for (i, row) in rows.iter().enumerate() {
+                    let is_sel = s.selected.contains(&row.path);
+                    match entry_row(ui, c, row, is_sel, idle, searching, action) {
+                        RowClick::None => {}
+                        rc => clicked = Some((i, rc)),
+                    }
+                }
+                // A click on the empty space below the rows clears the selection.
+                let avail = ui.available_size();
+                if avail.y > 4.0 && ui.allocate_response(avail, egui::Sense::click()).clicked() {
+                    bg_clicked = true;
                 }
             });
+        // Resolve selection after the scroll area releases its borrow of `s`.
+        if let Some((i, rc)) = clicked {
+            apply_row_click(s, &rows, i, rc, action);
+        } else if bg_clicked && !s.selected.is_empty() {
+            *action = Some(Action::ClearSelection);
+        }
     }
 
     // ---- Drag-and-drop overlay ----
@@ -3904,10 +4724,326 @@ fn breadcrumb(ui: &mut egui::Ui, current: &str, action: &mut Option<Action>) {
     });
 }
 
+/// The trash view: soft-deleted entries, each with Restore / Delete forever, plus
+/// an "Empty Trash" action. Items stay encrypted at rest until purged, and are
+/// never included when a vault is sent or extracted.
+fn trash_panel(
+    ui: &mut egui::Ui,
+    c: theme::Colors,
+    items: &[TrashItem],
+    idle: bool,
+    confirm_empty: bool,
+    action: &mut Option<Action>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(theme::icon_text(theme::icon::TRASH, 18.0).color(c.text_muted));
+        ui.heading("Trash");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Emptying the trash is the one irreversible bulk action here, so it
+            // takes a second click to confirm.
+            if !items.is_empty() && idle {
+                if confirm_empty {
+                    if theme::danger_button(ui, "Delete all permanently").clicked() {
+                        *action = Some(Action::EmptyTrash);
+                    }
+                    if theme::secondary_button(ui, "Cancel").clicked() {
+                        *action = Some(Action::PromptEmptyTrash(false));
+                    }
+                    ui.label(
+                        RichText::new(format!("Delete {} item(s) forever?", items.len()))
+                            .color(c.text_muted)
+                            .small(),
+                    );
+                } else if theme::danger_button(ui, "Empty Trash").clicked() {
+                    *action = Some(Action::PromptEmptyTrash(true));
+                }
+            }
+        });
+    });
+    ui.label(
+        RichText::new(
+            "Deleted items stay encrypted here until you empty the Trash. They're never \
+             included when you Send or Extract a vault.",
+        )
+        .color(c.text_muted)
+        .small(),
+    );
+    ui.add_space(8.0);
+
+    if items.is_empty() {
+        theme::empty_state(
+            ui,
+            theme::icon::TRASH,
+            "Trash is empty",
+            "Files you delete land here, so you can put them back.",
+            |_ui| {},
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for item in items {
+                theme::card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (glyph, col) = if item.kind == EntryKind::Dir {
+                            (theme::icon::FOLDER, c.accent)
+                        } else {
+                            (theme::icon::FILE, file_tint(leaf_name(&item.orig_path), c))
+                        };
+                        ui.label(theme::icon_text(glyph, 18.0).color(col));
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(leaf_name(&item.orig_path))
+                                    .color(c.text)
+                                    .size(14.5),
+                            );
+                            ui.label(
+                                RichText::new(trash_item_detail(item))
+                                    .color(c.text_muted)
+                                    .small(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if idle && theme::danger_button(ui, "Delete forever").clicked() {
+                                *action = Some(Action::PurgeTrashed(item.trashed_path.clone()));
+                            }
+                            if idle && theme::primary_button(ui, "Restore").clicked() {
+                                *action = Some(Action::RestoreTrashed(item.trashed_path.clone()));
+                            }
+                        });
+                    });
+                });
+            }
+        });
+}
+
+/// The secondary line of a trash card: what it is, where it came from, and when
+/// it was deleted.
+fn trash_item_detail(item: &TrashItem) -> String {
+    let loc = parent_dir(&item.orig_path);
+    let where_from = if loc.is_empty() {
+        "the top level".to_string()
+    } else {
+        format!("“{loc}”")
+    };
+    let what = if item.kind == EntryKind::Dir {
+        format!(
+            "folder · {} file{} · {}",
+            item.files,
+            if item.files == 1 { "" } else { "s" },
+            human_size(item.size)
+        )
+    } else {
+        human_size(item.size)
+    };
+    format!(
+        "{what} · was in {where_from} · deleted {}",
+        fmt_date(item.deleted_at)
+    )
+}
+
+/// The "move to folder" dialog: pick a destination folder for the chosen entries.
+fn move_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let entries = match &s.open {
+        Some(o) => snapshot_entries(&o.reader),
+        None => return,
+    };
+    let (paths, dest) = match &s.move_form {
+        Some(f) => (f.paths.clone(), f.dest.clone()),
+        None => return,
+    };
+    let options = move_folder_options(&entries, &paths);
+    let (close, _) = theme::modal(ctx, "Move to…", |ui| {
+        let cc = theme::colors(ui);
+        ui.label(
+            RichText::new(format!(
+                "Moving {} item{}. Choose a destination folder:",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" }
+            ))
+            .color(cc.text_muted),
+        );
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (path, label, depth) in &options {
+                    ui.horizontal(|ui| {
+                        ui.add_space(*depth as f32 * 16.0);
+                        if ui.selectable_label(&dest == path, label).clicked() {
+                            *action = Some(Action::SetMoveDest(path.clone()));
+                        }
+                    });
+                }
+            });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Move here").clicked() {
+                *action = Some(Action::ConfirmMove);
+            }
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelMove);
+            }
+        });
+    });
+    if close {
+        *action = Some(Action::CancelMove);
+    }
+}
+
+/// The in-app quick text editor: a wide modal holding the file's plaintext in an
+/// editable area, with Save / Close. The backdrop and Esc deliberately do *not*
+/// dismiss it (a stray click must never discard an in-progress edit) — only the
+/// buttons close it, so there is no `should_close` to honour.
+fn text_editor_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let cc = theme::colors_for(ctx);
+    let (leaf, dirty) = match &s.text_editor {
+        Some(te) => (te.leaf.clone(), te.dirty()),
+        None => return,
+    };
+    let screen = ctx.screen_rect();
+    egui::Modal::new(egui::Id::new("filesec_text_editor"))
+        .backdrop_color(Color32::from_black_alpha(130))
+        .frame(
+            egui::Frame::NONE
+                .fill(cc.surface)
+                .stroke(egui::Stroke::new(1.0, cc.border))
+                .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+                .inner_margin(egui::Margin::same(16)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width((screen.width() - 160.0).clamp(360.0, 900.0));
+            ui.horizontal(|ui| {
+                ui.label(theme::icon_text(theme::icon::EDIT, 16.0).color(cc.accent));
+                ui.label(RichText::new(format!("Edit {leaf}")).size(16.0).strong());
+                if dirty {
+                    ui.label(RichText::new("• unsaved").color(cc.warn).small());
+                }
+            });
+            ui.add_space(8.0);
+            let rows = (((screen.height() - 230.0) / 16.0) as usize).clamp(8, 40);
+            if let Some(te) = &mut s.text_editor {
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() - 200.0).max(160.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut te.content)
+                                .code_editor()
+                                .desired_rows(rows)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Save").clicked() {
+                    *action = Some(Action::SaveTextFile);
+                }
+                let close_label = if dirty { "Discard & close" } else { "Close" };
+                if theme::secondary_button(ui, close_label).clicked() {
+                    *action = Some(Action::CloseTextEditor);
+                }
+            });
+        });
+}
+
+/// How the user clicked a row's *body* (its trailing buttons / context menu emit
+/// actions directly). The browser resolves this against the full row order + the
+/// selection anchor, so shift / ⌘ / Ctrl behave like a real file explorer.
+#[derive(Clone, Copy)]
+enum RowClick {
+    None,
+    /// A single primary click, with shift / command (Ctrl on Win/Linux, ⌘ on mac).
+    Single {
+        shift: bool,
+        toggle: bool,
+    },
+    /// A double primary click: open — enter a folder, view a file.
+    Double,
+}
+
+/// The pure core of a single (non-double) click: update `selected` + `anchor` per
+/// the explorer modifier rules — plain = select only; ⌘/Ctrl = toggle; Shift =
+/// range from the anchor; Shift+⌘/Ctrl = add the range. Unit-tested below.
+fn resolve_single_click(
+    selected: &mut HashSet<String>,
+    anchor: &mut Option<String>,
+    rows: &[Row],
+    idx: usize,
+    shift: bool,
+    toggle: bool,
+) {
+    let path = rows[idx].path.clone();
+    if shift {
+        // Range from the anchor (or this row, if the anchor is gone). The anchor
+        // stays put so the range can be re-adjusted by another shift-click.
+        let anchor_idx = anchor
+            .as_ref()
+            .and_then(|a| rows.iter().position(|r| &r.path == a))
+            .unwrap_or(idx);
+        let (lo, hi) = (anchor_idx.min(idx), anchor_idx.max(idx));
+        if !toggle {
+            selected.clear();
+        }
+        for r in &rows[lo..=hi] {
+            selected.insert(r.path.clone());
+        }
+    } else if toggle {
+        if !selected.remove(&path) {
+            selected.insert(path.clone());
+        }
+        *anchor = Some(path);
+    } else {
+        selected.clear();
+        selected.insert(path.clone());
+        *anchor = Some(path);
+    }
+}
+
+/// Resolve a row body click into the new selection (and any open action).
+/// Double-click opens — enter a folder, view a file.
+fn apply_row_click(
+    s: &mut Session,
+    rows: &[Row],
+    idx: usize,
+    click: RowClick,
+    action: &mut Option<Action>,
+) {
+    match click {
+        RowClick::None => {}
+        RowClick::Double => {
+            let path = rows[idx].path.clone();
+            if rows[idx].kind == EntryKind::Dir {
+                *action = Some(Action::EnterDir(path));
+            } else {
+                s.selected.clear();
+                s.selected.insert(path.clone());
+                s.select_anchor = Some(path.clone());
+                *action = Some(Action::ViewFile(path));
+            }
+        }
+        RowClick::Single { shift, toggle } => {
+            resolve_single_click(
+                &mut s.selected,
+                &mut s.select_anchor,
+                rows,
+                idx,
+                shift,
+                toggle,
+            );
+        }
+    }
+}
+
 /// One row in the file browser: a full-width, hover/selected-highlighted surface
 /// with a type-tinted icon, a name + secondary line, and trailing quick actions
-/// revealed on hover. Folders enter on click; files toggle selection on click and
-/// open (view) on double-click.
+/// revealed on hover. The body click is *returned* (a [`RowClick`]); trailing
+/// buttons and the right-click menu emit their actions directly.
 fn entry_row(
     ui: &mut egui::Ui,
     c: theme::Colors,
@@ -3916,7 +5052,7 @@ fn entry_row(
     idle: bool,
     searching: bool,
     action: &mut Option<Action>,
-) {
+) -> RowClick {
     let is_dir = row.kind == EntryKind::Dir;
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
@@ -3979,18 +5115,21 @@ fn entry_row(
         };
         ui.label(RichText::new(secondary).color(c.text_muted).small());
     });
-    // Trailing actions, ordered left→right as View · Edit · Save · Remove (added
-    // right-to-left). Shown on hover or when the row is selected.
+    // Trailing actions, added right-to-left. Shown on hover or when selected. The
+    // full set (incl. Rename / Move) also lives in the right-click menu below.
     cui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let show = hovered || selected;
         if is_dir {
-            if show && idle && theme::icon_button(ui, theme::icon::TRASH, "Remove folder").clicked()
+            if show
+                && idle
+                && theme::icon_button(ui, theme::icon::TRASH, "Move folder to Trash").clicked()
             {
-                *action = Some(Action::DeleteEntry(row.path.clone()));
+                *action = Some(Action::Trash(row.path.clone()));
             }
         } else {
-            if show && idle && theme::icon_button(ui, theme::icon::TRASH, "Remove").clicked() {
-                *action = Some(Action::DeleteEntry(row.path.clone()));
+            if show && idle && theme::icon_button(ui, theme::icon::TRASH, "Move to Trash").clicked()
+            {
+                *action = Some(Action::Trash(row.path.clone()));
             }
             if show && theme::icon_button(ui, theme::icon::SAVE, "Save as…").clicked() {
                 *action = Some(Action::SaveEntryAs(row.path.clone()));
@@ -4011,16 +5150,51 @@ fn entry_row(
         }
     });
 
-    if is_dir {
-        if resp.clicked() {
-            *action = Some(Action::EnterDir(row.path.clone()));
+    // Right-click menu: the same actions, plus Rename / Move which have no hover
+    // button. egui closes the menu automatically when an item is clicked.
+    resp.context_menu(|ui| {
+        if is_dir {
+            if ui.button("Open").clicked() {
+                *action = Some(Action::EnterDir(row.path.clone()));
+            }
+        } else {
+            if ui.button("View").clicked() {
+                *action = Some(Action::ViewFile(row.path.clone()));
+            }
+            if idle && ui.button("Quick edit (in app)").clicked() {
+                *action = Some(Action::QuickEdit(row.path.clone()));
+            }
+            if idle && ui.button("Check out & edit").clicked() {
+                *action = Some(Action::CheckOut(row.path.clone()));
+            }
+            if ui.button("Save as…").clicked() {
+                *action = Some(Action::SaveEntryAs(row.path.clone()));
+            }
         }
-    } else if idle {
-        if resp.double_clicked() {
-            *action = Some(Action::ViewFile(row.path.clone()));
-        } else if resp.clicked() {
-            *action = Some(Action::ToggleSelect(row.path.clone()));
+        if idle {
+            ui.separator();
+            if ui.button("Rename…").clicked() {
+                *action = Some(Action::BeginRename(row.path.clone()));
+            }
+            if ui.button("Move to…").clicked() {
+                *action = Some(Action::BeginMove(vec![row.path.clone()]));
+            }
+            ui.separator();
+            if ui.button("Delete").clicked() {
+                *action = Some(Action::Trash(row.path.clone()));
+            }
         }
+    });
+
+    // Report the body click; the browser resolves selection / open. Modifiers are
+    // read at click time so shift / ⌘ / Ctrl emulate a real file explorer.
+    if resp.double_clicked() {
+        RowClick::Double
+    } else if resp.clicked() {
+        let (shift, toggle) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+        RowClick::Single { shift, toggle }
+    } else {
+        RowClick::None
     }
 }
 
@@ -5314,6 +6488,12 @@ fn snapshot_entries(reader: &VaultReaderV2) -> Vec<(String, EntryKind, u64)> {
         .collect()
 }
 
+/// A short random hex tag that makes each trash token unique, so two deletions
+/// of the same path (even in the same second) never collide.
+fn trash_tag() -> String {
+    hex(&filesec_core::secret::random_vec(4).unwrap_or_else(|_| vec![0u8; 4]))
+}
+
 /// The parent directory of a normalized vault path ("" for a top-level entry).
 fn parent_dir(path: &str) -> &str {
     match path.rsplit_once('/') {
@@ -5373,6 +6553,11 @@ fn visible_rows(
     let mut rows: Vec<Row> = entries
         .iter()
         .filter(|(p, _, _)| {
+            // The trash is a hidden, local-only subtree — never list it here (in
+            // the folder view or a global search). It has its own panel.
+            if is_trashed(p) {
+                return false;
+            }
             if q.is_empty() {
                 parent_dir(p) == dir
             } else {
@@ -5410,6 +6595,31 @@ fn sort_rows(rows: &mut [Row], sort: SortMode) {
             }
         })
     });
+}
+
+/// A one-line summary of a browser view: "2 folders · 5 files · 4.2 MB", or
+/// "N matches" while searching. Sizes count files only.
+fn view_summary(rows: &[Row], searching: bool) -> String {
+    if searching {
+        let n = rows.len();
+        return format!("{n} match{}", if n == 1 { "" } else { "es" });
+    }
+    let dirs = rows.iter().filter(|r| r.kind == EntryKind::Dir).count();
+    let files = rows.iter().filter(|r| r.kind == EntryKind::File).count();
+    let bytes: u64 = rows
+        .iter()
+        .filter(|r| r.kind == EntryKind::File)
+        .map(|r| r.size)
+        .sum();
+    let mut parts = Vec::new();
+    if dirs > 0 {
+        parts.push(format!("{dirs} folder{}", if dirs == 1 { "" } else { "s" }));
+    }
+    parts.push(format!("{files} file{}", if files == 1 { "" } else { "s" }));
+    if files > 0 {
+        parts.push(human_size(bytes));
+    }
+    parts.join(" · ")
 }
 
 /// Breadcrumb segments for `dir`, each `(label, navigation target)`. Always starts
@@ -5465,6 +6675,223 @@ fn file_tint(name: &str, c: theme::Colors) -> Color32 {
         FileCat::Code => c.accent,
         FileCat::Other => c.text_muted,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trash model: soft delete. A "deleted" entry is *moved* (a manifest-only,
+// O(1) rename — no blob is rewritten or decrypted) into the hidden `.trash/`
+// subtree, where it stays fully encrypted and restorable until the user empties
+// the trash. The single path segment under `.trash/` packs the deletion time, a
+// random tag, and the percent-encoded original path, so restore knows exactly
+// where the entry came from. These are pure functions, unit-tested below.
+// ---------------------------------------------------------------------------
+
+/// One soft-deleted entry, shown in the trash view.
+struct TrashItem {
+    /// Its current (hidden) path under `.trash/`.
+    trashed_path: String,
+    /// Where "Restore" will try to put it back (its original vault path).
+    orig_path: String,
+    /// Unix seconds it was moved to the trash.
+    deleted_at: i64,
+    kind: EntryKind,
+    /// A file's own size, or the total size of a folder's contents.
+    size: u64,
+    /// For a folder, how many files it holds (0 for a file).
+    files: usize,
+}
+
+/// Percent-encode the only two characters that can't appear raw in a single
+/// trash path segment: `%` (the escape itself) and `/` (a separator). Spaces,
+/// dots, and unicode pass through untouched.
+fn pct_encode_seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Reverse [`pct_encode_seg`]: decode `%XX` hex escapes left-to-right. We only
+/// ever emit `%25` / `%2F`, but a general decoder keeps the round-trip robust.
+fn pct_decode_seg(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The hidden path a soft-deleted entry is moved to: `.trash/<at>-<rand>-<enc>`,
+/// where `<at>` is the deletion time, `<rand>` a short tag (so two deletions of
+/// the same path never collide), and `<enc>` the percent-encoded original path.
+fn trash_dest(deleted_at: i64, rand_hex: &str, orig: &str) -> String {
+    format!(
+        "{TRASH_DIR}/{deleted_at}-{rand_hex}-{}",
+        pct_encode_seg(orig)
+    )
+}
+
+/// Parse a top-level trash entry path (a direct child of `.trash`) back into its
+/// `(deletion time, original path)`. Returns `None` for a malformed token, so a
+/// hand-mangled manifest degrades gracefully instead of showing garbage.
+fn parse_trash_token(trashed_path: &str) -> Option<(i64, String)> {
+    let token = trashed_path.strip_prefix(".trash/")?;
+    // Exactly three parts: <deleted_at>-<rand>-<encoded original path>. The
+    // original path may itself contain '-', so only the first two are split off.
+    let mut parts = token.splitn(3, '-');
+    let deleted_at: i64 = parts.next()?.parse().ok()?;
+    let _rand = parts.next()?;
+    let encoded = parts.next()?;
+    Some((deleted_at, pct_decode_seg(encoded)))
+}
+
+/// (file count, total size) of everything strictly inside a trashed folder.
+fn trashed_subtree_totals(entries: &[(String, EntryKind, u64)], top: &str) -> (usize, u64) {
+    let prefix = format!("{top}/");
+    entries
+        .iter()
+        .filter(|(p, k, _)| *k == EntryKind::File && p.starts_with(&prefix))
+        .fold((0, 0), |(n, sz), (_, _, s)| (n + 1, sz + s))
+}
+
+/// The soft-deleted entries (the direct children of `.trash`), most-recent
+/// first. Malformed tokens are skipped rather than shown wrong.
+fn trashed_items(entries: &[(String, EntryKind, u64)]) -> Vec<TrashItem> {
+    let mut items: Vec<TrashItem> = entries
+        .iter()
+        .filter(|(p, _, _)| parent_dir(p) == TRASH_DIR)
+        .filter_map(|(p, kind, size)| {
+            let (deleted_at, orig_path) = parse_trash_token(p)?;
+            let (files, total) = if *kind == EntryKind::Dir {
+                trashed_subtree_totals(entries, p)
+            } else {
+                (0, *size)
+            };
+            Some(TrashItem {
+                trashed_path: p.clone(),
+                orig_path,
+                deleted_at,
+                kind: *kind,
+                size: total,
+                files,
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b.deleted_at
+            .cmp(&a.deleted_at)
+            .then_with(|| a.orig_path.cmp(&b.orig_path))
+    });
+    items
+}
+
+/// Whether the vault has any entry outside the trash. A vault holding only
+/// trashed files should still read as "empty" in the browser.
+fn has_live_entries(entries: &[(String, EntryKind, u64)]) -> bool {
+    entries.iter().any(|(p, _, _)| !is_trashed(p))
+}
+
+/// (live file count, live total size) — i.e. excluding the trash — so a vault's
+/// card shrinks the moment a file is trashed.
+fn live_counts(entries: &[(String, EntryKind, u64)]) -> (u64, u64) {
+    entries
+        .iter()
+        .filter(|(p, k, _)| *k == EntryKind::File && !is_trashed(p))
+        .fold((0, 0), |(n, sz), (_, _, s)| (n + 1, sz + s))
+}
+
+/// Split a leaf into `(stem, extension-with-dot)`. A leading dot belongs to the
+/// stem (`.bashrc` has no extension), matching common file-manager behaviour.
+fn split_ext(leaf: &str) -> (&str, &str) {
+    match leaf.rfind('.') {
+        Some(i) if i > 0 => (&leaf[..i], &leaf[i..]),
+        _ => (leaf, ""),
+    }
+}
+
+/// A free vault path to restore `desired` to: it is used as-is when nothing
+/// lives there, else " (restored)", " (restored 2)", … is inserted before the
+/// extension until the name is unused. `taken` is the set of existing paths.
+fn dedup_path(taken: &HashSet<String>, desired: &str) -> String {
+    if !taken.contains(desired) {
+        return desired.to_string();
+    }
+    let parent = parent_dir(desired);
+    let (stem, ext) = split_ext(leaf_name(desired));
+    let make = |suffix: &str| -> String {
+        let leaf = format!("{stem}{suffix}{ext}");
+        if parent.is_empty() {
+            leaf
+        } else {
+            format!("{parent}/{leaf}")
+        }
+    };
+    let mut candidate = make(" (restored)");
+    let mut n = 2;
+    while taken.contains(&candidate) {
+        candidate = make(&format!(" (restored {n})"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Keep only the top-level entries of a selection: drop any path that is a
+/// descendant of another selected path. (A global search can select both a folder
+/// and a file inside it; trashing/moving both would act on the inner one twice.)
+fn prune_nested(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|p| {
+            !paths
+                .iter()
+                .any(|other| other.as_str() != p.as_str() && p.starts_with(&format!("{other}/")))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The destination folders offered by the Move dialog: the vault root plus every
+/// live folder, minus the folders being moved (and their subtrees, so a folder
+/// can't be moved into itself). Each is `(path, display leaf, depth)` for an
+/// indented tree-style picker.
+fn move_folder_options(
+    entries: &[(String, EntryKind, u64)],
+    moving: &[String],
+) -> Vec<(String, String, usize)> {
+    let blocked = |f: &str| {
+        moving
+            .iter()
+            .any(|m| f == m || f.starts_with(&format!("{m}/")))
+    };
+    let mut dirs: Vec<&str> = entries
+        .iter()
+        .filter(|(p, k, _)| *k == EntryKind::Dir && !is_trashed(p) && !blocked(p))
+        .map(|(p, _, _)| p.as_str())
+        .collect();
+    dirs.sort();
+    let mut opts = vec![(String::new(), "Top level".to_string(), 0usize)];
+    for d in dirs {
+        let depth = d.split('/').count();
+        opts.push((d.to_string(), leaf_name(d).to_string(), depth));
+    }
+    opts
 }
 
 #[cfg(test)]
@@ -5575,6 +7002,202 @@ mod browse_tests {
         assert_eq!(file_category("main.rs"), FileCat::Code);
         assert_eq!(file_category("README"), FileCat::Other);
         assert_eq!(file_category("data.unknownext"), FileCat::Other);
+    }
+
+    #[test]
+    fn pct_roundtrips_paths_with_separators_and_escapes() {
+        for orig in [
+            "report.pdf",
+            "docs/2026/q1 plan.xlsx",
+            "weird %name%/a-b-c.txt",
+            "100%/done/já.md",
+        ] {
+            assert_eq!(pct_decode_seg(&pct_encode_seg(orig)), orig);
+        }
+        // The encoding never leaves a raw separator in the segment.
+        assert!(!pct_encode_seg("a/b/c").contains('/'));
+    }
+
+    #[test]
+    fn trash_dest_and_token_roundtrip() {
+        // A nested original path survives the move-to-trash → parse round-trip,
+        // even though the destination is a single (slash-free) segment.
+        let orig = "docs/2026/q1 plan-final.xlsx";
+        let dest = trash_dest(1_717_000_000, "ab12cd34", orig);
+        assert_eq!(parent_dir(&dest), TRASH_DIR);
+        assert!(!leaf_name(&dest).contains('/'));
+        let (at, decoded) = parse_trash_token(&dest).expect("parse");
+        assert_eq!(at, 1_717_000_000);
+        assert_eq!(decoded, orig);
+        // A garbage token is rejected, not shown wrong.
+        assert!(parse_trash_token(".trash/not-a-token").is_none());
+        assert!(parse_trash_token("docs/file.txt").is_none());
+    }
+
+    /// docs/{a.txt} live, plus two trashed items (a file and a folder subtree).
+    fn sample_with_trash() -> Vec<(String, EntryKind, u64)> {
+        vec![
+            ent("docs", EntryKind::Dir, 0),
+            ent("docs/a.txt", EntryKind::File, 10),
+            ent(TRASH_DIR, EntryKind::Dir, 0),
+            ent(".trash/100-aa-old.txt", EntryKind::File, 7),
+            ent(".trash/200-bb-photos", EntryKind::Dir, 0),
+            ent(".trash/200-bb-photos/p1.jpg", EntryKind::File, 50),
+            ent(".trash/200-bb-photos/p2.jpg", EntryKind::File, 30),
+        ]
+    }
+
+    #[test]
+    fn browser_hides_the_trash_subtree() {
+        let e = sample_with_trash();
+        // Neither the folder view nor a global search ever surfaces `.trash`.
+        let root = visible_rows(&e, "", "", SortMode::NameAsc);
+        assert_eq!(names(&root), vec!["docs"]);
+        let search = visible_rows(&e, "", "p1", SortMode::NameAsc);
+        assert!(search.is_empty(), "trashed files must not match search");
+        // Live-only views of the vault.
+        assert!(has_live_entries(&e));
+        assert_eq!(live_counts(&e), (1, 10)); // docs/a.txt only
+    }
+
+    #[test]
+    fn trashed_items_are_parsed_grouped_and_sorted() {
+        let items = trashed_items(&sample_with_trash());
+        assert_eq!(
+            items.len(),
+            2,
+            "two top-level trashed items, not subtree files"
+        );
+        // Most-recent first (deleted_at 200 before 100).
+        assert_eq!(items[0].orig_path, "photos");
+        assert_eq!(items[0].kind, EntryKind::Dir);
+        assert_eq!((items[0].files, items[0].size), (2, 80));
+        assert_eq!(items[1].orig_path, "old.txt");
+        assert_eq!(items[1].kind, EntryKind::File);
+        assert_eq!(items[1].size, 7);
+    }
+
+    #[test]
+    fn restore_dedups_against_a_live_collision() {
+        let mut taken = HashSet::new();
+        taken.insert("docs/a.txt".to_string());
+        // Free path is returned unchanged.
+        assert_eq!(dedup_path(&taken, "docs/b.txt"), "docs/b.txt");
+        // A collision gets " (restored)" before the extension.
+        assert_eq!(dedup_path(&taken, "docs/a.txt"), "docs/a (restored).txt");
+        taken.insert("docs/a (restored).txt".to_string());
+        assert_eq!(dedup_path(&taken, "docs/a.txt"), "docs/a (restored 2).txt");
+        // A dotfile keeps its leading dot in the stem.
+        taken.insert(".env".to_string());
+        assert_eq!(dedup_path(&taken, ".env"), ".env (restored)");
+    }
+
+    #[test]
+    fn move_options_offer_root_and_live_folders_minus_self() {
+        let e = sample_with_trash();
+        // Moving a file: every live folder is a valid target; trash is excluded.
+        let opts = move_folder_options(&e, &["docs/a.txt".to_string()]);
+        let paths: Vec<&str> = opts.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["", "docs"]);
+        // Moving the "docs" folder: it (and any subtree) is not offered as a target.
+        let opts = move_folder_options(&e, &["docs".to_string()]);
+        let paths: Vec<&str> = opts.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(paths, vec![""]);
+    }
+
+    #[test]
+    fn summary_describes_the_view() {
+        let rows = visible_rows(&sample(), "", "", SortMode::NameAsc);
+        // root holds docs/ + notes.md + photo.png.
+        assert!(view_summary(&rows, false).starts_with("1 folder · 2 files · "));
+        assert_eq!(view_summary(&rows, true), "3 matches");
+    }
+
+    #[test]
+    fn prune_nested_keeps_only_top_level() {
+        let paths = vec![
+            "docs".to_string(),
+            "docs/a.txt".to_string(),
+            "docs/sub/b.txt".to_string(),
+            "photo.png".to_string(),
+        ];
+        let mut kept = prune_nested(&paths);
+        kept.sort();
+        // Only "docs" (its descendants are dropped) and the unrelated "photo.png".
+        assert_eq!(kept, vec!["docs".to_string(), "photo.png".to_string()]);
+    }
+
+    /// The root view rows (folders first), used to exercise click selection.
+    fn root_rows() -> Vec<Row> {
+        // docs/ (dir), notes.md, photo.png  — see `sample()`.
+        visible_rows(&sample(), "", "", SortMode::NameAsc)
+    }
+
+    fn sel(set: &HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = set.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn plain_click_selects_only_that_row_and_sets_anchor() {
+        let rows = root_rows();
+        let mut s = HashSet::new();
+        let mut anchor = None;
+        // Pre-existing selection is replaced by a plain click.
+        s.insert("notes.md".to_string());
+        resolve_single_click(&mut s, &mut anchor, &rows, 0, false, false);
+        assert_eq!(sel(&s), vec!["docs".to_string()]);
+        assert_eq!(anchor.as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_membership() {
+        let rows = root_rows();
+        let mut s = HashSet::new();
+        let mut anchor = None;
+        resolve_single_click(&mut s, &mut anchor, &rows, 0, false, true); // +docs
+        resolve_single_click(&mut s, &mut anchor, &rows, 1, false, true); // +notes.md
+        assert_eq!(sel(&s), vec!["docs".to_string(), "notes.md".to_string()]);
+        resolve_single_click(&mut s, &mut anchor, &rows, 0, false, true); // -docs
+        assert_eq!(sel(&s), vec!["notes.md".to_string()]);
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_the_anchor() {
+        let rows = root_rows(); // [docs, notes.md, photo.png]
+        let mut s = HashSet::new();
+        let mut anchor = None;
+        resolve_single_click(&mut s, &mut anchor, &rows, 0, false, false); // anchor=docs
+        resolve_single_click(&mut s, &mut anchor, &rows, 2, true, false); // shift→0..=2
+        assert_eq!(
+            sel(&s),
+            vec![
+                "docs".to_string(),
+                "notes.md".to_string(),
+                "photo.png".to_string()
+            ]
+        );
+        // Shift again to a closer row replaces the range (anchor unchanged).
+        resolve_single_click(&mut s, &mut anchor, &rows, 1, true, false);
+        assert_eq!(sel(&s), vec!["docs".to_string(), "notes.md".to_string()]);
+    }
+
+    #[test]
+    fn shift_ctrl_click_adds_a_range_to_the_selection() {
+        let rows = root_rows();
+        let mut s = HashSet::new();
+        let mut anchor = None;
+        resolve_single_click(&mut s, &mut anchor, &rows, 2, false, true); // +photo.png, anchor=photo
+        resolve_single_click(&mut s, &mut anchor, &rows, 0, true, true); // additive range 0..=2
+        assert_eq!(
+            sel(&s),
+            vec![
+                "docs".to_string(),
+                "notes.md".to_string(),
+                "photo.png".to_string()
+            ]
+        );
     }
 }
 
@@ -5721,7 +7344,10 @@ mod ui_smoke {
             false,
             dir.display().to_string(),
         );
-        s.open = Some(OpenVault { id: vid, reader });
+        s.open = Some(OpenVault {
+            id: vid.clone(),
+            reader,
+        });
         let mut action = None;
         // Root view: a folder row + a (type-tinted) file row, breadcrumb, combo.
         frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
@@ -5733,9 +7359,81 @@ mod ui_smoke {
         s.file_search = "a".to_string();
         s.selected.insert("folder/a.txt".to_string());
         frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
-        // Empty-vault state.
         s.file_search.clear();
         s.selected.clear();
+        // A multi-selection including a folder (folders are now selectable).
+        s.selected.insert("folder".to_string());
+        s.selected.insert("pic.png".to_string());
+        s.select_anchor = Some("folder".to_string());
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        s.selected.clear();
+        s.select_anchor = None;
+        // The "new file" composer.
+        s.show_new_file = true;
+        s.new_file_name = "notes.txt".to_string();
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        s.show_new_file = false;
+        s.new_file_name.clear();
+        // The in-app text editor modal (owns the whole context).
+        s.text_editor = Some(TextEditor {
+            path: "pic.png".to_string(),
+            leaf: "pic.png".to_string(),
+            content: "hello\nworld".to_string(),
+            original: "hello".to_string(),
+        });
+        ctx.begin_pass(egui::RawInput::default());
+        text_editor_window(&mut s, &ctx, &mut action);
+        let _ = ctx.end_pass();
+        if let Some(mut te) = s.text_editor.take() {
+            te.zeroize();
+        }
+
+        // Soft-delete a file, then drive the trash panel, the rename composer, and
+        // the move dialog through real frames so each render path is exercised.
+        let r = store
+            .open_vault(s.identity.as_ref(), &vid)
+            .expect("reopen2");
+        let dest = trash_dest(123, "abcd", "pic.png");
+        store
+            .rename_in_vault(
+                s.identity.as_ref(),
+                &vid,
+                &r,
+                &[("pic.png".to_string(), dest)],
+            )
+            .expect("trash a file");
+        let reader = store
+            .open_vault(s.identity.as_ref(), &vid)
+            .expect("reopen3");
+        s.open = Some(OpenVault {
+            id: vid.clone(),
+            reader,
+        });
+        // Trash view: one trashed item with Restore / Delete forever + Empty Trash,
+        // then again with the "empty the trash?" confirmation armed.
+        s.show_trash = true;
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        s.confirm_empty_trash = true;
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        s.confirm_empty_trash = false;
+        s.show_trash = false;
+        // Inline rename composer over a still-live file.
+        s.rename_target = Some("folder/a.txt".to_string());
+        s.rename_input = "renamed.txt".to_string();
+        frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
+        s.rename_target = None;
+        s.rename_input.clear();
+        // The move dialog (a modal that owns the whole context).
+        s.move_form = Some(MoveForm {
+            paths: vec!["folder/a.txt".to_string()],
+            dest: String::new(),
+        });
+        ctx.begin_pass(egui::RawInput::default());
+        move_window(&mut s, &ctx, &mut action);
+        let _ = ctx.end_pass();
+        s.move_form = None;
+
+        // Empty-vault state.
         let empty_vid = new_vault_id();
         store
             .save_vault(s.identity.as_ref(), &empty_vid, &Vault::new("Empty", 0))

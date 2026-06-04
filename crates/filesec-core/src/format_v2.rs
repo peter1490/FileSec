@@ -51,6 +51,19 @@ use crate::{aead, codec};
 const HEADER_FILE: &str = "header";
 const MANIFEST_FILE: &str = "manifest";
 const BLOBS_DIR: &str = "blobs";
+/// Reserved top-level directory holding soft-deleted ("trashed") entries. It is a
+/// **local-only** convention: trashed entries are still real, encrypted blobs in
+/// the manifest (so they can be restored), but they are deliberately excluded
+/// from anything that leaves the vault — [`VaultReaderV2::to_vault_for_export`]
+/// (and therefore [`export_v2_to_path`]) skips this subtree, so a file you put in
+/// the trash never travels inside a `.fsec` you send to someone else.
+pub const TRASH_DIR: &str = ".trash";
+
+/// Whether a normalized vault path is the trash root or sits anywhere inside it.
+/// The `".trash/"` literal mirrors [`TRASH_DIR`] (kept in sync by the test below).
+pub fn is_trashed(path: &str) -> bool {
+    path == TRASH_DIR || path.starts_with(".trash/")
+}
 /// Current at-rest directory format version.
 const FORMAT_VERSION_V2: u16 = 2;
 /// Upper bound on the plaintext header / sealed manifest reads (untrusted-input guard).
@@ -393,11 +406,29 @@ impl VaultReaderV2 {
         Ok(())
     }
 
-    /// Fully decrypt into an in-memory [`Vault`] — used for export to the
-    /// single-stream `.fsec` transport container and for tests.
+    /// Fully decrypt into an in-memory [`Vault`]. A faithful materialization of
+    /// *every* entry — including the local [`TRASH_DIR`] subtree — so it is the
+    /// right call for re-keying / round-tripping the whole store. For producing a
+    /// container to hand to someone else, use [`Self::to_vault_for_export`].
     pub fn to_vault(&self) -> Result<Vault> {
+        self.materialize(|_| true)
+    }
+
+    /// Like [`Self::to_vault`] but **omits the trash**: soft-deleted entries are
+    /// never decrypted and never make it into the exported container. This is what
+    /// [`export_v2_to_path`] uses, so "delete then send" can't leak the file.
+    pub fn to_vault_for_export(&self) -> Result<Vault> {
+        self.materialize(|path| !is_trashed(path))
+    }
+
+    /// Shared body of [`Self::to_vault`] / [`Self::to_vault_for_export`]: decrypt
+    /// the entries for which `keep` returns `true` into a fresh [`Vault`].
+    fn materialize(&self, keep: impl Fn(&str) -> bool) -> Result<Vault> {
         let mut vault = Vault::new(self.manifest.vault_name.clone(), self.manifest.created_at);
         for e in &self.manifest.entries {
+            if !keep(&e.path) {
+                continue;
+            }
             match e.kind {
                 EntryKind::Dir => vault.add_dir(&e.path)?,
                 EntryKind::File => {
@@ -802,7 +833,9 @@ pub fn export_v2_to_path(
     options: &crate::format::ExportOptions,
     path: &Path,
 ) -> Result<()> {
-    let vault = reader.to_vault()?;
+    // Exclude the local trash: a soft-deleted file must never ride along inside a
+    // container handed to a recipient.
+    let vault = reader.to_vault_for_export()?;
     let file = fs_err::File::create(path)?;
     crate::format::export_vault(&vault, sender, recipients, options, file)
 }
