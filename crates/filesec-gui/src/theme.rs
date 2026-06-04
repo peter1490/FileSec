@@ -431,15 +431,30 @@ pub fn text_input(
 }
 
 /// A full-width multi-line input (e.g. pasting a public key).
+///
+/// Capped at `rows` lines tall: a `TextEdit::multiline` grows with its content,
+/// so pasting a long key would otherwise balloon the field until it pushed the
+/// buttons below it off-screen. Wrapping it in a fixed-height scroll area keeps
+/// the field compact and scrolls the overflow internally instead.
 pub fn text_area(ui: &mut egui::Ui, text: &mut String, hint: &str, rows: usize) -> egui::Response {
-    ui.add(
-        egui::TextEdit::multiline(text)
-            .hint_text(hint)
-            .desired_width(f32::INFINITY)
-            .desired_rows(rows)
-            .margin(egui::Margin::symmetric(10, 8))
-            .font(egui::TextStyle::Body),
-    )
+    // Match the visible height to `rows` lines plus the field's vertical margin,
+    // so an empty field fits exactly and only longer content reveals a scrollbar.
+    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+    let max_height = row_h * rows as f32 + 16.0;
+    egui::ScrollArea::vertical()
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(rows)
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .font(egui::TextStyle::Body),
+            )
+        })
+        .inner
 }
 
 #[derive(Clone, Copy)]

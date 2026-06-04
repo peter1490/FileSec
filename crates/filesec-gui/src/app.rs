@@ -4769,6 +4769,13 @@ fn sanitize_leaf(name: &str) -> String {
     }
 }
 
+/// `CREATE_NO_WINDOW` (winbase.h). The `cmd /C start …` launcher we use to open
+/// files in their default app would otherwise flash an empty console window over
+/// the GUI every time. This flag suppresses that console without affecting the
+/// app `start` ultimately launches (it gets its own window).
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Best-effort: open `path` in the OS default application, detached (we do not
 /// wait for it to close). Uses platform launchers via `std::process::Command`
 /// to avoid pulling an extra dependency.
@@ -4779,11 +4786,14 @@ fn open_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         // The empty "" is the window title arg so a path with spaces isn't
-        // swallowed as the title.
+        // swallowed as the title. `CREATE_NO_WINDOW` keeps `cmd` from popping up
+        // a console window alongside the launched app.
         std::process::Command::new("cmd")
             .args(["/C", "start", ""])
             .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -4834,9 +4844,11 @@ fn start_view(path: &std::path::Path) -> ViewLaunch {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         match std::process::Command::new("cmd")
             .args(["/C", "start", "/wait", ""])
             .arg(&p)
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
         {
             Ok(mut child) => {
