@@ -29,7 +29,7 @@ use filesec_core::SuiteId;
 
 use crate::autounlock;
 use crate::passkey;
-use crate::store::{new_vault_id, Registry, Store, VaultMeta};
+use crate::store::{new_vault_id, write_private_export, Registry, Store, VaultMeta};
 
 use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
 
@@ -66,6 +66,9 @@ struct FirstRun {
     pass: String,
     pass2: String,
     error: Option<String>,
+    /// When set, the "restore from a backup" sub-flow is active (a backup file
+    /// has been picked) and its card is shown instead of "create identity".
+    restore: Option<RestoreForm>,
 }
 
 /// Wipe the passphrase buffers when the first-run form is discarded (e.g. on a
@@ -75,6 +78,26 @@ impl Drop for FirstRun {
     fn drop(&mut self) {
         self.pass.zeroize();
         self.pass2.zeroize();
+    }
+}
+
+/// First-run "restore from a backup" sub-form: the picked `.fsecid` file, the
+/// passphrase that decrypts it, and a new local passphrase (×2) to seal the
+/// restored identity into this device's keystore.
+#[derive(Default)]
+struct RestoreForm {
+    path: std::path::PathBuf,
+    backup_pass: String,
+    new_pass: String,
+    new_pass2: String,
+    error: Option<String>,
+}
+
+impl Drop for RestoreForm {
+    fn drop(&mut self) {
+        self.backup_pass.zeroize();
+        self.new_pass.zeroize();
+        self.new_pass2.zeroize();
     }
 }
 
@@ -147,6 +170,22 @@ struct AutoUnlockForm {
 impl Drop for AutoUnlockForm {
     fn drop(&mut self) {
         self.pass.zeroize();
+    }
+}
+
+/// The "Export identity backup" dialog: a backup passphrase (×2) that seals the
+/// exported `.fsecid` file. Independent of the daily passphrase.
+#[derive(Default)]
+struct ExportIdentityForm {
+    pass: String,
+    pass2: String,
+    error: Option<String>,
+}
+
+impl Drop for ExportIdentityForm {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+        self.pass2.zeroize();
     }
 }
 
@@ -328,6 +367,8 @@ struct Session {
     auto_unlock: bool,
     /// The open "remember on this device" dialog, if any.
     auto_unlock_form: Option<AutoUnlockForm>,
+    /// The open "export identity backup" dialog, if any.
+    export_identity: Option<ExportIdentityForm>,
     data_dir: String,
 }
 
@@ -367,6 +408,7 @@ impl Session {
             add_passkey: None,
             auto_unlock,
             auto_unlock_form: None,
+            export_identity: None,
             data_dir,
         }
     }
@@ -457,6 +499,14 @@ enum Action {
     AddSenderToContacts,
     CopyPubKey,
     SavePubKey,
+    /// Open / cancel / confirm the "export identity backup" dialog.
+    BeginExportIdentity,
+    CancelExportIdentity,
+    DoExportIdentity,
+    /// First-run restore: pick a backup file, then cancel / confirm the restore.
+    BeginRestore,
+    CancelRestore,
+    DoRestore,
     DismissImportInfo,
     DismissToast,
     /// Unlock by deriving a key from an enrolled security key (passkey).
@@ -579,6 +629,8 @@ enum Outcome {
     /// Update the cached "remember on this device" state after enable/disable and
     /// close the dialog.
     AutoUnlockChanged(bool),
+    /// Close the "export identity backup" dialog after a successful export.
+    ExportIdentityDone,
 }
 
 impl Default for App {
@@ -902,7 +954,12 @@ impl App {
             }
             Outcome::FirstRunFailed(msg) => {
                 if let State::FirstRun(f) = &mut self.state {
-                    f.error = Some(msg);
+                    // Surface the error in whichever card is showing: the restore
+                    // sub-form when restoring, otherwise the create form.
+                    match &mut f.restore {
+                        Some(r) => r.error = Some(msg),
+                        None => f.error = Some(msg),
+                    }
                 }
             }
             Outcome::UnlockFailed(msg) => {
@@ -1013,6 +1070,11 @@ impl App {
                 if let State::Unlocked(s) = &mut self.state {
                     s.auto_unlock = enabled;
                     s.auto_unlock_form = None;
+                }
+            }
+            Outcome::ExportIdentityDone => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.export_identity = None;
                 }
             }
         }
@@ -1219,6 +1281,40 @@ impl App {
                     s.auto_unlock_form = None;
                 }
             }
+            Action::BeginExportIdentity => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.export_identity = Some(ExportIdentityForm::default());
+                }
+            }
+            Action::CancelExportIdentity => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.export_identity = None;
+                }
+            }
+            Action::BeginRestore => {
+                if let State::FirstRun(f) = &mut self.state {
+                    // Pick the backup file up front; only open the restore card
+                    // once a file is chosen (cancelling the picker is a no-op).
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("FileSec identity backup", &["fsecid"])
+                        .pick_file()
+                    {
+                        f.error = None;
+                        f.restore = Some(RestoreForm {
+                            path,
+                            backup_pass: String::new(),
+                            new_pass: String::new(),
+                            new_pass2: String::new(),
+                            error: None,
+                        });
+                    }
+                }
+            }
+            Action::CancelRestore => {
+                if let State::FirstRun(f) = &mut self.state {
+                    f.restore = None;
+                }
+            }
             Action::CancelVerify => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.verify = None;
@@ -1278,6 +1374,8 @@ impl App {
             Action::SetTrust(fpr, t) => self.spawn_set_trust(ctx, fpr, t),
             Action::RemoveContact(fpr) => self.spawn_remove_contact(ctx, fpr),
             Action::SavePubKey => self.spawn_save_pubkey(ctx),
+            Action::DoExportIdentity => self.spawn_export_identity(ctx),
+            Action::DoRestore => self.spawn_restore_identity(ctx),
         }
     }
 
@@ -2846,6 +2944,169 @@ impl App {
             }
         });
     }
+
+    /// Export the current identity as a portable, passphrase-encrypted `.fsecid`
+    /// backup. Validates the backup passphrase from the open dialog, picks a save
+    /// location, then seals + writes the armored backup in the background.
+    fn spawn_export_identity(&mut self, ctx: &egui::Context) {
+        // Validate the backup passphrase from the dialog before doing anything.
+        let pass = match &mut self.state {
+            State::Unlocked(s) => match &mut s.export_identity {
+                Some(f) => {
+                    if f.pass.chars().count() < 8 {
+                        f.error = Some("Backup passphrase must be at least 8 characters.".into());
+                        return;
+                    }
+                    if f.pass != f.pass2 {
+                        f.error = Some("Passphrases do not match.".into());
+                        return;
+                    }
+                    f.error = None;
+                    f.pass2.zeroize();
+                    // Wiped after the worker uses it (see `spawn_create_identity`).
+                    Zeroizing::new(std::mem::take(&mut f.pass))
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        let (identity, name) = match self.ident_arc() {
+            Some(i) => {
+                let name = i.name.clone();
+                (i, name)
+            }
+            None => return,
+        };
+        let suggested = format!("{}.fsecid", sanitize_filename(&name));
+        let target = match rfd::FileDialog::new()
+            .add_filter("FileSec identity backup", &["fsecid"])
+            .set_file_name(&suggested)
+            .save_file()
+        {
+            Some(p) => p,
+            None => {
+                // User backed out of the save dialog; close the dialog cleanly.
+                if let State::Unlocked(s) = &mut self.state {
+                    s.export_identity = None;
+                }
+                return;
+            }
+        };
+        self.spawn_job(ctx, "Exporting identity…", move || {
+            let armored = match filesec_core::keystore::export_identity_armored(
+                &identity,
+                pass.as_bytes(),
+                KdfParams::default(),
+            ) {
+                Ok(a) => a,
+                Err(e) => return JobReport::err(e.to_string()),
+            };
+            match write_private_export(&target, armored.as_bytes()) {
+                Ok(()) => JobReport::ok(
+                    Outcome::ExportIdentityDone,
+                    format!("Identity backup saved to {}", target.display()),
+                ),
+                Err(e) => JobReport::err(e),
+            }
+        });
+    }
+
+    /// Restore an identity from a `.fsecid` backup on first run: decrypt the
+    /// backup with its passphrase, then seal it into this device's keystore under
+    /// a new local passphrase and drop straight into the unlocked session.
+    fn spawn_restore_identity(&mut self, ctx: &egui::Context) {
+        let (path, backup_pass, new_pass) = match &mut self.state {
+            State::FirstRun(f) => match &mut f.restore {
+                Some(r) => {
+                    if r.backup_pass.is_empty() {
+                        r.error = Some("Enter the backup's passphrase.".into());
+                        return;
+                    }
+                    if r.new_pass.chars().count() < 8 {
+                        r.error = Some("New passphrase must be at least 8 characters.".into());
+                        return;
+                    }
+                    if r.new_pass != r.new_pass2 {
+                        r.error = Some("New passphrases do not match.".into());
+                        return;
+                    }
+                    r.error = None;
+                    r.new_pass2.zeroize();
+                    (
+                        r.path.clone(),
+                        Zeroizing::new(std::mem::take(&mut r.backup_pass)),
+                        Zeroizing::new(std::mem::take(&mut r.new_pass)),
+                    )
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        let store = match self.store_arc() {
+            Some(s) => s,
+            None => return,
+        };
+        self.spawn_job(ctx, "Restoring identity…", move || {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::FirstRunFailed(format!("Could not read backup: {e}")),
+                        toast: None,
+                    }
+                }
+            };
+            let identity =
+                match filesec_core::keystore::import_identity_armored(&text, backup_pass.as_bytes())
+                {
+                    Ok(i) => i,
+                    Err(filesec_core::error::Error::BadPassphrase) => {
+                        return JobReport {
+                            outcome: Outcome::FirstRunFailed(
+                                "The backup passphrase is incorrect.".into(),
+                            ),
+                            toast: None,
+                        }
+                    }
+                    Err(e) => {
+                        return JobReport {
+                            outcome: Outcome::FirstRunFailed(format!(
+                                "This file isn't a valid FileSec identity backup ({e})."
+                            )),
+                            toast: None,
+                        }
+                    }
+                };
+            let ks = match KeystoreFile::create(&identity, new_pass.as_bytes(), KdfParams::default())
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::FirstRunFailed(e.to_string()),
+                        toast: None,
+                    }
+                }
+            };
+            if let Err(e) = store.save_keystore(&ks) {
+                return JobReport {
+                    outcome: Outcome::FirstRunFailed(e),
+                    toast: None,
+                };
+            }
+            let data_dir = store.data_dir().display().to_string();
+            JobReport::ok(
+                Outcome::Unlocked(Box::new(SessionInit {
+                    identity,
+                    contacts: ContactBook::default(),
+                    registry: Registry::default(),
+                    passkeys: Vec::new(),
+                    auto_unlock: false,
+                    data_dir,
+                })),
+                "Identity restored. It's now protected by your new passphrase on this device.",
+            )
+        });
+    }
 }
 
 /// Re-open a freshly-saved vault (metadata only), refresh its registry entry,
@@ -3023,34 +3284,81 @@ fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>
         );
         ui.add_space(18.0);
 
-        theme::card(ui, |ui| {
-            field_label(ui, "Display name");
-            theme::text_input(ui, &mut f.name, "e.g. Alice", false);
-            ui.add_space(10.0);
-            field_label(ui, "Passphrase");
-            theme::text_input(ui, &mut f.pass, "At least 8 characters", true);
-            ui.add_space(10.0);
-            field_label(ui, "Confirm passphrase");
-            theme::text_input(ui, &mut f.pass2, "Repeat passphrase", true);
-            ui.add_space(14.0);
-            if let Some(e) = &f.error {
-                ui.colored_label(c.err, e);
-                ui.add_space(10.0);
+        match &mut f.restore {
+            // Restore-from-backup flow: a `.fsecid` file has been picked.
+            Some(r) => {
+                theme::card(ui, |ui| {
+                    ui.label(RichText::new("Restore from a backup").size(16.0).strong());
+                    ui.label(
+                        RichText::new(format!(
+                            "Restoring from {}",
+                            r.path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| r.path.display().to_string())
+                        ))
+                        .color(c.text_muted)
+                        .small(),
+                    );
+                    ui.add_space(12.0);
+                    field_label(ui, "Backup passphrase");
+                    theme::text_input(ui, &mut r.backup_pass, "Passphrase that protects the backup", true);
+                    ui.add_space(10.0);
+                    field_label(ui, "New passphrase for this device");
+                    theme::text_input(ui, &mut r.new_pass, "At least 8 characters", true);
+                    ui.add_space(10.0);
+                    field_label(ui, "Confirm new passphrase");
+                    theme::text_input(ui, &mut r.new_pass2, "Repeat new passphrase", true);
+                    ui.add_space(14.0);
+                    if let Some(e) = &r.error {
+                        ui.colored_label(c.err, e);
+                        ui.add_space(10.0);
+                    }
+                    if theme::primary_button_full(ui, "Restore identity").clicked() {
+                        *action = Some(Action::DoRestore);
+                    }
+                    ui.add_space(6.0);
+                    if theme::secondary_button_full(ui, "Cancel").clicked() {
+                        *action = Some(Action::CancelRestore);
+                    }
+                });
             }
-            if theme::primary_button_full(ui, "Create identity").clicked() {
-                *action = Some(Action::CreateIdentity);
-            }
-        });
+            // Default: create a brand-new identity.
+            None => {
+                theme::card(ui, |ui| {
+                    field_label(ui, "Display name");
+                    theme::text_input(ui, &mut f.name, "e.g. Alice", false);
+                    ui.add_space(10.0);
+                    field_label(ui, "Passphrase");
+                    theme::text_input(ui, &mut f.pass, "At least 8 characters", true);
+                    ui.add_space(10.0);
+                    field_label(ui, "Confirm passphrase");
+                    theme::text_input(ui, &mut f.pass2, "Repeat passphrase", true);
+                    ui.add_space(14.0);
+                    if let Some(e) = &f.error {
+                        ui.colored_label(c.err, e);
+                        ui.add_space(10.0);
+                    }
+                    if theme::primary_button_full(ui, "Create identity").clicked() {
+                        *action = Some(Action::CreateIdentity);
+                    }
+                    ui.add_space(6.0);
+                    if theme::secondary_button_full(ui, "Restore from a backup…").clicked() {
+                        *action = Some(Action::BeginRestore);
+                    }
+                });
 
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new(
-                "⚠ There is no password recovery. If you forget your passphrase, \
-                 your vaults cannot be opened.",
-            )
-            .color(c.warn)
-            .small(),
-        );
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(
+                        "⚠ There is no password recovery. If you forget your passphrase, \
+                         your vaults cannot be opened.",
+                    )
+                    .color(c.warn)
+                    .small(),
+                );
+            }
+        }
     });
 }
 
@@ -3160,6 +3468,9 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     }
     if s.auto_unlock_form.is_some() {
         autounlock_window(s, ui.ctx(), action);
+    }
+    if s.export_identity.is_some() {
+        export_identity_window(s, ui.ctx(), action);
     }
 }
 
@@ -3897,6 +4208,35 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
             );
         });
 
+        // Identity backup: a portable, passphrase-encrypted copy of the private
+        // keys, for restoring on another device or after a reinstall.
+        theme::card(ui, |ui| {
+            ui.label(RichText::new("Identity backup").size(16.0).strong());
+            ui.label(
+                RichText::new(
+                    "Save an encrypted backup of your identity so you can restore it on \
+                     another device or after a reinstall. Without a backup, a lost device \
+                     means a lost identity — and everything encrypted to it.",
+                )
+                .color(cc.text_muted)
+                .small(),
+            );
+            ui.add_space(8.0);
+            if theme::primary_button(ui, "Export identity backup…").clicked() {
+                *action = Some(Action::BeginExportIdentity);
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "⚠ The backup file contains your private keys. Protect it with a strong \
+                     passphrase and store it somewhere safe — anyone with the file and its \
+                     passphrase becomes you.",
+                )
+                .color(cc.warn)
+                .small(),
+            );
+        });
+
         // Security keys (passkeys). Shown when this build supports them, or
         // whenever any are already enrolled.
         if passkey::SUPPORTED || !s.passkeys.is_empty() {
@@ -4154,6 +4494,70 @@ fn autounlock_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<A
     });
     if close {
         *action = Some(Action::CancelEnableAutoUnlock);
+    }
+}
+
+/// The "Export identity backup" dialog: choose a backup passphrase to seal the
+/// `.fsecid` file (independent of the daily passphrase).
+fn export_identity_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let form = match &mut s.export_identity {
+        Some(f) => f,
+        None => return,
+    };
+    let (close, ()) = theme::modal(ctx, "Export identity backup", |ui| {
+        let c = theme::colors(ui);
+        ui.label(
+            "Choose a passphrase to protect this backup. You'll need it (not your \
+             everyday passphrase) to restore the identity later, so it can differ from \
+             the one you use day to day.",
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "The backup file holds your private keys. Anyone with the file and this \
+                 passphrase becomes you — keep both safe.",
+            )
+            .color(c.warn)
+            .small(),
+        );
+        ui.add_space(10.0);
+        egui::Grid::new("export_identity_grid")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Backup passphrase");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.pass)
+                        .password(true)
+                        .hint_text("At least 8 characters")
+                        .desired_width(240.0),
+                );
+                ui.end_row();
+                ui.label("Confirm passphrase");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.pass2)
+                        .password(true)
+                        .hint_text("Repeat passphrase")
+                        .desired_width(240.0),
+                );
+                ui.end_row();
+            });
+        if let Some(e) = &form.error {
+            ui.add_space(4.0);
+            ui.colored_label(c.err, e);
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Choose file & export…").clicked() {
+                *action = Some(Action::DoExportIdentity);
+            }
+            if theme::secondary_button(ui, "Cancel").clicked() {
+                *action = Some(Action::CancelExportIdentity);
+            }
+        });
+    });
+    if close {
+        *action = Some(Action::CancelExportIdentity);
     }
 }
 
@@ -5221,6 +5625,22 @@ mod ui_smoke {
         frame(&ctx, |ui| vaults_ui(&mut s, ui, &mut action));
         frame(&ctx, |ui| contacts_ui(&mut s, ui, &mut action));
         frame(&ctx, |ui| identity_ui(&mut s, ui, &mut action));
+        // First-run "restore from a backup" card (a backup file has been picked).
+        let mut fr = FirstRun::default();
+        fr.restore = Some(RestoreForm {
+            path: "/tmp/alice.fsecid".into(),
+            backup_pass: String::new(),
+            new_pass: String::new(),
+            new_pass2: String::new(),
+            error: Some("The backup passphrase is incorrect.".into()),
+        });
+        frame(&ctx, |ui| first_run_ui(&mut fr, ui, &mut action));
+        // The "export identity backup" modal owns the whole context.
+        s.export_identity = Some(ExportIdentityForm::default());
+        ctx.begin_pass(egui::RawInput::default());
+        export_identity_window(&mut s, &ctx, &mut action);
+        let _ = ctx.end_pass();
+        s.export_identity = None;
         // The novel painter path: icon-font glyphs drawn directly.
         frame(&ctx, |ui| {
             sidebar_nav_item(ui, crate::theme::icon::VAULT, "Vaults", true);

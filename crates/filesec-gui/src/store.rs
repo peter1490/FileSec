@@ -632,6 +632,18 @@ impl Store {
     }
 }
 
+/// Write `contents` to a user-chosen `path` with owner-only permissions (0600
+/// where the OS supports it) from the outset, so an exported secret (e.g. an
+/// identity backup) never briefly exists with loose permissions. Truncates any
+/// existing file at `path`.
+pub fn write_private_export(path: &Path, contents: &[u8]) -> StoreResult<()> {
+    use std::io::Write;
+    let mut f = open_private_create(path)?;
+    f.write_all(contents).map_err(err)?;
+    f.flush().map_err(err)?;
+    Ok(())
+}
+
 /// Generate a fresh random vault id (hex of 16 random bytes).
 pub fn new_vault_id() -> String {
     let bytes = filesec_core::secret::random_vec(16).unwrap_or_else(|_| vec![0u8; 16]);

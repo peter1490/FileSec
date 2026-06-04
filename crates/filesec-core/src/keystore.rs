@@ -43,6 +43,17 @@ const VERSION_V2: u16 = 2;
 /// discriminator between the two formats.
 const MAGIC_V2: &[u8; 4] = b"FSK\x1a";
 
+/// Magic preamble identifying a portable identity backup (see
+/// [`export_identity_armored`]). Distinct from [`MAGIC_V2`] so a backup blob and
+/// a live keystore can never be mistaken for one another.
+const MAGIC_BACKUP: &[u8; 4] = b"FSB\x1a";
+/// Backup format version, framed after [`MAGIC_BACKUP`].
+const VERSION_BACKUP_V1: u16 = 1;
+/// ASCII-armor delimiters for an exported identity backup, matching the
+/// `.fsecpub` armor style so the file is human-identifiable and email-safe.
+const BACKUP_ARMOR_BEGIN: &str = "-----BEGIN FILESEC IDENTITY BACKUP-----";
+const BACKUP_ARMOR_END: &str = "-----END FILESEC IDENTITY BACKUP-----";
+
 /// Salt length for Argon2id.
 const SALT_LEN: usize = 16;
 /// Length of the `hmac-secret` salt fed to the authenticator and of the 32-byte
@@ -57,6 +68,9 @@ const AAD_BUNDLE_V2: &[u8] = b"FileSec keystore v2 bundle";
 /// Base AEAD associated data for a v2 DEK wrap. Each slot extends it with
 /// slot-identifying material (see [`passphrase_wrap_aad`]/[`passkey_wrap_aad`]).
 const WRAP_AAD_V2: &[u8] = b"FileSec keystore v2 dek-wrap";
+/// AEAD associated data binding a portable identity backup — distinct from every
+/// keystore AAD so a backup ciphertext can never be reinterpreted as a keystore.
+const AAD_BACKUP_V1: &[u8] = b"FileSec identity backup v1";
 /// Domain-separation context deriving a passkey slot's key-encryption key from
 /// the authenticator's `hmac-secret` output.
 const PASSKEY_KEK_CONTEXT: &str = "FileSec passkey keyslot v1";
@@ -277,6 +291,136 @@ impl KeystoreV1 {
         let bundle: SecretBundle = codec::from_slice(&plaintext)?;
         Ok(bundle_into_identity(bundle))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Portable identity backup
+// ---------------------------------------------------------------------------
+
+/// A portable, passphrase-encrypted backup of a private identity. Structurally a
+/// v1-style sealing (Argon2id key + XChaCha20-Poly1305 over the [`SecretBundle`]),
+/// but bound under [`AAD_BACKUP_V1`] and framed behind [`MAGIC_BACKUP`] so it is
+/// unambiguously a backup, never a live keystore. It carries **no passkey slots**
+/// — a backup restores anywhere with just its passphrase.
+#[derive(Serialize, Deserialize)]
+struct IdentityBackupV1 {
+    version: u16,
+    kdf: KdfParams,
+    salt: Vec<u8>,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+/// Produce a portable, passphrase-encrypted, ASCII-armored backup of `identity`.
+///
+/// The private keys (including the ML-DSA/ML-KEM seeds of a hybrid identity) are
+/// serialized and sealed under a key derived from `passphrase` via Argon2id — the
+/// plaintext never touches disk. The result is base64 wrapped in
+/// `-----BEGIN FILESEC IDENTITY BACKUP-----` armor, suitable for saving to a
+/// `.fsecid` file, printing, or pasting. Restore it later with
+/// [`import_identity_armored`].
+///
+/// The backup is only as safe as `passphrase`: anyone with the file and the
+/// passphrase recovers the full identity.
+pub fn export_identity_armored(
+    identity: &Identity,
+    passphrase: &[u8],
+    params: KdfParams,
+) -> Result<String> {
+    let salt = secret::random_vec(SALT_LEN)?;
+    let master = kdf::derive_master_key(passphrase, &salt, params)?;
+    let nonce = secret::random_vec(aead::NONCE_LEN)?;
+    let bundle = build_bundle(identity);
+    let plaintext = Zeroizing::new(codec::to_vec(&bundle)?);
+    let ciphertext = aead::seal(&master, &nonce, AAD_BACKUP_V1, &plaintext)?;
+    let backup = IdentityBackupV1 {
+        version: VERSION_BACKUP_V1,
+        kdf: params,
+        salt,
+        nonce,
+        ciphertext,
+    };
+
+    let body = codec::to_vec(&backup)?;
+    let mut framed = Vec::with_capacity(MAGIC_BACKUP.len() + 2 + body.len());
+    framed.extend_from_slice(MAGIC_BACKUP);
+    framed.extend_from_slice(&VERSION_BACKUP_V1.to_be_bytes());
+    framed.extend_from_slice(&body);
+
+    let b64 = data_encoding::BASE64.encode(&framed);
+    let mut out = String::new();
+    out.push_str(BACKUP_ARMOR_BEGIN);
+    out.push('\n');
+    for line in b64.as_bytes().chunks(64) {
+        // chunks of base64 are valid ASCII by construction.
+        out.push_str(&String::from_utf8_lossy(line));
+        out.push('\n');
+    }
+    out.push_str(BACKUP_ARMOR_END);
+    out.push('\n');
+    Ok(out)
+}
+
+/// Parse an armored identity backup (as produced by [`export_identity_armored`])
+/// and decrypt it with `passphrase`, reconstructing the [`Identity`].
+///
+/// Tolerant of surrounding whitespace and the armor lines being present or not. A
+/// wrong passphrase (or any tampering) surfaces as [`Error::BadPassphrase`]; input
+/// that isn't a FileSec identity backup surfaces as [`Error::Format`].
+pub fn import_identity_armored(text: &str, passphrase: &[u8]) -> Result<Identity> {
+    // De-armor: collect the base64 body between the delimiters, ignoring the
+    // armor lines and surrounding whitespace.
+    let mut body = String::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == BACKUP_ARMOR_BEGIN {
+            in_block = true;
+            continue;
+        }
+        if trimmed == BACKUP_ARMOR_END {
+            break;
+        }
+        if in_block {
+            body.push_str(trimmed);
+        }
+    }
+    // Be forgiving if the armor delimiters were stripped (e.g. by a chat client):
+    // fall back to treating all non-delimiter lines as the base64 body.
+    if body.is_empty() {
+        body = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+            .collect();
+    }
+    if body.is_empty() {
+        return Err(Error::Format("no identity backup found"));
+    }
+    let framed = data_encoding::BASE64
+        .decode(body.as_bytes())
+        .or_else(|_| data_encoding::BASE64_NOPAD.decode(body.as_bytes()))
+        .map_err(|_| Error::Format("invalid base64 in identity backup"))?;
+
+    if framed.len() < MAGIC_BACKUP.len() + 2 || &framed[..MAGIC_BACKUP.len()] != MAGIC_BACKUP {
+        return Err(Error::Format("not a FileSec identity backup"));
+    }
+    let version = u16::from_be_bytes([framed[MAGIC_BACKUP.len()], framed[MAGIC_BACKUP.len() + 1]]);
+    if version != VERSION_BACKUP_V1 {
+        return Err(Error::Format("unsupported identity backup version"));
+    }
+    let backup: IdentityBackupV1 = codec::from_slice(&framed[MAGIC_BACKUP.len() + 2..])?;
+    if backup.version != VERSION_BACKUP_V1 {
+        return Err(Error::Format("identity backup version mismatch"));
+    }
+
+    let master = kdf::derive_master_key(passphrase, &backup.salt, backup.kdf)?;
+    let plaintext = Zeroizing::new(
+        aead::open(&master, &backup.nonce, AAD_BACKUP_V1, &backup.ciphertext)
+            .map_err(|_| Error::BadPassphrase)?,
+    );
+    let bundle: SecretBundle = codec::from_slice(&plaintext)?;
+    Ok(bundle_into_identity(bundle))
 }
 
 // ---------------------------------------------------------------------------
@@ -636,5 +780,97 @@ mod tests {
         assert!(ks.unlock_with_passkey(0, &secret).is_err());
         // The independent passphrase slot still opens it.
         assert_eq!(ks.unlock(b"pw").unwrap().fingerprint(), id.fingerprint());
+    }
+
+    fn fast_params() -> KdfParams {
+        KdfParams {
+            m_cost: 8 * 1024,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
+    /// An exported backup decrypts back to the same identity (same fingerprint,
+    /// name, and creation time) under the export passphrase.
+    #[test]
+    fn identity_backup_round_trips() {
+        let id = Identity::generate("Alice", 1234).unwrap();
+        let armored = export_identity_armored(&id, b"backup-pass", fast_params()).unwrap();
+        assert!(armored.contains(BACKUP_ARMOR_BEGIN));
+        let restored = import_identity_armored(&armored, b"backup-pass").unwrap();
+        assert_eq!(restored.fingerprint(), id.fingerprint());
+        assert_eq!(restored.name, "Alice");
+        assert_eq!(restored.created_at, 1234);
+    }
+
+    /// A hybrid identity's post-quantum seeds survive the backup round-trip, so
+    /// the restored identity keeps the same (PQC-folded) fingerprint.
+    #[cfg(feature = "pqc")]
+    #[test]
+    fn hybrid_identity_backup_round_trips() {
+        let id = Identity::generate_hybrid("Bob", 99).unwrap();
+        assert!(id.is_hybrid_capable());
+        let armored = export_identity_armored(&id, b"backup-pass", fast_params()).unwrap();
+        let restored = import_identity_armored(&armored, b"backup-pass").unwrap();
+        assert!(restored.is_hybrid_capable());
+        assert_eq!(restored.fingerprint(), id.fingerprint());
+    }
+
+    /// The wrong export passphrase is rejected as [`Error::BadPassphrase`].
+    #[test]
+    fn identity_backup_rejects_wrong_passphrase() {
+        let id = Identity::generate("Alice", 0).unwrap();
+        let armored = export_identity_armored(&id, b"right-pass", fast_params()).unwrap();
+        assert!(matches!(
+            import_identity_armored(&armored, b"wrong-pass"),
+            Err(Error::BadPassphrase)
+        ));
+    }
+
+    /// Flipping a byte of the ciphertext makes the AEAD reject it (tamper-evident).
+    #[test]
+    fn identity_backup_detects_tampering() {
+        let id = Identity::generate("Alice", 0).unwrap();
+        let armored = export_identity_armored(&id, b"backup-pass", fast_params()).unwrap();
+        // Decode, flip a ciphertext byte, re-encode, and confirm it no longer opens.
+        let body: String = armored
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let mut framed = data_encoding::BASE64.decode(body.as_bytes()).unwrap();
+        let last = framed.len() - 1;
+        framed[last] ^= 0x01;
+        let tampered = format!(
+            "{BACKUP_ARMOR_BEGIN}\n{}\n{BACKUP_ARMOR_END}\n",
+            data_encoding::BASE64.encode(&framed)
+        );
+        assert!(import_identity_armored(&tampered, b"backup-pass").is_err());
+    }
+
+    /// A backup and a live keystore are distinct artifacts: neither parser accepts
+    /// the other's bytes (distinct magic / AAD domain separation).
+    #[test]
+    fn backup_and_keystore_are_not_interchangeable() {
+        let id = Identity::generate("Alice", 0).unwrap();
+        let armored = export_identity_armored(&id, b"pw", fast_params()).unwrap();
+
+        // A backup blob is not a keystore.
+        let body: String = armored
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let backup_bytes = data_encoding::BASE64.decode(body.as_bytes()).unwrap();
+        assert!(KeystoreFile::from_bytes(&backup_bytes).is_err());
+
+        // A keystore is not a backup (feed its base64 to the backup parser).
+        let ks = KeystoreFile::create(&id, b"pw", fast_params()).unwrap();
+        let ks_armored = format!(
+            "{BACKUP_ARMOR_BEGIN}\n{}\n{BACKUP_ARMOR_END}\n",
+            data_encoding::BASE64.encode(&ks.to_bytes().unwrap())
+        );
+        assert!(matches!(
+            import_identity_armored(&ks_armored, b"pw"),
+            Err(Error::Format(_))
+        ));
     }
 }
