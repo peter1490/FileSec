@@ -9,6 +9,12 @@ rust-version.workspace = true
 
 [features]
 default = []
+# Direct peer-to-peer network transfer: the authenticated, forward-secret
+# handshake + AEAD record layer in `transport.rs`. Built entirely from the
+# primitives already present (X25519 / Ed25519 / BLAKE3 / XChaCha20-Poly1305), so
+# it pulls **no new dependencies**. The sockets, NAT mapping, and UI live in
+# filesec-gui behind its own `net` feature; this crate stays transport-agnostic.
+net = []
 # Post-quantum opt-in (Phase 5). Enables the additional algorithm suites:
 #   * 0x0002 — AES-256-GCM (classical X25519/Ed25519, AES bulk cipher)
 #   * 0x0101 — Hybrid X25519+ML-KEM-768 KEM and Ed25519+ML-DSA-65 signatures

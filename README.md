@@ -1,14 +1,17 @@
 # FileSec
 
-A native, **offline** desktop app for securely exchanging files between parties
-using public/private-key cryptography. Built in pure Rust (egui), with no
-webview, no JavaScript, and no network.
+A native desktop app for securely exchanging files between parties using
+public/private-key cryptography. Built in pure Rust (egui), with no webview and
+no JavaScript. The **standard build is fully offline**; an optional **networking
+build** adds direct, server-less peer-to-peer transfer to a verified contact
+(see [Direct transfer](#direct-transfer-networking-build)).
 
 The core idea is a **secure vault** — a container holding arbitrary files and
 folders, fully managed through the app. A vault is exported as a single portable
 encrypted file (`.fsec`) that you send to a recipient over any channel (email,
-cloud, USB). Only the intended recipients — selected by their public key — can
-open it.
+cloud, USB) — or hand straight to a verified contact over the network with the
+networking build. Only the intended recipients — selected by their public key —
+can open it.
 
 > **Status: MVP + opt-in PQC & passkeys, with signed installers.** The classical
 > crypto suite, vault management, in-place editing, and the full
@@ -335,6 +338,56 @@ One egui codebase targets Windows, macOS, and Linux from a single source. The
 default `glow` (OpenGL) backend is the most portable. On Linux, the windowing
 stack needs system libraries (X11/Wayland + OpenGL); install your distro's
 development packages for those.
+
+---
+
+## Direct transfer (networking build)
+
+The **networking build** (`filesec-pqc`, or any build compiled with
+`--features net`) adds an optional way to hand a vault straight to a contact over
+the network — **no relay or rendezvous server in between**. The standard
+`filesec` build links no networking code at all.
+
+How it works:
+
+- The **receiver** opens *listen mode*. By default it's reachable only on the
+  local network; an *internet* toggle additionally asks the router to open a port
+  via **NAT-PMP** (a small, vendored, dependency-free client) and shows the public
+  address. If the router doesn't speak NAT-PMP, the receiver stays reachable on
+  the LAN and tells you so. The public address comes from the gateway itself — no
+  third-party "what is my IP" service is contacted.
+- The **sender** picks a **verified contact**, enters the address, and types the
+  one-time **pairing code** the receiver is showing.
+- The vault travels as the usual signed, recipient-encrypted `.fsec` *inside* an
+  authenticated, forward-secret channel, and lands through the same
+  verify-the-signature-then-import path as a file you'd import by hand.
+
+Security model:
+
+- **Only verified contacts.** A transfer completes only between two identities
+  that each hold the other as a verified contact. The live peer is bound to the
+  same BLAKE3 **safety number** you already compare out-of-band — so reaching the
+  right IP but the wrong identity aborts.
+- **Mutual authentication + forward secrecy.** The handshake is a SIGMA-I
+  construction (as in Noise-IK / IKEv2) built only from FileSec's own primitives
+  (X25519 + Ed25519 + BLAKE3 + XChaCha20-Poly1305): ephemeral keys give forward
+  secrecy, Ed25519 signatures over the transcript authenticate each side, and
+  identities are revealed only under the session key.
+- **Pairing code as a second factor.** The one-time code is folded into the
+  signed handshake transcript and the session keys, so a wrong code makes the
+  channel fail to form. It's a *layered* second factor on top of the public-key
+  identity gate, not a standalone authenticator — a short numeric code is low
+  entropy and, against an attacker who already controls a valid verified identity,
+  guessable; the identity check remains the real protection.
+- **Defense in depth.** Even if the channel were broken, the payload is still the
+  end-to-end-sealed, signed `.fsec` that only the recipient can open.
+
+What it does **not** protect against (documented, not hidden): traffic analysis
+(record sizes and timing reveal the file-size class), the receiver's address
+being learned by anyone who connects, denial-of-service from unauthenticated
+dialers (mitigated by handshake timeouts and a single-listener model), and
+endpoint compromise. Internet mode also genuinely won't work behind carrier-grade
+or double NAT — fall back to the LAN, a manual port-forward, or a VPN.
 
 ---
 

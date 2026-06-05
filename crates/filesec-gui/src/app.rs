@@ -210,6 +210,8 @@ enum Nav {
     Vaults,
     Contacts,
     Identity,
+    #[cfg(feature = "net")]
+    Transfer,
 }
 
 /// Sort order for the in-vault file browser. Directories always sort before
@@ -388,6 +390,9 @@ struct Session {
     /// The open "export identity backup" dialog, if any.
     export_identity: Option<ExportIdentityForm>,
     data_dir: String,
+    /// Direct network-transfer state (the `net` feature).
+    #[cfg(feature = "net")]
+    transfer: TransferState,
 }
 
 impl Session {
@@ -437,6 +442,8 @@ impl Session {
             auto_unlock_form: None,
             export_identity: None,
             data_dir,
+            #[cfg(feature = "net")]
+            transfer: TransferState::default(),
         }
     }
 
@@ -494,6 +501,63 @@ impl TextEditor {
         self.content.zeroize();
         self.original.zeroize();
     }
+}
+
+/// All direct-transfer UI state (the `net` feature): the running transfer, if
+/// any, plus the receive/send form fields. Lives in the [`Session`] so it
+/// survives navigation and is torn down (stopping the worker) when the session
+/// drops on lock or exit.
+#[cfg(feature = "net")]
+#[derive(Default)]
+struct TransferState {
+    /// The running listener or sender, if any.
+    active: Option<ActiveTransfer>,
+    // Receive form.
+    recv_contact: Option<String>, // hex fingerprint of the designated sender
+    recv_internet: bool,
+    recv_port: String,
+    // Send form.
+    send_contact: Option<String>, // hex fingerprint of the chosen verified contact
+    send_host: String,
+    send_port: String,
+    send_pairing: String,
+    send_vault: Option<String>, // vault id to send
+}
+
+/// A running transfer and the UI view of its progress.
+#[cfg(feature = "net")]
+struct ActiveTransfer {
+    handle: crate::net::NetHandle,
+    kind: ActiveKind,
+    status: String,
+    listen: Option<ListenView>,
+    peer: Option<String>,
+    offer: Option<OfferView>,
+    progress: Option<(u64, u64)>,
+}
+
+#[cfg(feature = "net")]
+#[derive(PartialEq, Clone, Copy)]
+enum ActiveKind {
+    Receive,
+    Send,
+}
+
+/// The listening address(es) + pairing code shown to the user in receive mode.
+#[cfg(feature = "net")]
+struct ListenView {
+    lan_addr: String,
+    public_addr: Option<String>,
+    nat: String,
+    pairing_code: String,
+}
+
+/// A pending incoming offer awaiting the user's accept/reject.
+#[cfg(feature = "net")]
+struct OfferView {
+    filename: String,
+    size: u64,
+    sender: String,
 }
 
 /// Deferred mutations collected during rendering.
@@ -629,6 +693,24 @@ enum Action {
     ConfirmEnableAutoUnlock,
     /// Forget the passphrase saved in the OS keychain for this device.
     DisableAutoUnlock,
+    /// Start listening to receive a transfer.
+    #[cfg(feature = "net")]
+    StartListen,
+    /// Stop the active listener.
+    #[cfg(feature = "net")]
+    StopTransfer,
+    /// Start sending the chosen vault to the chosen verified contact.
+    #[cfg(feature = "net")]
+    StartSend,
+    /// Accept the pending incoming offer.
+    #[cfg(feature = "net")]
+    AcceptIncoming,
+    /// Reject the pending incoming offer.
+    #[cfg(feature = "net")]
+    RejectIncoming,
+    /// Cancel an in-progress transfer.
+    #[cfg(feature = "net")]
+    CancelTransfer,
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +884,9 @@ impl eframe::App for App {
                 self.apply(report);
             }
         }
+        // Drain any direct-transfer events (independent of the one-shot job slot).
+        #[cfg(feature = "net")]
+        self.poll_transfer(ctx);
         let busy = self.job.is_some();
         let mut action: Option<Action> = None;
 
@@ -931,6 +1016,8 @@ impl App {
             nav_item(ui, theme::icon::VAULT, "Vaults", Nav::Vaults);
             nav_item(ui, theme::icon::CONTACTS, "Contacts", Nav::Contacts);
             nav_item(ui, theme::icon::IDENTITY, "My Identity", Nav::Identity);
+            #[cfg(feature = "net")]
+            nav_item(ui, theme::icon::SEND, "Transfer", Nav::Transfer);
 
             // Bottom-pinned: theme controls and Lock.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -1268,6 +1355,22 @@ impl App {
                 };
                 self.toast = None;
             }
+            #[cfg(feature = "net")]
+            Action::StartListen => self.start_listen(ctx),
+            #[cfg(feature = "net")]
+            Action::StopTransfer => self.stop_transfer(),
+            #[cfg(feature = "net")]
+            Action::StartSend => self.start_send(ctx),
+            #[cfg(feature = "net")]
+            Action::AcceptIncoming => {
+                self.transfer_command(crate::net::NetCommand::AcceptOffer, true)
+            }
+            #[cfg(feature = "net")]
+            Action::RejectIncoming => {
+                self.transfer_command(crate::net::NetCommand::RejectOffer, true)
+            }
+            #[cfg(feature = "net")]
+            Action::CancelTransfer => self.transfer_command(crate::net::NetCommand::Cancel, false),
             Action::DismissToast => self.toast = None,
             Action::DismissImportInfo => {
                 if let State::Unlocked(s) = &mut self.state {
@@ -1640,12 +1743,12 @@ impl App {
             None => return,
         };
         self.spawn_job(ctx, "Creating identity…", move || {
-            // With the `pqc` feature the new identity is hybrid (classical keys
-            // plus ML-DSA-65 / ML-KEM-768), so it can use any suite; otherwise it
-            // is classical. Either way the keystore persists exactly what exists.
-            #[cfg(feature = "pqc")]
-            let generated = Identity::generate_hybrid(&name, now_unix());
-            #[cfg(not(feature = "pqc"))]
+            // New identities are always **classical** by default — even in a build
+            // that has the post-quantum suites compiled in. Going post-quantum is an
+            // explicit, opt-in step via "Upgrade to post-quantum" in My Identity
+            // (which keeps the same X25519/Ed25519 keys and adds the lattice keys).
+            // This keeps a fresh identity's safety number stable and predictable and
+            // avoids pushing the larger hybrid identity on everyone.
             let generated = Identity::generate(&name, now_unix());
             let identity = match generated {
                 Ok(i) => i,
@@ -3945,6 +4048,703 @@ fn sidebar_nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool)
     resp
 }
 
+// ---------------------------------------------------------------------------
+// Direct network transfer (the `net` feature)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "net")]
+impl App {
+    /// Drain transfer events from the worker and apply them; keep the UI repainting
+    /// while a transfer is live so progress stays current.
+    fn poll_transfer(&mut self, ctx: &egui::Context) {
+        let active = matches!(&self.state, State::Unlocked(s) if s.transfer.active.is_some());
+        if !active {
+            return;
+        }
+        let mut events = Vec::new();
+        if let State::Unlocked(s) = &self.state {
+            if let Some(t) = &s.transfer.active {
+                while let Some(event) = t.handle.try_recv() {
+                    events.push(event);
+                }
+            }
+        }
+        for event in events {
+            self.apply_net_event(event);
+        }
+        if matches!(&self.state, State::Unlocked(s) if s.transfer.active.is_some()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Apply one transfer event to the session state (and toasts / registry).
+    fn apply_net_event(&mut self, event: crate::net::NetEvent) {
+        use crate::net::{NatStatus, NetEvent};
+
+        // A completed receive updates the registry (needs store + identity) + toasts.
+        if let NetEvent::Received {
+            meta,
+            file_count,
+            sender_name,
+        } = &event
+        {
+            if let (Some(store), Some(identity)) = (self.store_arc(), self.ident_arc()) {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.registry.upsert(meta.clone());
+                    let _ = store.save_registry(&identity, &s.registry);
+                    if let Some(t) = &mut s.transfer.active {
+                        t.progress = None;
+                        t.offer = None;
+                        t.status = "Listening for the next transfer…".into();
+                    }
+                }
+            }
+            let who = sender_name
+                .clone()
+                .unwrap_or_else(|| "a verified contact".into());
+            self.set_toast(
+                format!(
+                    "Received \u{201c}{}\u{201d} from {who} ({file_count} file(s)).",
+                    meta.name
+                ),
+                false,
+            );
+            return;
+        }
+
+        let mut toast: Option<(String, bool)> = None;
+        if let State::Unlocked(s) = &mut self.state {
+            match event {
+                NetEvent::Listening {
+                    lan_addr,
+                    public_addr,
+                    nat,
+                    pairing_code,
+                } => {
+                    let nat = match nat {
+                        NatStatus::Disabled => "Local network only.".to_string(),
+                        NatStatus::Mapped => "Router port opened.".to_string(),
+                        NatStatus::Unavailable(m) => format!(
+                            "Couldn't open a router port ({m}). You're still reachable on your local network."
+                        ),
+                    };
+                    if let Some(t) = &mut s.transfer.active {
+                        t.status = "Listening".into();
+                        t.listen = Some(ListenView {
+                            lan_addr,
+                            public_addr,
+                            nat,
+                            pairing_code,
+                        });
+                    }
+                }
+                NetEvent::Connecting => {
+                    if let Some(t) = &mut s.transfer.active {
+                        t.status = "Connecting…".into();
+                    }
+                }
+                NetEvent::PeerConnected {
+                    fpr_hex,
+                    name,
+                    verified,
+                } => {
+                    if let Some(t) = &mut s.transfer.active {
+                        let who = name
+                            .unwrap_or_else(|| format!("{}…", &fpr_hex[..fpr_hex.len().min(16)]));
+                        t.peer = Some(if verified {
+                            format!("{who} (verified)")
+                        } else {
+                            format!("{who} (unverified)")
+                        });
+                        t.status = "Connected".into();
+                    }
+                }
+                NetEvent::Offer {
+                    filename,
+                    size,
+                    sender_name,
+                    verified: _,
+                } => {
+                    if let Some(t) = &mut s.transfer.active {
+                        t.offer = Some(OfferView {
+                            filename,
+                            size,
+                            sender: sender_name.unwrap_or_else(|| "a verified contact".into()),
+                        });
+                    }
+                }
+                NetEvent::Progress { done, total } => {
+                    if let Some(t) = &mut s.transfer.active {
+                        t.progress = Some((done, total));
+                    }
+                }
+                NetEvent::Sent { vault_name } => {
+                    toast = Some((format!("Sent \u{201c}{vault_name}\u{201d}."), false));
+                    s.transfer.active = None;
+                }
+                NetEvent::Declined => {
+                    toast = Some(("The receiver declined the transfer.".into(), true));
+                    s.transfer.active = None;
+                }
+                NetEvent::Error(msg) => {
+                    let is_send = s
+                        .transfer
+                        .active
+                        .as_ref()
+                        .is_some_and(|a| a.kind == ActiveKind::Send);
+                    toast = Some((msg, true));
+                    if is_send {
+                        s.transfer.active = None;
+                    } else if let Some(t) = &mut s.transfer.active {
+                        t.offer = None;
+                        t.progress = None;
+                        t.status = "Listening for the next transfer…".into();
+                    }
+                }
+                NetEvent::Stopped => s.transfer.active = None,
+                NetEvent::Received { .. } => {} // handled above
+            }
+        }
+        if let Some((msg, error)) = toast {
+            self.set_toast(msg, error);
+        }
+    }
+
+    /// Begin listening (receive mode).
+    fn start_listen(&mut self, ctx: &egui::Context) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let built = match &self.state {
+            State::Unlocked(s) if s.transfer.active.is_none() => {
+                build_listen_config(&s.transfer, &s.contacts).map(|c| (c, s.contacts.clone()))
+            }
+            _ => return,
+        };
+        let (config, contacts) = match built {
+            Ok(x) => x,
+            Err(msg) => {
+                self.set_toast(msg, true);
+                return;
+            }
+        };
+        let handle = crate::net::start_listener(config, identity, store, contacts, ctx.clone());
+        if let State::Unlocked(s) = &mut self.state {
+            s.transfer.active = Some(ActiveTransfer {
+                handle,
+                kind: ActiveKind::Receive,
+                status: "Starting…".into(),
+                listen: None,
+                peer: None,
+                offer: None,
+                progress: None,
+            });
+        }
+    }
+
+    /// Begin sending (send mode).
+    fn start_send(&mut self, ctx: &egui::Context) {
+        let (store, identity) = match (self.store_arc(), self.ident_arc()) {
+            (Some(s), Some(i)) => (s, i),
+            _ => return,
+        };
+        let built = match &self.state {
+            State::Unlocked(s) if s.transfer.active.is_none() => {
+                build_send_config(&s.transfer, &s.contacts)
+            }
+            _ => return,
+        };
+        let config = match built {
+            Ok(c) => c,
+            Err(msg) => {
+                self.set_toast(msg, true);
+                return;
+            }
+        };
+        let handle = crate::net::start_sender(config, identity, store, ctx.clone());
+        if let State::Unlocked(s) = &mut self.state {
+            s.transfer.active = Some(ActiveTransfer {
+                handle,
+                kind: ActiveKind::Send,
+                status: "Connecting…".into(),
+                listen: None,
+                peer: None,
+                offer: None,
+                progress: None,
+            });
+        }
+    }
+
+    /// Stop the active listener/sender and clear it (the worker unmaps any NAT port).
+    fn stop_transfer(&mut self) {
+        if let State::Unlocked(s) = &mut self.state {
+            if let Some(t) = &mut s.transfer.active {
+                t.handle.stop();
+            }
+            s.transfer.active = None;
+        }
+    }
+
+    /// Forward a command (accept/reject/cancel) to the active transfer.
+    fn transfer_command(&mut self, command: crate::net::NetCommand, clear_offer: bool) {
+        if let State::Unlocked(s) = &mut self.state {
+            if let Some(t) = &mut s.transfer.active {
+                t.handle.send(command);
+                if clear_offer {
+                    t.offer = None;
+                    t.status = "Receiving…".into();
+                }
+            }
+        }
+    }
+}
+
+/// Validate the send form into a [`crate::net::SendConfig`], or a user-facing error.
+/// A comfortable max width for the transfer forms so they neither stretch across a
+/// wide window nor collapse to their content on the left.
+#[cfg(feature = "net")]
+const TRANSFER_COL_W: f32 = 540.0;
+
+/// The user's verified contacts as `(fingerprint_hex, display_name)`.
+#[cfg(feature = "net")]
+fn verified_contacts(s: &Session) -> Vec<(String, String)> {
+    s.contacts
+        .contacts
+        .iter()
+        .filter(|c| c.trust == Trust::Verified)
+        .map(|c| {
+            let name = if c.identity.name.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                c.identity.name.clone()
+            };
+            (hex(&c.fingerprint()), name)
+        })
+        .collect()
+}
+
+/// The display name for the selected `(id, name)` option, or a placeholder.
+#[cfg(feature = "net")]
+fn combo_label(
+    selected: &Option<String>,
+    options: &[(String, String)],
+    placeholder: &str,
+) -> String {
+    selected
+        .as_ref()
+        .and_then(|sel| options.iter().find(|(id, _)| id == sel))
+        .map(|(_, name)| name.clone())
+        .unwrap_or_else(|| placeholder.to_string())
+}
+
+/// A single-line text field with the inset, padded look used across the app.
+#[cfg(feature = "net")]
+fn net_input(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) -> egui::Response {
+    ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .desired_width(width)
+            .margin(egui::Margin::symmetric(10, 7))
+            .font(egui::TextStyle::Body),
+    )
+}
+
+/// Validate the receive form into a [`crate::net::ListenConfig`], or a user-facing error.
+#[cfg(feature = "net")]
+fn build_listen_config(
+    forms: &TransferState,
+    contacts: &ContactBook,
+) -> Result<crate::net::ListenConfig, String> {
+    let fpr_hex = forms
+        .recv_contact
+        .clone()
+        .ok_or_else(|| "Pick the verified contact you expect to receive from.".to_string())?;
+    let contact = contacts
+        .contacts
+        .iter()
+        .find(|c| c.trust == Trust::Verified && hex(&c.fingerprint()) == fpr_hex)
+        .ok_or_else(|| "Pick the verified contact you expect to receive from.".to_string())?;
+    let port = if forms.recv_port.trim().is_empty() {
+        0
+    } else {
+        forms
+            .recv_port
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "Enter a valid port number, or leave it blank for auto.".to_string())?
+    };
+    Ok(crate::net::ListenConfig {
+        port,
+        internet: forms.recv_internet,
+        expected_sender_fpr: Some(contact.fingerprint()),
+    })
+}
+
+#[cfg(feature = "net")]
+fn build_send_config(
+    forms: &TransferState,
+    contacts: &ContactBook,
+) -> Result<crate::net::SendConfig, String> {
+    let fpr_hex = forms
+        .send_contact
+        .clone()
+        .ok_or_else(|| "Pick a verified contact to send to.".to_string())?;
+    let contact = contacts
+        .contacts
+        .iter()
+        .find(|c| c.trust == Trust::Verified && hex(&c.fingerprint()) == fpr_hex)
+        .ok_or_else(|| "Pick a verified contact to send to.".to_string())?;
+    let host = forms.send_host.trim().to_string();
+    if host.is_empty() {
+        return Err("Enter the receiver's address.".into());
+    }
+    let port = forms
+        .send_port
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| "Enter a valid port number.".to_string())?;
+    let vault_id = forms
+        .send_vault
+        .clone()
+        .ok_or_else(|| "Pick a vault to send.".to_string())?;
+    let pairing_code = {
+        let p = forms.send_pairing.trim();
+        (!p.is_empty()).then(|| p.to_string())
+    };
+    Ok(crate::net::SendConfig {
+        host,
+        port,
+        recipient: contact.identity.clone(),
+        recipient_fpr: contact.fingerprint(),
+        pairing_code,
+        vault_id,
+    })
+}
+
+#[cfg(feature = "net")]
+fn transfer_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let cc = theme::colors(ui);
+    theme::section_header(ui, "Transfer", |_ui| {});
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            // Constrain the forms to a comfortable column (left-aligned) instead of
+            // letting cards collapse to their content or stretch the whole window.
+            ui.set_max_width(TRANSFER_COL_W);
+            ui.label(
+                RichText::new(
+                    "Send a vault straight to a verified contact over the network — no server in between. Keep both apps open during the transfer.",
+                )
+                .color(cc.text_muted),
+            );
+            ui.add_space(12.0);
+            if let Some(active) = &s.transfer.active {
+                active_transfer_card(active, ui, action);
+            } else {
+                receive_card(s, ui, action);
+                ui.add_space(8.0);
+                send_card(s, ui, action);
+            }
+        });
+}
+
+#[cfg(feature = "net")]
+fn receive_card(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let cc = theme::colors(ui);
+    theme::card(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::icon_text(theme::icon::DOWNLOAD, 18.0).color(cc.accent));
+            ui.label(RichText::new("Receive").strong().size(15.0));
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Wait for a contact you choose to send you a vault.")
+                .color(cc.text_muted)
+                .small(),
+        );
+        ui.add_space(10.0);
+
+        let verified = verified_contacts(s);
+        if verified.is_empty() {
+            ui.label(
+                RichText::new("Add and verify the contact you expect to receive from first.")
+                    .color(cc.text_muted)
+                    .small(),
+            );
+            return;
+        }
+
+        ui.label(RichText::new("Receive from").small().color(cc.text_muted));
+        let field_w = ui.available_width();
+        let label = combo_label(&s.transfer.recv_contact, &verified, "Choose a contact…");
+        egui::ComboBox::from_id_salt("recv_contact")
+            .width(field_w)
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                for (fp, name) in &verified {
+                    let selected = s.transfer.recv_contact.as_deref() == Some(fp.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        s.transfer.recv_contact = Some(fp.clone());
+                    }
+                }
+            });
+        ui.label(
+            RichText::new("Only this contact will be able to send to you.")
+                .color(cc.text_muted)
+                .small(),
+        );
+
+        ui.add_space(10.0);
+        ui.checkbox(
+            &mut s.transfer.recv_internet,
+            "Reachable over the internet (open a port on my router)",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Port");
+            net_input(ui, &mut s.transfer.recv_port, "auto", 90.0);
+            ui.label(RichText::new("(optional)").color(cc.text_muted).small());
+        });
+        if s.transfer.recv_internet {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "If your router can't open the port (NAT-PMP), you'll still be reachable on your local network.",
+                )
+                .color(cc.text_muted)
+                .small(),
+            );
+        }
+        ui.add_space(12.0);
+        if theme::primary_button(ui, "Start listening").clicked() {
+            *action = Some(Action::StartListen);
+        }
+    });
+}
+
+#[cfg(feature = "net")]
+fn send_card(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let cc = theme::colors(ui);
+    theme::card(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::icon_text(theme::icon::SEND, 18.0).color(cc.accent));
+            ui.label(RichText::new("Send").strong().size(15.0));
+        });
+        ui.add_space(8.0);
+
+        let verified = verified_contacts(s);
+        if verified.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Add and verify a contact first — you can only send to verified contacts.",
+                )
+                .color(cc.text_muted)
+                .small(),
+            );
+            return;
+        }
+        let vaults: Vec<(String, String)> = s
+            .registry
+            .vaults
+            .iter()
+            .map(|v| (v.id.clone(), v.name.clone()))
+            .collect();
+        if vaults.is_empty() {
+            ui.label(
+                RichText::new("Create a vault to send first.")
+                    .color(cc.text_muted)
+                    .small(),
+            );
+            return;
+        }
+
+        let field_w = ui.available_width();
+        ui.label(RichText::new("Send to").small().color(cc.text_muted));
+        let contact_label = combo_label(&s.transfer.send_contact, &verified, "Choose a contact…");
+        egui::ComboBox::from_id_salt("send_contact")
+            .width(field_w)
+            .selected_text(contact_label)
+            .show_ui(ui, |ui| {
+                for (fp, name) in &verified {
+                    let selected = s.transfer.send_contact.as_deref() == Some(fp.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        s.transfer.send_contact = Some(fp.clone());
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Vault").small().color(cc.text_muted));
+        let vault_label = combo_label(&s.transfer.send_vault, &vaults, "Choose a vault…");
+        egui::ComboBox::from_id_salt("send_vault")
+            .width(field_w)
+            .selected_text(vault_label)
+            .show_ui(ui, |ui| {
+                for (vid, name) in &vaults {
+                    let selected = s.transfer.send_vault.as_deref() == Some(vid.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        s.transfer.send_vault = Some(vid.clone());
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Address").small().color(cc.text_muted));
+        ui.horizontal(|ui| {
+            let avail = ui.available_width();
+            net_input(
+                ui,
+                &mut s.transfer.send_host,
+                "IP or hostname",
+                (avail - 84.0).max(120.0),
+            );
+            ui.label(":");
+            net_input(ui, &mut s.transfer.send_port, "port", 56.0);
+        });
+
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Pairing code (from the receiver)")
+                .small()
+                .color(cc.text_muted),
+        );
+        net_input(
+            ui,
+            &mut s.transfer.send_pairing,
+            "e.g. 1234-5678",
+            field_w.min(220.0),
+        );
+
+        ui.add_space(12.0);
+        if theme::primary_button(ui, "Send").clicked() {
+            *action = Some(Action::StartSend);
+        }
+    });
+}
+
+#[cfg(feature = "net")]
+fn active_transfer_card(active: &ActiveTransfer, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let cc = theme::colors(ui);
+    theme::card(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new());
+            ui.add_space(6.0);
+            let title = match active.kind {
+                ActiveKind::Receive => "Receiving",
+                ActiveKind::Send => "Sending",
+            };
+            ui.label(RichText::new(title).strong().size(15.0));
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new(&active.status).color(cc.text_muted));
+        if let Some(peer) = &active.peer {
+            ui.label(format!("Peer: {peer}"));
+        }
+
+        if let Some(lv) = &active.listen {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            addr_row(ui, "On this network", &lv.lan_addr);
+            if let Some(pa) = &lv.public_addr {
+                addr_row(ui, "Over the internet", pa);
+            }
+            ui.label(RichText::new(&lv.nat).color(cc.text_muted).small());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Pairing code:");
+                ui.label(
+                    RichText::new(&lv.pairing_code)
+                        .monospace()
+                        .strong()
+                        .size(16.0)
+                        .color(cc.accent),
+                );
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(lv.pairing_code.clone());
+                }
+            });
+            ui.label(
+                RichText::new("Give the address and this code to the sender.")
+                    .color(cc.text_muted)
+                    .small(),
+            );
+        }
+
+        if let Some((done, total)) = active.progress {
+            ui.add_space(8.0);
+            let frac = if total > 0 {
+                (done as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(frac).show_percentage());
+            ui.label(
+                RichText::new(format!("{} / {}", human_size(done), human_size(total)))
+                    .color(cc.text_muted)
+                    .small(),
+            );
+        }
+
+        ui.add_space(10.0);
+        let (label, act) = match active.kind {
+            ActiveKind::Receive => ("Stop listening", Action::StopTransfer),
+            ActiveKind::Send => ("Cancel", Action::CancelTransfer),
+        };
+        if theme::danger_button(ui, label).clicked() {
+            *action = Some(act);
+        }
+    });
+}
+
+#[cfg(feature = "net")]
+fn addr_row(ui: &mut egui::Ui, label: &str, addr: &str) {
+    let cc = theme::colors(ui);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(cc.text_muted).small());
+        ui.label(RichText::new(addr).monospace());
+        if ui.small_button("Copy").clicked() {
+            ui.ctx().copy_text(addr.to_string());
+        }
+    });
+}
+
+#[cfg(feature = "net")]
+fn transfer_offer_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let (filename, size, sender) = match s.transfer.active.as_ref().and_then(|a| a.offer.as_ref()) {
+        Some(o) => (o.filename.clone(), o.size, o.sender.clone()),
+        None => return,
+    };
+    let (_close, ()) = theme::modal(ctx, "Incoming transfer", |ui| {
+        let cc = theme::colors(ui);
+        ui.label(format!("{sender} wants to send you:"));
+        ui.add_space(6.0);
+        ui.label(RichText::new(&filename).strong());
+        ui.label(RichText::new(human_size(size)).color(cc.text_muted).small());
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Only accept files you're expecting from this contact.")
+                .color(cc.text_muted)
+                .small(),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Accept").clicked() {
+                *action = Some(Action::AcceptIncoming);
+            }
+            if theme::secondary_button(ui, "Reject").clicked() {
+                *action = Some(Action::RejectIncoming);
+            }
+        });
+    });
+}
+
 fn fatal_ui(msg: &str, ui: &mut egui::Ui) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
@@ -4136,6 +4936,8 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             Nav::Vaults => vaults_ui(s, ui, action),
             Nav::Contacts => contacts_ui(s, ui, action),
             Nav::Identity => identity_ui(s, ui, action),
+            #[cfg(feature = "net")]
+            Nav::Transfer => transfer_ui(s, ui, action),
         }
     }
 
@@ -4169,6 +4971,14 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     }
     if s.export_identity.is_some() {
         export_identity_window(s, ui.ctx(), action);
+    }
+    #[cfg(feature = "net")]
+    if s.transfer
+        .active
+        .as_ref()
+        .is_some_and(|a| a.offer.is_some())
+    {
+        transfer_offer_window(s, ui.ctx(), action);
     }
 }
 

@@ -1,10 +1,12 @@
-//! FileSec desktop app — **post-quantum build**.
+//! FileSec desktop app — the **networking build**.
 //!
-//! Identical to the classical `filesec` binary, but compiled with the `pqc`
-//! feature so new identities are hybrid (X25519+ML-KEM-768 / Ed25519+ML-DSA-65),
-//! the post-quantum and AES-256-GCM export suites are available, and the local
-//! store is encrypted at rest under the hybrid suite. It presents the same
-//! "FileSec" name as the classical build. See `filesec_gui::run`.
+//! The same app as the standard `filesec` binary, plus the `net` feature: direct,
+//! server-less peer-to-peer transfer of a vault to a verified contact (an
+//! authenticated, forward-secret channel built from FileSec's own primitives,
+//! with optional NAT-PMP router port mapping for internet transfers). The
+//! post-quantum and AES-256-GCM suites are compiled in as well; new identities are
+//! **classical** by default and can be upgraded to hybrid post-quantum in-app. It
+//! presents the same "FileSec" name. See `filesec_gui::run`.
 
 // On Windows, don't pop up a console window alongside the GUI in release.
 #![cfg_attr(

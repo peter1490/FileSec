@@ -12,11 +12,12 @@ repository.workspace = true
 name = "filesec"
 path = "src/main.rs"
 
-# cargo-dist builds the classical installer with OS-keychain auto-unlock and
-# hardware-passkey unlock on (the release workflow passes the same
-# `--features keyring,passkey`).
+# cargo-dist builds the standard `filesec` installer with the post-quantum suites
+# available (classical-default identities), OS-keychain auto-unlock, and
+# hardware-passkey unlock — but no networking (that's the `filesec-pqc` build).
+# The release workflow passes the same `--features pqc,keyring,passkey`.
 [package.metadata.dist]
-features = ["keyring", "passkey"]
+features = ["pqc", "keyring", "passkey"]
 
 # `cargo deb` (Linux .deb). The release workflow builds the binary first with the
 # right features, then runs `cargo deb --no-build` to package this already-built
@@ -25,10 +26,11 @@ features = ["keyring", "passkey"]
 maintainer = "FileSec contributors"
 copyright = "FileSec contributors"
 extended-description = """\
-FileSec is a native, offline desktop app for securely exchanging files between \
-parties using public/private-key cryptography. This is the classical build \
-(XChaCha20-Poly1305 / X25519 / Ed25519); the post-quantum build is the separate \
-`filesec-pqc` package."""
+FileSec is a native desktop app for securely exchanging files between parties \
+using public/private-key cryptography. This is the standard build: the \
+post-quantum suites are available (new identities are classical by default and \
+can be upgraded in-app), and it works offline. The companion `filesec-pqc` \
+package adds direct peer-to-peer network transfer."""
 section = "utils"
 priority = "optional"
 # `target/release/...` is remapped by cargo-deb to the real (workspace) target
@@ -49,6 +51,12 @@ assets = [
 default = []
 # Forward the core post-quantum opt-in.
 pqc = ["filesec-core/pqc"]
+# Direct peer-to-peer network transfer (the `net` module: sockets, NAT-PMP port
+# mapping, and the Transfer UI). Forwards the core handshake/record layer. NAT
+# traversal is a small vendored NAT-PMP client, so this pulls **no new
+# dependencies** and stays on the 1.86 MSRV. Off by default, so the standard
+# build links no networking code.
+net = ["filesec-core/net"]
 # Opt-in hardware passkey unlock (FIDO2 `hmac-secret`). Pulls a USB-HID FIDO2
 # client; kept optional so the default build stays dependency-light and the
 # CI/sandbox build (which can't compile vendored hidapi or test real hardware)
@@ -112,3 +120,9 @@ features = ["sync-secret-service", "crypto-rust"]
 # so the macOS/Linux builds are unaffected. Installer-side icon: packaging/windows.
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
+
+# The `net` loopback integration test constructs an `egui::Context` (used as the
+# repaint waker by the transfer threads). egui is already a normal dependency, so
+# this only exposes it to the test crate — no new build cost.
+[dev-dependencies]
+egui = "0.32.3"

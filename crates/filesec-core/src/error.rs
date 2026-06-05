@@ -66,4 +66,22 @@ pub enum Error {
     /// classical-only identity.
     #[error("post-quantum key material is missing: {0}")]
     MissingPqcKey(&'static str),
+
+    /// During a direct network transfer, the peer that answered proved a
+    /// long-term identity whose fingerprint did not match the contact we meant
+    /// to reach ("right address, wrong identity"). The transfer is aborted.
+    #[error("the peer's identity does not match the expected contact")]
+    PeerIdentityMismatch,
+
+    /// During a direct network transfer, the one-time pairing code did not match
+    /// (or one side supplied a code and the other did not). Surfaced as a
+    /// best-effort hint when the peer identity is otherwise correct but the
+    /// authenticated handshake fails to agree on keys.
+    #[error("the pairing code does not match")]
+    PairingCodeMismatch,
+
+    /// A transport handshake message was malformed, arrived out of order, or
+    /// named an unsupported protocol version/suite.
+    #[error("handshake protocol error: {0}")]
+    HandshakeProtocol(&'static str),
 }

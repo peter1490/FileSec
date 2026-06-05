@@ -6,6 +6,8 @@
 
 pub mod app;
 pub mod autounlock;
+#[cfg(feature = "net")]
+pub mod net;
 pub mod passkey;
 pub mod store;
 pub mod theme;

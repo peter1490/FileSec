@@ -18,11 +18,12 @@ path = "src/main.rs"
 maintainer = "FileSec contributors"
 copyright = "FileSec contributors"
 extended-description = """\
-FileSec is a native, offline desktop app for securely exchanging files between \
-parties using public/private-key cryptography. This is the post-quantum build: \
-new identities are hybrid (X25519+ML-KEM-768 / Ed25519+ML-DSA-65) and the local \
-store is encrypted at rest under the hybrid suite. It installs alongside the \
-classical `filesec` package."""
+FileSec is a native desktop app for securely exchanging files between parties \
+using public/private-key cryptography. This is the networking build: it adds \
+direct, server-less peer-to-peer transfer to a verified contact, on top of the \
+standard build's offline container exchange. The post-quantum suites are \
+available (new identities are classical by default and can be upgraded in-app). \
+It installs alongside the standard `filesec` package."""
 section = "utils"
 priority = "optional"
 assets = [
@@ -47,7 +48,10 @@ assets = [
 # would unify features across both; `default-members` in the root manifest keeps
 # the bare `cargo build`/`test` classical, and CI builds each variant separately.)
 eframe = "0.32.3"
-filesec-gui = { path = "../filesec-gui", features = ["pqc", "keyring", "passkey"] }
+# This is the full build: post-quantum suites available AND direct peer-to-peer
+# network transfer (`net`). The companion `filesec` binary is the same app
+# without networking. New identities default to classical in both.
+filesec-gui = { path = "../filesec-gui", features = ["pqc", "keyring", "passkey", "net"] }
 
 # Embeds the app icon into `filesec-pqc.exe` (see build.rs). Dependency-free at
 # default-features = false; no MSRV impact — see filesec-gui's build-dependency.

@@ -54,11 +54,12 @@ jobs:
         run: cargo test --locked
 
   # Opt-in feature builds, exercised on a single OS to keep CI fast. The
-  # post-quantum suites and the OS-keychain auto-unlock each get their own
-  # clippy + test pass. (The passkey feature vendors hidapi/C and needs physical
-  # hardware, so it is not built here — see crates/filesec-gui/src/passkey.rs.)
+  # post-quantum suites, the direct-transfer networking, and the OS-keychain
+  # auto-unlock each get their own clippy + test pass. (The passkey feature
+  # vendors hidapi/C and needs physical hardware, so it is not built here — see
+  # crates/filesec-gui/src/passkey.rs.)
   features:
-    name: features (pqc, keyring)
+    name: features (pqc, net, keyring)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +73,12 @@ jobs:
 
       - name: Test (pqc)
         run: cargo test -p filesec-core -p filesec-gui --features pqc --locked
+
+      - name: Clippy (net)
+        run: cargo clippy -p filesec-core -p filesec-gui --all-targets --features net --locked
+
+      - name: Test (net)
+        run: cargo test -p filesec-core -p filesec-gui --features net --locked
 
       - name: Clippy (keyring)
         run: cargo clippy -p filesec-gui --all-targets --features keyring --locked

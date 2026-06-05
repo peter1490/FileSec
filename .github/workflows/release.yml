@@ -1,13 +1,18 @@
 name: Release
 
 # Authoritative release pipeline. On a version tag it builds BOTH variants —
-# classical (`filesec`) and post-quantum (`filesec-pqc`) — for macOS, Windows and
-# Linux, packages each into native installers (.dmg / .msi + NSIS / .deb) plus a
-# portable archive, code-signs and notarizes where credentials are configured,
-# and publishes everything with a SHA256SUMS file to a GitHub Release.
+# `filesec` (the standard build: post-quantum suites available, networking off)
+# and `filesec-pqc` (the same app plus direct peer-to-peer network transfer) —
+# for macOS, Windows and Linux, packages each into native installers
+# (.dmg / .msi + NSIS / .deb) plus a portable archive, code-signs and notarizes
+# where credentials are configured, and publishes everything with a SHA256SUMS
+# file to a GitHub Release. Both builds compile the post-quantum suites in; new
+# identities are classical by default in both. The matrix key `classical` is the
+# standard (no-networking) build and `pqc` is the networking build — kept as keys
+# only to avoid churning artifact names.
 #
 # Each variant is built in its own `cargo build -p <package>` invocation so the
-# post-quantum features are never unified into the classical binary. Signing and
+# networking code is never unified into the standard binary. Signing and
 # notarization are gated on secrets, so the build runs end-to-end (producing
 # unsigned artifacts) on a fork that has none. See RELEASE.md for the secrets.
 
@@ -53,7 +58,7 @@ jobs:
             echo "APP_NAME=FileSec"                                   >> "$GITHUB_ENV"
             echo "BUNDLE_ID=dev.FileSec.FileSec.pqc"                  >> "$GITHUB_ENV"
           else
-            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring,passkey" >> "$GITHUB_ENV"
+            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features pqc,keyring,passkey" >> "$GITHUB_ENV"
             echo "BIN=filesec"                                        >> "$GITHUB_ENV"
             echo "APP_NAME=FileSec"                                   >> "$GITHUB_ENV"
             echo "BUNDLE_ID=dev.FileSec.FileSec"                      >> "$GITHUB_ENV"
@@ -134,7 +139,7 @@ jobs:
             echo "APP_NAME=FileSec"           >> "$GITHUB_ENV"
             echo "REG_KEY=FileSec-pqc"        >> "$GITHUB_ENV"
           else
-            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring,passkey" >> "$GITHUB_ENV"
+            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features pqc,keyring,passkey" >> "$GITHUB_ENV"
             echo "BIN=filesec"                >> "$GITHUB_ENV"
             echo "PKG=filesec-gui"            >> "$GITHUB_ENV"
             echo "APP_NAME=FileSec"           >> "$GITHUB_ENV"
@@ -221,7 +226,7 @@ jobs:
             echo "BIN=filesec-pqc"            >> "$GITHUB_ENV"
             echo "PKG=filesec-pqc"            >> "$GITHUB_ENV"
           else
-            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features keyring,passkey" >> "$GITHUB_ENV"
+            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features pqc,keyring,passkey" >> "$GITHUB_ENV"
             echo "BIN=filesec"                >> "$GITHUB_ENV"
             echo "PKG=filesec-gui"            >> "$GITHUB_ENV"
           fi

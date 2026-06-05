@@ -77,3 +77,42 @@ pub fn ephemeral_agree(
         ephemeral_public.to_bytes(),
     ))
 }
+
+/// A one-time X25519 keypair whose secret is **held across messages** — needed by
+/// the direct-transfer handshake ([`crate::transport`]), where each side sends its
+/// ephemeral public first and only later agrees against the peer's ephemeral.
+/// Unlike [`ephemeral_agree`] (a single sender-side call), this keeps the secret
+/// so an ephemeral↔ephemeral DH can be completed in a second step. The secret is
+/// zeroized on drop by the underlying `StaticSecret`.
+#[cfg(feature = "net")]
+pub struct EphemeralKeyPair {
+    secret: StaticSecret,
+    public: [u8; PUBLIC_LEN],
+}
+
+#[cfg(feature = "net")]
+impl EphemeralKeyPair {
+    /// Generate a fresh ephemeral keypair from the OS CSPRNG.
+    pub fn generate() -> Result<Self> {
+        let secret = StaticSecret::from(random_array::<SECRET_LEN>()?);
+        let public = PublicKey::from(&secret).to_bytes();
+        Ok(Self { secret, public })
+    }
+
+    /// This keypair's public key bytes (sent to the peer).
+    #[must_use]
+    pub fn public(&self) -> [u8; PUBLIC_LEN] {
+        self.public
+    }
+
+    /// Agree on the shared secret with the peer's ephemeral public key, rejecting
+    /// non-contributory (low-order / identity) keys exactly as the static path does.
+    pub fn agree(&self, peer_public: &[u8; PUBLIC_LEN]) -> Result<Zeroizing<[u8; 32]>> {
+        let peer = PublicKey::from(*peer_public);
+        let shared = self.secret.diffie_hellman(&peer);
+        if !shared.was_contributory() {
+            return Err(Error::BadKey("non-contributory X25519 agreement"));
+        }
+        Ok(Zeroizing::new(shared.to_bytes()))
+    }
+}

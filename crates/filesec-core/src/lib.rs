@@ -37,6 +37,8 @@ pub mod mlkem;
 pub mod secret;
 pub mod sign;
 pub mod suite;
+#[cfg(feature = "net")]
+pub mod transport;
 pub mod util;
 pub mod vault;
 
@@ -45,4 +47,6 @@ pub use format::{AddedFile, ExportOptions, ImportedVault, VaultReader, VerifiedS
 pub use format_v2::VaultReaderV2;
 pub use identity::{Identity, PublicIdentity};
 pub use suite::SuiteId;
+#[cfg(feature = "net")]
+pub use transport::{Initiator, PeerAuth, RecordType, Responder, Session};
 pub use vault::Vault;
