@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use filesec_core::contacts::{ContactBook, Trust};
 use filesec_core::identity::Identity;
 use filesec_core::vault::Vault;
+use filesec_core::ExportOptions;
 use filesec_gui::net::{self, ListenConfig, NetCommand, NetEvent, NetHandle, SendConfig};
 use filesec_gui::store::{new_vault_id, Store};
 
@@ -284,6 +285,99 @@ fn loopback_wrong_pairing_code_aborts() {
         received.is_none(),
         "nothing should be imported on a bad code"
     );
+
+    bob_h.stop();
+    alice_h.stop();
+}
+
+/// A richer vault — a multi-chunk file, an empty file, and a nested path —
+/// streamed end to end. Locks in the streaming sender's guarantees: the size
+/// declared in the offer is the *exact* container size (the receiver enforces it),
+/// and every byte round-trips across chunk and file boundaries.
+#[test]
+fn loopback_large_multifile_roundtrips_with_exact_size() {
+    let send_store = Arc::new(Store::at(tmp("send")).unwrap());
+    let recv_store = Arc::new(Store::at(tmp("recv")).unwrap());
+    let alice = Arc::new(Identity::generate("Alice", 0).unwrap());
+    let bob = Arc::new(Identity::generate("Bob", 0).unwrap());
+
+    // `big` spans several 64 KiB transfer chunks; an empty file and a nested file
+    // exercise the per-blob boundaries of the streaming reader.
+    let big = vec![0xABu8; 200 * 1024];
+    let vid = new_vault_id();
+    let mut vault = Vault::new("Bundle", 0);
+    vault.add_file("big.bin", big.clone(), None, None).unwrap();
+    vault
+        .add_file("docs/empty.txt", Vec::new(), None, None)
+        .unwrap();
+    vault.add_file("docs/note.md", b"hi".to_vec(), None, None).unwrap();
+    send_store.save_vault(&alice, &vid, &vault).unwrap();
+
+    // The plan reads only metadata, so its size is available without touching any
+    // blob — a cheap lower-bound sanity check that it at least covers the payload.
+    let plan_size = send_store
+        .open_vault(&alice, &vid)
+        .unwrap()
+        .export_plan(&alice, &[bob.public()], &ExportOptions::default())
+        .unwrap()
+        .container_size();
+    assert!(
+        plan_size > 200 * 1024,
+        "the container must be at least as large as its payload"
+    );
+
+    let mut contacts = ContactBook::default();
+    contacts.upsert(alice.public(), 0);
+    contacts.set_trust(&alice.fingerprint(), Trust::Verified, 0);
+    let (mut bob_h, port, code) = start_bob(
+        bob.clone(),
+        recv_store.clone(),
+        contacts,
+        Some(alice.fingerprint()),
+    );
+
+    let mut alice_h = net::start_sender(
+        SendConfig {
+            host: "127.0.0.1".into(),
+            port,
+            recipient: bob.public(),
+            recipient_fpr: bob.fingerprint(),
+            pairing_code: Some(code),
+            vault_id: vid,
+        },
+        alice.clone(),
+        send_store,
+        egui::Context::default(),
+    );
+
+    // The offer declares a concrete size that covers the payload. The exact value
+    // isn't recomputed here: the live sender uses one export plan for both the
+    // declared size and the streamed bytes, and the receiver enforces
+    // `received == declared` — so reaching Received below proves they matched.
+    let offer = recv_until(&bob_h, Duration::from_secs(10), |e| {
+        matches!(e, NetEvent::Offer { .. })
+    })
+    .expect("an offer should arrive");
+    if let NetEvent::Offer { size, .. } = offer {
+        assert!(size > 200 * 1024, "the offer should cover the big file");
+    }
+    bob_h.send(NetCommand::AcceptOffer);
+
+    // A size mismatch would surface as an Error, not Received — so reaching
+    // Received already proves the streamed byte count matched the declared size.
+    let meta = match recv_until(&bob_h, Duration::from_secs(30), |e| {
+        matches!(e, NetEvent::Received { .. } | NetEvent::Error(_))
+    }) {
+        Some(NetEvent::Received { meta, .. }) => meta,
+        other => panic!("expected Received, got {other:?}"),
+    };
+    assert_eq!(meta.name, "Bundle");
+
+    // Every file round-trips byte for byte.
+    let reader = recv_store.open_vault(&bob, &meta.id).unwrap();
+    assert_eq!(&reader.read_entry("big.bin").unwrap()[..], &big[..]);
+    assert_eq!(&reader.read_entry("docs/empty.txt").unwrap()[..], b"");
+    assert_eq!(&reader.read_entry("docs/note.md").unwrap()[..], b"hi");
 
     bob_h.stop();
     alice_h.stop();

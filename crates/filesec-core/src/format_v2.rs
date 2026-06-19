@@ -40,9 +40,9 @@ use zeroize::Zeroizing;
 
 use crate::envelope::{self, RecipientStanza};
 use crate::error::{Error, Result};
-use crate::format::{hash_path, VaultReader};
-use crate::identity::Identity;
-use crate::manifest::{Entry, EntryKind};
+use crate::format::{hash_path, ContainerPlan, ExportOptions, VaultReader};
+use crate::identity::{Identity, PublicIdentity};
+use crate::manifest::{Entry, EntryKind, Manifest};
 use crate::secret::{ct_eq, random_array, SymKey};
 use crate::suite::SuiteId;
 use crate::vault::{normalize_path, Vault};
@@ -735,6 +735,77 @@ impl VaultReaderV2 {
         me.reseal_manifest()?;
         Ok(me)
     }
+
+    /// Prepare a streaming export of this vault as a signed `.fsec` v1 transport
+    /// container, **without** materializing the plaintext. The returned plan knows
+    /// the exact container size up front ([`V2ExportPlan::container_size`]) and
+    /// streams each blob chunk-by-chunk when written ([`V2ExportPlan::write_to`]),
+    /// so peak memory is a couple of chunks regardless of vault size.
+    ///
+    /// The local [`TRASH_DIR`] subtree is excluded, exactly like
+    /// [`Self::to_vault_for_export`], so a soft-deleted file never rides along.
+    pub fn export_plan<'a>(
+        &'a self,
+        sender: &'a Identity,
+        recipients: &[PublicIdentity],
+        options: &ExportOptions,
+    ) -> Result<V2ExportPlan<'a>> {
+        // Build the v1 manifest from v2 metadata (no blob content is read) and the
+        // ordered list of blobs to stream, assigning each file a contiguous data
+        // offset in the same order the plaintext reader will yield them.
+        let mut entries = Vec::with_capacity(self.manifest.entries.len());
+        let mut files = Vec::new();
+        let mut offset: u64 = 0;
+        for e in &self.manifest.entries {
+            if is_trashed(&e.path) {
+                continue;
+            }
+            match e.kind {
+                EntryKind::Dir => entries.push(Entry {
+                    path: e.path.clone(),
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    mtime: e.mtime,
+                    mode: e.mode,
+                    blake3: [0u8; 32],
+                    data_offset: 0,
+                }),
+                EntryKind::File => {
+                    entries.push(Entry {
+                        path: e.path.clone(),
+                        kind: EntryKind::File,
+                        size: e.size,
+                        mtime: e.mtime,
+                        mode: e.mode,
+                        blake3: e.blake3,
+                        data_offset: offset,
+                    });
+                    files.push(ExportFile {
+                        file_id: blob_id(e)?.to_string(),
+                        key: e.key.ok_or(Error::Format("missing blob key"))?,
+                        nonce: e.nonce.clone().ok_or(Error::Format("missing blob nonce"))?,
+                        blake3: e.blake3,
+                        size: e.size,
+                        chunk_size: e.chunk_size,
+                    });
+                    offset = offset
+                        .checked_add(e.size)
+                        .ok_or(Error::Format("size overflow"))?;
+                }
+            }
+        }
+        let manifest = Manifest {
+            vault_name: self.manifest.vault_name.clone(),
+            created_at: self.manifest.created_at,
+            entries,
+        };
+        let plan = ContainerPlan::new(&manifest, offset, sender, recipients, options)?;
+        Ok(V2ExportPlan {
+            reader: self,
+            files,
+            plan,
+        })
+    }
 }
 
 /// The `file_id` of a file entry (errors if absent — a corrupt manifest).
@@ -824,18 +895,151 @@ fn harden_file(_path: &Path) {}
 fn harden_dir(_path: &Path) {}
 
 /// Re-export a v2 vault as the signed single-stream `.fsec` v1 transport
-/// container (unchanged format). Reconstructs the plaintext [`Vault`] in memory,
-/// then calls [`crate::format::export_vault`].
+/// container (unchanged format), **streaming** straight from the per-file blobs so
+/// the whole vault is never held in memory. The local trash is excluded.
 pub fn export_v2_to_path(
     reader: &VaultReaderV2,
     sender: &Identity,
-    recipients: &[crate::identity::PublicIdentity],
-    options: &crate::format::ExportOptions,
+    recipients: &[PublicIdentity],
+    options: &ExportOptions,
     path: &Path,
 ) -> Result<()> {
-    // Exclude the local trash: a soft-deleted file must never ride along inside a
-    // container handed to a recipient.
-    let vault = reader.to_vault_for_export()?;
+    let plan = reader.export_plan(sender, recipients, options)?;
     let file = fs_err::File::create(path)?;
-    crate::format::export_vault(&vault, sender, recipients, options, file)
+    plan.write_to(file)
+}
+
+/// One blob to stream during an export: the metadata needed to open and decrypt
+/// it. Owned (not borrowed from the manifest) so the export plan and its reader
+/// have a simple lifetime.
+struct ExportFile {
+    file_id: String,
+    key: [u8; 32],
+    nonce: Vec<u8>,
+    blake3: [u8; 32],
+    size: u64,
+    chunk_size: u32,
+}
+
+/// A prepared streaming export of a v2 vault into a signed `.fsec` container.
+///
+/// Building the plan reads only metadata, so [`Self::container_size`] is known
+/// before any blob is touched — a direct transfer declares that exact size to the
+/// receiver up front. [`Self::write_to`] then decrypts each blob chunk-by-chunk on
+/// the fly; peak memory is a couple of chunks regardless of vault size.
+pub struct V2ExportPlan<'a> {
+    reader: &'a VaultReaderV2,
+    files: Vec<ExportFile>,
+    plan: ContainerPlan<'a>,
+}
+
+impl V2ExportPlan<'_> {
+    /// The exact number of bytes [`Self::write_to`] will produce.
+    pub fn container_size(&self) -> u64 {
+        self.plan.container_len()
+    }
+
+    /// Stream the signed, recipient-encrypted container into `out`.
+    pub fn write_to<W: Write>(self, out: W) -> Result<()> {
+        let data = V2PlaintextReader {
+            reader: self.reader,
+            files: self.files.into_iter(),
+            current: None,
+        };
+        self.plan.write(data, out)
+    }
+}
+
+/// The currently-streaming blob: its decrypting reader plus a running hash of the
+/// plaintext, checked against the manifest digest at the blob's end.
+struct CurrentBlob {
+    dec: aead::StreamDecryptReader<BufReader<fs_err::File>>,
+    hasher: blake3::Hasher,
+    expected: [u8; 32],
+}
+
+/// A [`Read`] that yields a v2 vault's plaintext, concatenated in manifest order,
+/// by decrypting each per-file blob chunk-by-chunk. The whole-file BLAKE3 is
+/// verified as each blob streams (defense in depth atop the per-chunk AEAD).
+struct V2PlaintextReader<'a> {
+    reader: &'a VaultReaderV2,
+    files: std::vec::IntoIter<ExportFile>,
+    current: Option<CurrentBlob>,
+}
+
+/// An [`std::io::Error`] standing in for an authentication failure mid-stream.
+fn auth_io_err() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, Error::Auth)
+}
+
+/// The outcome of advancing [`V2PlaintextReader`] to the next manifest file.
+enum Advance {
+    /// A blob was opened into `current` and is ready to stream.
+    Opened,
+    /// An empty file was verified and skipped (it yields no plaintext).
+    SkippedEmpty,
+    /// No files remain.
+    Done,
+}
+
+impl V2PlaintextReader<'_> {
+    /// Move to the next file: open its blob into `current`, skip an empty file
+    /// (after checking its digest is the hash of nothing), or report completion.
+    fn advance(&mut self) -> std::io::Result<Advance> {
+        let f = match self.files.next() {
+            Some(f) => f,
+            None => return Ok(Advance::Done),
+        };
+        if f.size == 0 {
+            if !ct_eq(blake3::hash(&[]).as_bytes(), &f.blake3) {
+                return Err(auth_io_err());
+            }
+            return Ok(Advance::SkippedEmpty);
+        }
+        let file = BufReader::new(fs_err::File::open(self.reader.blob_path(&f.file_id))?);
+        let dec = aead::StreamDecryptReader::new_with(
+            self.reader.suite.aead_alg(),
+            &SymKey::from_bytes(f.key),
+            &f.nonce,
+            &self.reader.header_bytes,
+            file,
+            f.chunk_size as usize,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.current = Some(CurrentBlob {
+            dec,
+            hasher: blake3::Hasher::new(),
+            expected: f.blake3,
+        });
+        Ok(Advance::Opened)
+    }
+}
+
+impl Read for V2PlaintextReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.current.is_none() {
+                match self.advance()? {
+                    Advance::Opened => {}
+                    Advance::SkippedEmpty => continue,
+                    Advance::Done => return Ok(0),
+                }
+            }
+            let cur = match self.current.as_mut() {
+                Some(c) => c,
+                None => continue, // unreachable after `advance` returned `Opened`
+            };
+            let n = cur.dec.read(buf)?;
+            if n == 0 {
+                // Blob fully streamed: verify the whole-file digest before moving on.
+                if !ct_eq(cur.hasher.finalize().as_bytes(), &cur.expected) {
+                    return Err(auth_io_err());
+                }
+                self.current = None;
+                continue;
+            }
+            cur.hasher.update(&buf[..n]);
+            return Ok(n);
+        }
+    }
 }

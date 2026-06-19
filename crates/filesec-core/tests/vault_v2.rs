@@ -324,6 +324,46 @@ fn v2_exports_to_v1_and_reimports() {
 }
 
 #[test]
+fn v2_export_plan_size_matches_written_bytes() {
+    let id = ident("Alice");
+    let dir = tmp_dir("export-size.fsv2");
+    let v = build_sample(&dir, &id, SuiteId::Classic);
+
+    // The network sender declares `container_size()` in its offer up front, then
+    // streams that *same* plan's bytes; the receiver aborts on any byte-count
+    // mismatch. That safety hinges on a plan's declared size being exactly the
+    // number of bytes it writes — assert it directly so the standard (no-`net`)
+    // build covers the invariant too. The rich sample (multi-chunk file, empty
+    // file, nested file, a dir) makes the header, manifest, data, and trailer
+    // lengths all contribute.
+    let plan = v
+        .export_plan(&id, &[id.public()], &ExportOptions::default())
+        .unwrap();
+    let declared = plan.container_size();
+
+    let fsec = tmp_file("export-size.fsec");
+    plan.write_to(std::fs::File::create(&fsec).unwrap()).unwrap();
+    let written = std::fs::metadata(&fsec).unwrap().len();
+    assert_eq!(
+        declared, written,
+        "the declared container size must equal the bytes the plan streams"
+    );
+
+    // The streamed bytes are a real, signed container that imports cleanly.
+    let (reader, _sender) = format::verify_and_open(&fsec, &id).unwrap();
+    let dir2 = tmp_dir("export-size-reimport.fsv2");
+    let v_re = VaultReaderV2::from_reader_v1(&dir2, &id, SuiteId::Classic, &reader).unwrap();
+    assert_eq!(
+        v.read_entry("data/big.bin").unwrap().to_vec(),
+        v_re.read_entry("data/big.bin").unwrap().to_vec()
+    );
+
+    let _ = std::fs::remove_file(&fsec);
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
 fn export_omits_the_trash_subtree() {
     use filesec_core::format_v2::{is_trashed, TRASH_DIR};
 

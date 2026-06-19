@@ -460,14 +460,197 @@ pub fn export_vault<W: Write>(
     )
 }
 
-/// Serialize and encrypt `manifest`, stream the `data` plaintext (whose
-/// decrypted length is `data_plaintext_len`) through the AEAD into `out`, sign
-/// the whole body, and append the trailer.
+/// A container whose header, manifest, and section lengths are fixed but whose
+/// data section has not been streamed yet.
 ///
-/// This is the single place the on-disk framing is produced; both the in-memory
-/// [`export_vault`] and the streaming [`VaultReader::reexport`] funnel through it
-/// so they cannot drift. The data is consumed from a [`Read`], so neither caller
-/// needs to hold the whole plaintext at once.
+/// Building a plan does everything that does **not** depend on the file data —
+/// serialize and measure the manifest, draw the fresh secrets, wrap the content
+/// key to every recipient, and lay out the header — so the exact final container
+/// length is known up front via [`ContainerPlan::container_len`]. A direct
+/// network transfer uses this to declare the precise byte count to the receiver
+/// *before* paying to encrypt and stream the data. [`ContainerPlan::write`] then
+/// consumes the data from a [`Read`], so the whole plaintext is never held at once.
+pub(crate) struct ContainerPlan<'a> {
+    sender: &'a Identity,
+    suite: SuiteId,
+    alg: aead::AeadAlg,
+    cek: SymKey,
+    header_bytes: Vec<u8>,
+    manifest_plaintext: Zeroizing<Vec<u8>>,
+    manifest_nonce: Vec<u8>,
+    data_stream_nonce: Vec<u8>,
+    manifest_len: u64,
+    data_len: u64,
+    chunk_size: usize,
+}
+
+impl<'a> ContainerPlan<'a> {
+    /// Prepare a container for `manifest`, whose data section will be exactly
+    /// `data_plaintext_len` plaintext bytes, signed by `sender` and readable by
+    /// each of `recipients`. Reads no file data.
+    pub(crate) fn new(
+        manifest: &Manifest,
+        data_plaintext_len: u64,
+        sender: &'a Identity,
+        recipients: &[PublicIdentity],
+        options: &ExportOptions,
+    ) -> Result<Self> {
+        if recipients.is_empty() {
+            return Err(Error::Vault(
+                "a container needs at least one recipient".into(),
+            ));
+        }
+        if !options.suite.is_supported() {
+            return Err(Error::UnsupportedSuite(options.suite.to_u16()));
+        }
+        if options.chunk_size == 0 {
+            return Err(Error::Format("chunk size"));
+        }
+        let suite = options.suite;
+        let alg = suite.aead_alg();
+
+        // A hybrid sender always advertises its post-quantum keys in the header,
+        // even in a classical/AES container: its canonical fingerprint commits to
+        // them, so an importer must recompute the same fingerprint to match the
+        // sender against its contacts. The Ed25519 signature covers the whole header
+        // (including these keys), so they are authenticated regardless of suite. A
+        // hybrid *suite* additionally requires them (to dual-sign), so fail early and
+        // explicitly if they are absent.
+        let sender_mldsa_public = sender.mldsa_public().map(<[u8]>::to_vec);
+        let sender_mlkem_public = sender.mlkem_public().map(<[u8]>::to_vec);
+        if suite.is_hybrid() && (sender_mldsa_public.is_none() || sender_mlkem_public.is_none()) {
+            return Err(Error::MissingPqcKey(
+                "hybrid container requires a sender with post-quantum keys",
+            ));
+        }
+
+        // 1. Serialize the manifest and compute the on-disk section lengths.
+        let manifest_plaintext = Zeroizing::new(codec::to_vec(manifest)?);
+        let manifest_len = (manifest_plaintext.len() + aead::TAG_LEN) as u64;
+        let data_len = data_ciphertext_len(data_plaintext_len, options.chunk_size as u64);
+
+        // 2. Fresh secrets. Nonce sizes follow the suite's bulk AEAD.
+        let cek = SymKey::random()?;
+        let manifest_nonce = random_vec(alg.nonce_len())?;
+        let data_stream_nonce = random_vec(alg.stream_nonce_len())?;
+        let vault_id = random_array::<16>()?;
+
+        // 3. Wrap the content key to every recipient (hybrid suites also ML-KEM-
+        //    encapsulate to each recipient inside `wrap_for_recipient`).
+        let mut stanzas = Vec::with_capacity(recipients.len());
+        for r in recipients {
+            stanzas.push(envelope::wrap_for_recipient(&cek, r, suite)?);
+        }
+
+        // 4. Header, then bind it everywhere as AAD.
+        let header = Header {
+            suite_id: suite.to_u16(),
+            vault_id,
+            sender_sign_public: sender.sign_public(),
+            sender_kem_public: sender.kem_public(),
+            sender_mldsa_public,
+            sender_mlkem_public,
+            sender_fpr: sender.fingerprint(),
+            recipients: stanzas,
+            manifest_nonce: manifest_nonce.clone(),
+            manifest_len,
+            data_stream_nonce: data_stream_nonce.clone(),
+            data_chunk_size: options.chunk_size as u32,
+            data_len,
+        };
+        let header_bytes = codec::to_vec(&header)?;
+        if header_bytes.len() > MAX_HEADER_LEN || header_bytes.len() > u32::MAX as usize {
+            return Err(Error::Format("header too large"));
+        }
+
+        Ok(Self {
+            sender,
+            suite,
+            alg,
+            cek,
+            header_bytes,
+            manifest_plaintext,
+            manifest_nonce,
+            data_stream_nonce,
+            manifest_len,
+            data_len,
+            chunk_size: options.chunk_size,
+        })
+    }
+
+    /// The exact total byte length the finished container will have: preamble,
+    /// header, encrypted manifest, encrypted data stream, and signature trailer.
+    /// Known before any data is streamed, so it can be declared to a transfer peer.
+    pub(crate) fn container_len(&self) -> u64 {
+        PREAMBLE_LEN as u64
+            + self.header_bytes.len() as u64
+            + self.manifest_len
+            + self.data_len
+            + trailer_len(self.suite) as u64
+    }
+
+    /// Stream the `data` plaintext through the AEAD into `out`, sign the whole
+    /// body, and append the trailer. `data` must yield exactly the
+    /// `data_plaintext_len` given to [`Self::new`]; a shorter or longer stream is
+    /// rejected (and the receiver's own length check would catch it regardless).
+    pub(crate) fn write<R: Read, W: Write>(self, data: R, out: W) -> Result<()> {
+        // 5. Stream everything out through a hashing writer (except the trailer).
+        let mut hw = HashingWriter::new(BufWriter::new(out));
+        hw.write_all(MAGIC)?;
+        hw.write_all(&FORMAT_VERSION.to_be_bytes())?;
+        hw.write_all(&(self.header_bytes.len() as u32).to_be_bytes())?;
+        hw.write_all(&self.header_bytes)?;
+
+        let enc_manifest = aead::seal_with(
+            self.alg,
+            &self.cek,
+            &self.manifest_nonce,
+            &self.header_bytes,
+            &self.manifest_plaintext,
+        )?;
+        if enc_manifest.len() as u64 != self.manifest_len {
+            return Err(Error::Format("manifest length mismatch"));
+        }
+        hw.write_all(&enc_manifest)?;
+
+        let written = aead::encrypt_stream_with(
+            self.alg,
+            &self.cek,
+            &self.data_stream_nonce,
+            &self.header_bytes,
+            data,
+            &mut hw,
+            self.chunk_size,
+        )?;
+        if written != self.data_len {
+            return Err(Error::Format("data length mismatch"));
+        }
+
+        // 6. Sign the hash of everything written, then append the trailer: the
+        //    Ed25519 signature, plus the ML-DSA-65 signature for a hybrid container.
+        //    Requiring both on import means forging needs breaking *both* schemes.
+        let hash = hw.hasher.finalize();
+        let signature = self.sender.sign(hash.as_bytes());
+        let mut inner = hw.inner;
+        inner.write_all(&signature)?;
+        #[cfg(feature = "pqc")]
+        if self.suite.is_hybrid() {
+            let pq_signature = self.sender.sign_pqc(hash.as_bytes())?;
+            inner.write_all(&pq_signature)?;
+        }
+        inner.flush()?;
+        Ok(())
+    }
+}
+
+/// Serialize and encrypt `manifest`, stream the `data` plaintext (whose decrypted
+/// length is `data_plaintext_len`) through the AEAD into `out`, sign the whole
+/// body, and append the trailer.
+///
+/// This is the single place the on-disk framing is produced; the in-memory
+/// [`export_vault`], the streaming [`VaultReader::reexport`], and the v2 streaming
+/// export all funnel through [`ContainerPlan`] so they cannot drift. The data is
+/// consumed from a [`Read`], so no caller needs to hold the whole plaintext at once.
 fn write_container<R: Read, W: Write>(
     manifest: &Manifest,
     data_plaintext_len: u64,
@@ -477,120 +660,7 @@ fn write_container<R: Read, W: Write>(
     options: &ExportOptions,
     out: W,
 ) -> Result<()> {
-    if recipients.is_empty() {
-        return Err(Error::Vault(
-            "a container needs at least one recipient".into(),
-        ));
-    }
-    if !options.suite.is_supported() {
-        return Err(Error::UnsupportedSuite(options.suite.to_u16()));
-    }
-    if options.chunk_size == 0 {
-        return Err(Error::Format("chunk size"));
-    }
-    let suite = options.suite;
-    let alg = suite.aead_alg();
-
-    // A hybrid sender always advertises its post-quantum keys in the header,
-    // even in a classical/AES container: its canonical fingerprint commits to
-    // them, so an importer must recompute the same fingerprint to match the
-    // sender against its contacts. The Ed25519 signature covers the whole header
-    // (including these keys), so they are authenticated regardless of suite. A
-    // hybrid *suite* additionally requires them (to dual-sign), so fail early and
-    // explicitly if they are absent.
-    let sender_mldsa_public = sender.mldsa_public().map(<[u8]>::to_vec);
-    let sender_mlkem_public = sender.mlkem_public().map(<[u8]>::to_vec);
-    if suite.is_hybrid() && (sender_mldsa_public.is_none() || sender_mlkem_public.is_none()) {
-        return Err(Error::MissingPqcKey(
-            "hybrid container requires a sender with post-quantum keys",
-        ));
-    }
-
-    // 1. Serialize the manifest and compute the on-disk section lengths.
-    let manifest_plaintext = Zeroizing::new(codec::to_vec(manifest)?);
-    let manifest_len = (manifest_plaintext.len() + aead::TAG_LEN) as u64;
-    let data_len = data_ciphertext_len(data_plaintext_len, options.chunk_size as u64);
-
-    // 2. Fresh secrets. Nonce sizes follow the suite's bulk AEAD.
-    let cek = SymKey::random()?;
-    let manifest_nonce = random_vec(alg.nonce_len())?;
-    let data_stream_nonce = random_vec(alg.stream_nonce_len())?;
-    let vault_id = random_array::<16>()?;
-
-    // 3. Wrap the content key to every recipient (hybrid suites also ML-KEM-
-    //    encapsulate to each recipient inside `wrap_for_recipient`).
-    let mut stanzas = Vec::with_capacity(recipients.len());
-    for r in recipients {
-        stanzas.push(envelope::wrap_for_recipient(&cek, r, suite)?);
-    }
-
-    // 4. Header, then bind it everywhere as AAD.
-    let header = Header {
-        suite_id: suite.to_u16(),
-        vault_id,
-        sender_sign_public: sender.sign_public(),
-        sender_kem_public: sender.kem_public(),
-        sender_mldsa_public,
-        sender_mlkem_public,
-        sender_fpr: sender.fingerprint(),
-        recipients: stanzas,
-        manifest_nonce: manifest_nonce.clone(),
-        manifest_len,
-        data_stream_nonce: data_stream_nonce.clone(),
-        data_chunk_size: options.chunk_size as u32,
-        data_len,
-    };
-    let header_bytes = codec::to_vec(&header)?;
-    if header_bytes.len() > MAX_HEADER_LEN || header_bytes.len() > u32::MAX as usize {
-        return Err(Error::Format("header too large"));
-    }
-
-    // 5. Stream everything out through a hashing writer (except the trailer).
-    let mut hw = HashingWriter::new(BufWriter::new(out));
-    hw.write_all(MAGIC)?;
-    hw.write_all(&FORMAT_VERSION.to_be_bytes())?;
-    hw.write_all(&(header_bytes.len() as u32).to_be_bytes())?;
-    hw.write_all(&header_bytes)?;
-
-    let enc_manifest = aead::seal_with(
-        alg,
-        &cek,
-        &manifest_nonce,
-        &header_bytes,
-        &manifest_plaintext,
-    )?;
-    if enc_manifest.len() as u64 != manifest_len {
-        return Err(Error::Format("manifest length mismatch"));
-    }
-    hw.write_all(&enc_manifest)?;
-
-    let written = aead::encrypt_stream_with(
-        alg,
-        &cek,
-        &data_stream_nonce,
-        &header_bytes,
-        data,
-        &mut hw,
-        options.chunk_size,
-    )?;
-    if written != data_len {
-        return Err(Error::Format("data length mismatch"));
-    }
-
-    // 6. Sign the hash of everything written, then append the trailer: the
-    //    Ed25519 signature, plus the ML-DSA-65 signature for a hybrid container.
-    //    Requiring both on import means forging needs breaking *both* schemes.
-    let hash = hw.hasher.finalize();
-    let signature = sender.sign(hash.as_bytes());
-    let mut inner = hw.inner;
-    inner.write_all(&signature)?;
-    #[cfg(feature = "pqc")]
-    if suite.is_hybrid() {
-        let pq_signature = sender.sign_pqc(hash.as_bytes())?;
-        inner.write_all(&pq_signature)?;
-    }
-    inner.flush()?;
-    Ok(())
+    ContainerPlan::new(manifest, data_plaintext_len, sender, recipients, options)?.write(data, out)
 }
 
 /// Export a vault directly to a file path.

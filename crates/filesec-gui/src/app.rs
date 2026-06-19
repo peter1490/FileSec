@@ -4129,7 +4129,7 @@ impl App {
                         ),
                     };
                     if let Some(t) = &mut s.transfer.active {
-                        t.status = "Listening".into();
+                        t.status = "Listening for a sender…".into();
                         t.listen = Some(ListenView {
                             lan_addr,
                             public_addr,
@@ -4141,6 +4141,11 @@ impl App {
                 NetEvent::Connecting => {
                     if let Some(t) = &mut s.transfer.active {
                         t.status = "Connecting…".into();
+                    }
+                }
+                NetEvent::Status(msg) => {
+                    if let Some(t) = &mut s.transfer.active {
+                        t.status = msg;
                     }
                 }
                 NetEvent::PeerConnected {
@@ -4632,19 +4637,18 @@ fn active_transfer_card(active: &ActiveTransfer, ui: &mut egui::Ui, action: &mut
     let cc = theme::colors(ui);
     theme::card(ui, |ui| {
         ui.set_min_width(ui.available_width());
+        // The header IS the live phase, so it always matches what's actually
+        // happening — e.g. "Listening for a sender…" while waiting, not a
+        // misleading "Receiving". The direction (send vs receive) is clear from
+        // the rows below (the listen address/code, the peer, the progress).
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new());
             ui.add_space(6.0);
-            let title = match active.kind {
-                ActiveKind::Receive => "Receiving",
-                ActiveKind::Send => "Sending",
-            };
-            ui.label(RichText::new(title).strong().size(15.0));
+            ui.label(RichText::new(&active.status).strong().size(15.0));
         });
-        ui.add_space(6.0);
-        ui.label(RichText::new(&active.status).color(cc.text_muted));
         if let Some(peer) = &active.peer {
-            ui.label(format!("Peer: {peer}"));
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("Peer: {peer}")).color(cc.text_muted));
         }
 
         if let Some(lv) = &active.listen {

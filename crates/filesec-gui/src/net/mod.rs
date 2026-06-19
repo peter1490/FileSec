@@ -83,6 +83,11 @@ pub enum NetEvent {
     },
     /// The sender is dialing the receiver.
     Connecting,
+    /// A free-form status line describing the current phase, shown verbatim to the
+    /// user (e.g. "Waiting for Bob to accept…", "Encrypting & sending…",
+    /// "Verifying & saving…"). Lets the worker describe exactly what is happening
+    /// at moments that aren't captured by the structured events.
+    Status(String),
     /// The peer completed the mutual-auth handshake.
     PeerConnected {
         fpr_hex: String,

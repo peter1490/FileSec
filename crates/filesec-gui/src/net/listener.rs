@@ -195,17 +195,17 @@ fn handle_conn(
         return Ok(());
     }
 
-    // Stream the encrypted container to a private temp, then import + verify.
+    // Stream the encrypted container to a private temp, then verify + import.
     let temp = store.create_private_checkout_file(&format!("incoming-{}.fsec", new_vault_id()))?;
-    let received = receive_into(
-        &mut stream,
-        &mut session,
-        &temp,
-        offer.size,
-        emitter,
-        cmd_rx,
-    );
-    let result = received.and_then(|()| import_received(store, identity, &temp, &peer.fingerprint));
+    let result = match receive_into(&mut stream, &mut session, &temp, offer.size, emitter, cmd_rx) {
+        Ok(()) => {
+            // The bytes are in; verifying the signature and re-encrypting into the
+            // local store can take a moment for a large vault, so say so.
+            emitter.emit(NetEvent::Status("Verifying & saving…".into()));
+            import_received(store, identity, &temp, &peer.fingerprint)
+        }
+        Err(e) => Err(e),
+    };
     let _ = secure_wipe(&temp);
     let (meta, file_count) = result?;
     emitter.emit(NetEvent::Received {
