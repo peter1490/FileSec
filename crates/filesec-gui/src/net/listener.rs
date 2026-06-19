@@ -197,7 +197,14 @@ fn handle_conn(
 
     // Stream the encrypted container to a private temp, then verify + import.
     let temp = store.create_private_checkout_file(&format!("incoming-{}.fsec", new_vault_id()))?;
-    let result = match receive_into(&mut stream, &mut session, &temp, offer.size, emitter, cmd_rx) {
+    let result = match receive_into(
+        &mut stream,
+        &mut session,
+        &temp,
+        offer.size,
+        emitter,
+        cmd_rx,
+    ) {
         Ok(()) => {
             // The bytes are in; verifying the signature and re-encrypting into the
             // local store can take a moment for a large vault, so say so.

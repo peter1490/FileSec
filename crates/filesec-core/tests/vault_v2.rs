@@ -342,7 +342,8 @@ fn v2_export_plan_size_matches_written_bytes() {
     let declared = plan.container_size();
 
     let fsec = tmp_file("export-size.fsec");
-    plan.write_to(std::fs::File::create(&fsec).unwrap()).unwrap();
+    plan.write_to(std::fs::File::create(&fsec).unwrap())
+        .unwrap();
     let written = std::fs::metadata(&fsec).unwrap().len();
     assert_eq!(
         declared, written,

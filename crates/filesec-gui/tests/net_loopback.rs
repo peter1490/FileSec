@@ -310,7 +310,9 @@ fn loopback_large_multifile_roundtrips_with_exact_size() {
     vault
         .add_file("docs/empty.txt", Vec::new(), None, None)
         .unwrap();
-    vault.add_file("docs/note.md", b"hi".to_vec(), None, None).unwrap();
+    vault
+        .add_file("docs/note.md", b"hi".to_vec(), None, None)
+        .unwrap();
     send_store.save_vault(&alice, &vid, &vault).unwrap();
 
     // The plan reads only metadata, so its size is available without touching any
