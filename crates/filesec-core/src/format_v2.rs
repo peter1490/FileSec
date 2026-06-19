@@ -667,8 +667,12 @@ impl VaultReaderV2 {
     }
 
     /// Build a fresh v2 vault at `dir` from an opened, verified v1 [`VaultReader`]
-    /// (the import / migration path). Reads one file at a time (peak memory is a
-    /// single file) and reseals the manifest once at the end.
+    /// (the import / migration path), **streaming** the data straight from the
+    /// source container into the per-file blobs. The v1 data section is one
+    /// contiguous plaintext stream in entry order, so each file is re-encrypted on
+    /// the fly from the next `size` bytes — a multi-gigabyte file is never buffered
+    /// whole (peak memory is a couple of chunks). Reseals the manifest once at the
+    /// end.
     pub fn from_reader_v1(
         dir: &Path,
         identity: &Identity,
@@ -676,6 +680,8 @@ impl VaultReaderV2 {
         reader: &VaultReader,
     ) -> Result<Self> {
         let mut me = Self::create(dir, identity, suite, reader.name(), reader.created_at())?;
+        let mut plaintext = reader.plaintext_stream()?;
+        let mut offset: u64 = 0;
         for e in reader.entries() {
             match e.kind {
                 EntryKind::Dir => {
@@ -685,18 +691,30 @@ impl VaultReaderV2 {
                     }
                 }
                 EntryKind::File => {
-                    let bytes = reader.read_entry(&e.path)?;
+                    // Files are laid out contiguously in entry order; the next
+                    // `e.size` bytes of the stream are exactly this file's content.
+                    if e.data_offset != offset {
+                        return Err(Error::Format("non-contiguous data offset"));
+                    }
+                    let mut src = HashingReader::new((&mut plaintext).take(e.size));
                     // Fresh vault, so this never overwrites (no old blob to drop).
-                    me.stage_file(
-                        e.path.clone(),
-                        e.blake3,
-                        e.size,
-                        Cursor::new(bytes.as_slice()),
-                        e.mtime,
-                        e.mode,
-                    )?;
+                    me.stage_file(e.path.clone(), e.blake3, e.size, &mut src, e.mtime, e.mode)?;
+                    // Defense in depth atop the already-verified container signature.
+                    if !ct_eq(src.finalize().as_bytes(), &e.blake3) {
+                        return Err(Error::Auth);
+                    }
+                    offset = offset
+                        .checked_add(e.size)
+                        .ok_or(Error::Format("size overflow"))?;
                 }
             }
+        }
+        // The stream must end exactly at the last file — no trailing plaintext.
+        let mut extra = [0u8; 1];
+        match plaintext.read(&mut extra) {
+            Ok(0) => {}
+            Ok(_) => return Err(Error::Format("trailing data after last entry")),
+            Err(e) => return Err(Error::Io(e)),
         }
         me.reseal_manifest()?;
         Ok(me)
@@ -947,6 +965,36 @@ impl V2ExportPlan<'_> {
             current: None,
         };
         self.plan.write(data, out)
+    }
+}
+
+/// A [`Read`] that BLAKE3-hashes every byte as it passes through, so a streamed
+/// file's whole-file digest can be checked once it has been fully consumed. Used
+/// by [`VaultReaderV2::from_reader_v1`] to verify each file as it re-encrypts it
+/// without holding the file in memory.
+struct HashingReader<R: Read> {
+    inner: R,
+    hasher: blake3::Hasher,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn finalize(&self) -> blake3::Hash {
+        self.hasher.finalize()
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 }
 

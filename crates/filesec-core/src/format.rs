@@ -1053,6 +1053,14 @@ impl VaultReader {
         self.decrypt_entry_to_writer(&mut file, entry, out)
     }
 
+    /// A streaming [`Read`] over the whole data section's plaintext, in entry
+    /// order — exactly the bytes [`Self::to_vault`] reconstructs. Peak memory is a
+    /// single chunk. The v2 importer uses this to re-encrypt each file straight
+    /// from the stream, so a multi-gigabyte file is never buffered whole.
+    pub fn plaintext_stream(&self) -> Result<impl Read> {
+        self.plaintext_reader()
+    }
+
     /// Look up a file entry by path, erroring if it is missing or is a directory.
     fn file_entry(&self, path: &str) -> Result<&Entry> {
         let norm = normalize_path(path)?;
