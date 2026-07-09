@@ -15,6 +15,7 @@ use filesec_core::format::{self, ExportOptions};
 use filesec_core::format_v2::VaultReaderV2;
 use filesec_core::identity::Identity;
 use filesec_core::keystore::KeystoreFile;
+use filesec_core::manifest::EntryKind;
 use filesec_core::util::now_unix;
 use filesec_core::vault::Vault;
 use filesec_core::SuiteId;
@@ -46,6 +47,9 @@ const CONTACTS_FILE: &str = "contacts.fsec";
 const INDEX_FILE: &str = "index.fsec";
 const REGISTRY_BLOB: &str = "registry";
 const CONTACTS_BLOB: &str = "contacts";
+const MAX_KEYSTORE_FILE_LEN: u64 = 16 * 1024 * 1024;
+const MAX_SELF_BLOB_CONTAINER_LEN: u64 = 64 * 1024 * 1024;
+const MAX_SELF_BLOB_PLAINTEXT_LEN: u64 = 16 * 1024 * 1024;
 
 /// GUI-layer result type: errors are user-facing strings.
 pub type StoreResult<T> = Result<T, String>;
@@ -180,7 +184,11 @@ impl Store {
 
     /// Load the keystore (still encrypted — call `unlock`).
     pub fn load_keystore(&self) -> StoreResult<KeystoreFile> {
-        let bytes = std::fs::read(self.keystore_path()).map_err(err)?;
+        let bytes = read_bounded_file(
+            &self.keystore_path(),
+            MAX_KEYSTORE_FILE_LEN,
+            "keystore file",
+        )?;
         KeystoreFile::from_bytes(&bytes).map_err(err)
     }
 
@@ -216,11 +224,18 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
-        let imported = format::import_vault_from_path(path, identity).map_err(err)?;
-        match imported.vault.get(name) {
-            Some(e) => Ok(Some(e.content.to_vec())),
-            None => Err("stored blob is missing its entry".to_string()),
+        reject_oversized_file(path, MAX_SELF_BLOB_CONTAINER_LEN, "stored metadata file")?;
+        let reader = format::open_vault_from_path(path, identity).map_err(err)?;
+        let entry = reader
+            .entries()
+            .iter()
+            .find(|entry| entry.path == name && entry.kind == EntryKind::File)
+            .ok_or_else(|| "stored blob is missing its entry".to_string())?;
+        if entry.size > MAX_SELF_BLOB_PLAINTEXT_LEN {
+            return Err("stored metadata blob is too large".to_string());
         }
+        let bytes = reader.read_entry(name).map_err(err)?;
+        Ok(Some(bytes.to_vec()))
     }
 
     /// Load the contact book (empty if none yet).
@@ -488,9 +503,7 @@ impl Store {
     /// `leaf` (a sanitized display name, extension intact) is appended so the OS
     /// opens it with the right application.
     pub fn create_private_checkout_file(&self, leaf: &str) -> StoreResult<PathBuf> {
-        let stem = filesec_core::util::hex(
-            &filesec_core::secret::random_vec(8).unwrap_or_else(|_| vec![0u8; 8]),
-        );
+        let stem = random_hex::<8>()?;
         let name = if leaf.is_empty() {
             stem
         } else {
@@ -682,10 +695,40 @@ pub fn write_private_export(path: &Path, contents: &[u8]) -> StoreResult<()> {
     Ok(())
 }
 
+fn reject_oversized_file(path: &Path, max_len: u64, label: &'static str) -> StoreResult<()> {
+    let meta = std::fs::metadata(path).map_err(err)?;
+    if !meta.is_file() {
+        return Err(format!("{label} is not a file"));
+    }
+    if meta.len() > max_len {
+        return Err(format!("{label} is too large"));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, max_len: u64, label: &'static str) -> StoreResult<Vec<u8>> {
+    reject_oversized_file(path, max_len, label)?;
+    let bytes = std::fs::read(path).map_err(err)?;
+    if bytes.len() as u64 > max_len {
+        return Err(format!("{label} is too large"));
+    }
+    Ok(bytes)
+}
+
 /// Generate a fresh random vault id (hex of 16 random bytes).
-pub fn new_vault_id() -> String {
-    let bytes = filesec_core::secret::random_vec(16).unwrap_or_else(|_| vec![0u8; 16]);
-    filesec_core::util::hex(&bytes)
+pub fn new_vault_id() -> StoreResult<String> {
+    random_hex::<16>()
+}
+
+fn random_hex<const N: usize>() -> StoreResult<String> {
+    random_hex_from(filesec_core::secret::random_array::<N>)
+}
+
+fn random_hex_from<const N: usize>(
+    rng: impl FnOnce() -> filesec_core::error::Result<[u8; N]>,
+) -> StoreResult<String> {
+    let bytes = rng().map_err(err)?;
+    Ok(filesec_core::util::hex(&bytes))
 }
 
 /// Write a decrypted vault's contents into `dest` on the real filesystem.
@@ -873,3 +916,60 @@ fn harden_file(_path: &Path) {}
 
 #[cfg(not(unix))]
 fn harden_dir(_path: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn random_hex_propagates_rng_failure() {
+        let result = random_hex_from::<16>(|| Err(filesec_core::error::Error::Rng));
+        assert!(result
+            .unwrap_err()
+            .contains("secure random number generation failed"));
+    }
+
+    #[test]
+    fn random_hex_encodes_successful_rng_output() {
+        let result = random_hex_from::<4>(|| Ok([0xab, 0xcd, 0x01, 0x23])).unwrap();
+        assert_eq!(result, "abcd0123");
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let suffix = filesec_core::util::hex(&filesec_core::secret::random_array::<8>().unwrap());
+        std::env::temp_dir().join(format!("filesec-store-bounds-{suffix}-{name}"))
+    }
+
+    #[test]
+    fn load_keystore_rejects_oversized_file_before_read() {
+        let dir = tmp("keystore");
+        let store = Store::at(&dir).unwrap();
+        std::fs::File::create(store.keystore_path())
+            .unwrap()
+            .set_len(MAX_KEYSTORE_FILE_LEN + 1)
+            .unwrap();
+        match store.load_keystore() {
+            Ok(_) => panic!("oversized keystore unexpectedly loaded"),
+            Err(e) => assert!(e.contains("too large")),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_registry_rejects_oversized_local_blob_before_read() {
+        let dir = tmp("registry");
+        let store = Store::at(&dir).unwrap();
+        let identity = Identity::generate("Alice", 0).unwrap();
+        std::fs::File::create(store.index_path())
+            .unwrap()
+            .set_len(MAX_SELF_BLOB_CONTAINER_LEN + 1)
+            .unwrap();
+        assert!(store
+            .load_registry(&identity)
+            .unwrap_err()
+            .contains("too large"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

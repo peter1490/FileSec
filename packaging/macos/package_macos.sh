@@ -5,10 +5,10 @@
 # binary, code-signs it with a Developer ID Application certificate, packages it
 # into a .dmg, then submits the .dmg for notarization and staples the ticket.
 #
-# Signing and notarization are SKIPPED (a plain, unsigned .dmg is still produced)
-# when the corresponding credentials are absent — so the workflow runs end-to-end
-# on a fork without Apple secrets, and a maintainer with certificates gets fully
-# signed output. See RELEASE.md for the required secrets.
+# Signing and notarization are mandatory when RELEASE_SIGNING_REQUIRED=1
+# (official upstream tag releases). Without that flag, missing credentials only
+# produce warnings so forks and manual development runs can still build unsigned
+# artifacts. See RELEASE.md for the required secrets.
 #
 # Required env:
 #   BIN_PATH      path to the built binary (e.g. target/universal/filesec)
@@ -23,6 +23,24 @@
 set -euo pipefail
 
 : "${BIN_PATH:?}" "${APP_NAME:?}" "${BUNDLE_ID:?}" "${VERSION:?}" "${OUT_DMG:?}"
+
+signing_required="${RELEASE_SIGNING_REQUIRED:-}"
+
+has_notary_credentials() {
+  [[ -n "${AC_API_KEY_PATH:-}" && -n "${AC_API_KEY_ID:-}" && -n "${AC_API_ISSUER:-}" ]] ||
+    [[ -n "${AC_APPLE_ID:-}" && -n "${AC_APP_PASSWORD:-}" && -n "${AC_TEAM_ID:-}" ]]
+}
+
+if [[ "$signing_required" == "1" ]]; then
+  if [[ -z "${MACOS_SIGN_IDENTITY:-}" ]]; then
+    echo "ERROR: RELEASE_SIGNING_REQUIRED=1 but MACOS_SIGN_IDENTITY is not set." >&2
+    exit 1
+  fi
+  if ! has_notary_credentials; then
+    echo "ERROR: RELEASE_SIGNING_REQUIRED=1 but notarization credentials are not set." >&2
+    exit 1
+  fi
+fi
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
@@ -107,6 +125,10 @@ if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]] && notarize; then
   xcrun stapler staple "$OUT_DMG"
   echo "Notarized and stapled: $OUT_DMG"
 else
+  if [[ "$signing_required" == "1" ]]; then
+    echo "ERROR: notarization failed for required official release artifact." >&2
+    exit 1
+  fi
   echo "WARNING: skipping notarization (no credentials or unsigned)." >&2
 fi
 

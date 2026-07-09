@@ -52,6 +52,10 @@ pub enum Error {
     #[error("key derivation failed")]
     Kdf,
 
+    /// Persisted or imported Argon2id parameters exceeded the local open policy.
+    #[error("key derivation parameters rejected: {0}")]
+    KdfParams(&'static str),
+
     /// A filesystem operation failed.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

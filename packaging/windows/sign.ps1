@@ -1,7 +1,8 @@
 # Authenticode-sign a Windows file (the .exe and/or the installers).
 #
-# Signing is SKIPPED (the file is left unsigned, exit 0) when no certificate is
-# configured, so the release workflow runs on a fork without Windows secrets.
+# Signing is mandatory when RELEASE_SIGNING_REQUIRED=1 (official upstream tag
+# releases). Without that flag, missing credentials only warn and exit 0 so forks
+# and manual development runs can still build unsigned artifacts.
 # Provide a code-signing certificate as a base64-encoded .pfx in the
 # WINDOWS_CERT_BASE64 secret and its password in WINDOWS_CERT_PASSWORD.
 #
@@ -14,8 +15,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $env:WINDOWS_CERT_BASE64) {
+  if ($env:RELEASE_SIGNING_REQUIRED -eq "1") {
+    throw "RELEASE_SIGNING_REQUIRED=1 but WINDOWS_CERT_BASE64 is not set."
+  }
   Write-Warning "WINDOWS_CERT_BASE64 not set - leaving '$File' UNSIGNED."
   exit 0
+}
+if (-not $env:WINDOWS_CERT_PASSWORD -and $env:RELEASE_SIGNING_REQUIRED -eq "1") {
+  throw "RELEASE_SIGNING_REQUIRED=1 but WINDOWS_CERT_PASSWORD is not set."
 }
 
 $pfx = Join-Path $env:RUNNER_TEMP "filesec-codesign.pfx"

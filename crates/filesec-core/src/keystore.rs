@@ -413,6 +413,7 @@ pub fn import_identity_armored(text: &str, passphrase: &[u8]) -> Result<Identity
     if backup.version != VERSION_BACKUP_V1 {
         return Err(Error::Format("identity backup version mismatch"));
     }
+    backup.kdf.validate_for_open()?;
 
     let master = kdf::derive_master_key(passphrase, &backup.salt, backup.kdf)?;
     let plaintext = Zeroizing::new(
@@ -606,12 +607,14 @@ impl KeystoreFile {
             if v2.version != VERSION_V2 {
                 return Err(Error::Format("keystore version mismatch"));
             }
+            v2.passphrase.kdf.validate_for_open()?;
             Ok(Self(Inner::V2(v2)))
         } else {
             let v1: KeystoreV1 = codec::from_slice(bytes)?;
             if v1.version != VERSION_V1 {
                 return Err(Error::Format("unsupported keystore version"));
             }
+            v1.kdf.validate_for_open()?;
             Ok(Self(Inner::V1(v1)))
         }
     }
@@ -790,6 +793,14 @@ mod tests {
         }
     }
 
+    fn excessive_params() -> KdfParams {
+        KdfParams {
+            m_cost: kdf::KdfPolicy::open().max_m_cost + 1,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
     /// An exported backup decrypts back to the same identity (same fingerprint,
     /// name, and creation time) under the export passphrase.
     #[test]
@@ -845,6 +856,46 @@ mod tests {
             data_encoding::BASE64.encode(&framed)
         );
         assert!(import_identity_armored(&tampered, b"backup-pass").is_err());
+    }
+
+    #[test]
+    fn keystore_parser_rejects_excessive_v1_kdf_params() {
+        let v1 = KeystoreV1 {
+            version: VERSION_V1,
+            kdf: excessive_params(),
+            salt: vec![0u8; SALT_LEN],
+            nonce: vec![0u8; aead::NONCE_LEN],
+            ciphertext: vec![0u8; aead::TAG_LEN],
+        };
+        let bytes = codec::to_vec(&v1).unwrap();
+        assert!(matches!(
+            KeystoreFile::from_bytes(&bytes),
+            Err(Error::KdfParams(_))
+        ));
+    }
+
+    #[test]
+    fn identity_backup_import_rejects_excessive_kdf_params() {
+        let backup = IdentityBackupV1 {
+            version: VERSION_BACKUP_V1,
+            kdf: excessive_params(),
+            salt: vec![0u8; SALT_LEN],
+            nonce: vec![0u8; aead::NONCE_LEN],
+            ciphertext: vec![0u8; aead::TAG_LEN],
+        };
+        let body = codec::to_vec(&backup).unwrap();
+        let mut framed = Vec::with_capacity(MAGIC_BACKUP.len() + 2 + body.len());
+        framed.extend_from_slice(MAGIC_BACKUP);
+        framed.extend_from_slice(&VERSION_BACKUP_V1.to_be_bytes());
+        framed.extend_from_slice(&body);
+        let armored = format!(
+            "{BACKUP_ARMOR_BEGIN}\n{}\n{BACKUP_ARMOR_END}\n",
+            data_encoding::BASE64.encode(&framed)
+        );
+        assert!(matches!(
+            import_identity_armored(&armored, b"backup-pass"),
+            Err(Error::KdfParams(_))
+        ));
     }
 
     /// A backup and a live keystore are distinct artifacts: neither parser accepts

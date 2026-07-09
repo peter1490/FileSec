@@ -13,8 +13,9 @@ name: Release
 #
 # Each variant is built in its own `cargo build -p <package>` invocation so the
 # networking code is never unified into the standard binary. Signing and
-# notarization are gated on secrets, so the build runs end-to-end (producing
-# unsigned artifacts) on a fork that has none. See RELEASE.md for the secrets.
+# notarization are mandatory for official version tags on the upstream repo.
+# Forks and manual development runs may still build unsigned artifacts, but they
+# do not publish stable upstream releases. See RELEASE.md for the secrets.
 
 on:
   push:
@@ -43,6 +44,7 @@ jobs:
       AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER: ${{ secrets.AC_API_ISSUER }}
+      RELEASE_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -94,6 +96,16 @@ jobs:
           echo "$AC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/ac_api_key.p8"
           echo "AC_API_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8" >> "$GITHUB_ENV"
 
+      - name: Require macOS signing for official tags
+        if: env.RELEASE_SIGNING_REQUIRED == '1'
+        run: |
+          test -n "$MACOS_CERT_P12_BASE64"
+          test -n "$MACOS_CERT_PASSWORD"
+          test -n "$MACOS_SIGN_IDENTITY"
+          test -n "$AC_API_KEY_BASE64"
+          test -n "$AC_API_KEY_ID"
+          test -n "$AC_API_ISSUER"
+
       - name: Package archive + signed/notarized .dmg
         run: |
           BASE="$BIN-$VERSION-universal-apple-darwin"
@@ -119,6 +131,7 @@ jobs:
     env:
       WINDOWS_CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      RELEASE_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -150,6 +163,15 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build --locked --release $BUILD_ARGS
+
+      - name: Require Windows signing for official tags
+        if: env.RELEASE_SIGNING_REQUIRED == '1'
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
+            throw "Official tag releases require WINDOWS_CERT_BASE64 and WINDOWS_CERT_PASSWORD."
+          }
 
       - name: Sign executable
         shell: pwsh
@@ -256,7 +278,7 @@ jobs:
     name: Publish GitHub Release
     needs: [macos, windows, linux]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec'
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4

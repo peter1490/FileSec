@@ -48,7 +48,7 @@ fn fixture() -> (Arc<Identity>, Arc<Identity>, Arc<Store>, Arc<Store>, String) {
     let alice = Arc::new(Identity::generate("Alice", 0).unwrap());
     let bob = Arc::new(Identity::generate("Bob", 0).unwrap());
 
-    let vid = new_vault_id();
+    let vid = new_vault_id().unwrap();
     let mut vault = Vault::new("Shared", 0);
     vault
         .add_file(
@@ -304,7 +304,7 @@ fn loopback_large_multifile_roundtrips_with_exact_size() {
     // `big` spans several 64 KiB transfer chunks; an empty file and a nested file
     // exercise the per-blob boundaries of the streaming reader.
     let big = vec![0xABu8; 200 * 1024];
-    let vid = new_vault_id();
+    let vid = new_vault_id().unwrap();
     let mut vault = Vault::new("Bundle", 0);
     vault.add_file("big.bin", big.clone(), None, None).unwrap();
     vault

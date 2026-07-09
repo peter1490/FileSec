@@ -196,7 +196,8 @@ fn handle_conn(
     }
 
     // Stream the encrypted container to a private temp, then verify + import.
-    let temp = store.create_private_checkout_file(&format!("incoming-{}.fsec", new_vault_id()))?;
+    let incoming_id = new_vault_id()?;
+    let temp = store.create_private_checkout_file(&format!("incoming-{incoming_id}.fsec"))?;
     let result = match receive_into(
         &mut stream,
         &mut session,
@@ -293,7 +294,7 @@ fn import_received(
     if &sender.fingerprint != peer_fpr {
         return Err("the file's signature does not match the connected sender".into());
     }
-    let id = new_vault_id();
+    let id = new_vault_id()?;
     store.import_reader_to_vault(identity, &id, &reader)?;
     let file_count = reader.file_count();
     let meta = VaultMeta {

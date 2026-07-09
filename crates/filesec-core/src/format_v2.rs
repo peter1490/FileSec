@@ -840,6 +840,13 @@ fn new_file_id() -> Result<String> {
 
 /// Read a whole file, rejecting anything larger than `max` (untrusted-input guard).
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let meta = fs_err::metadata(path)?;
+    if !meta.is_file() {
+        return Err(Error::Format("metadata path is not a file"));
+    }
+    if meta.len() > max {
+        return Err(Error::Format("file too large"));
+    }
     let bytes = fs_err::read(path)?;
     if bytes.len() as u64 > max {
         return Err(Error::Format("file too large"));
@@ -1089,5 +1096,49 @@ impl Read for V2PlaintextReader<'_> {
             cur.hasher.update(&buf[..n]);
             return Ok(n);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let suffix = crate::util::hex(&crate::secret::random_array::<8>().unwrap());
+        std::env::temp_dir().join(format!("filesec-v2-bounds-{suffix}-{name}"))
+    }
+
+    #[test]
+    fn read_bounded_rejects_oversized_header_before_read() {
+        let dir = tmp("header");
+        fs_err::create_dir_all(&dir).unwrap();
+        let header = dir.join(HEADER_FILE);
+        fs_err::File::create(&header)
+            .unwrap()
+            .set_len(MAX_HEADER_LEN + 1)
+            .unwrap();
+        assert!(matches!(
+            read_bounded(&header, MAX_HEADER_LEN),
+            Err(Error::Format("file too large"))
+        ));
+        let _ = fs_err::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_bounded_rejects_oversized_manifest_before_read() {
+        let dir = tmp("manifest");
+        fs_err::create_dir_all(&dir).unwrap();
+        let manifest = dir.join(MANIFEST_FILE);
+        fs_err::File::create(&manifest)
+            .unwrap()
+            .set_len(MAX_MANIFEST_LEN + 1)
+            .unwrap();
+        assert!(matches!(
+            read_bounded(&manifest, MAX_MANIFEST_LEN),
+            Err(Error::Format("file too large"))
+        ));
+        let _ = fs_err::remove_dir_all(&dir);
     }
 }

@@ -43,7 +43,7 @@ fn full_persistence_roundtrip() {
     assert_eq!(unlocked.fingerprint(), id.fingerprint());
 
     // Vault save / load (encrypted-to-self at rest).
-    let vid = new_vault_id();
+    let vid = new_vault_id().unwrap();
     let mut v = Vault::new("Docs", 10);
     v.add_file("a/b.txt", b"hello".to_vec(), None, None)
         .unwrap();
@@ -104,7 +104,7 @@ fn replace_file_in_vault_roundtrip() {
     let dir = tmp();
     let store = Store::at(&dir).unwrap();
     let id = Identity::generate("Alice", 0).unwrap();
-    let vid = new_vault_id();
+    let vid = new_vault_id().unwrap();
     let mut v = Vault::new("Docs", 10);
     v.add_file("a/b.txt", b"original".to_vec(), Some(1), Some(0o644))
         .unwrap();
@@ -221,7 +221,7 @@ fn migrate_classical_store_to_post_quantum() {
     store
         .save_keystore(&KeystoreFile::create(&old, pass, fast_kdf()).unwrap())
         .unwrap();
-    let vid = new_vault_id();
+    let vid = new_vault_id().unwrap();
     let mut v = Vault::new("Docs", 10);
     v.add_file("a/b.txt", b"hello".to_vec(), None, None)
         .unwrap();

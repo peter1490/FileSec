@@ -29,9 +29,29 @@ use filesec_core::SuiteId;
 
 use crate::autounlock;
 use crate::passkey;
-use crate::store::{new_vault_id, write_private_export, Registry, Store, VaultMeta};
+use crate::store::{new_vault_id, write_private_export, Registry, Store, StoreResult, VaultMeta};
 
 use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
+
+const MIN_PASSPHRASE_CHARS: usize = 12;
+const MIN_PASSPHRASE_SCORE: u32 = 7;
+const PASSPHRASE_HINT: &str = "Strong passphrase";
+const PASSPHRASE_STRENGTH_MESSAGE: &str =
+    "Use a stronger passphrase: combine several words or mix letters, numbers, and symbols.";
+const MAX_PUBLIC_IDENTITY_FILE_LEN: u64 = 256 * 1024;
+const MAX_IDENTITY_BACKUP_FILE_LEN: u64 = 4 * 1024 * 1024;
+const COMMON_WEAK_PASSPHRASES: &[&str] = &[
+    "password",
+    "password1",
+    "password12",
+    "password123",
+    "password1234",
+    "123456789012",
+    "qwerty123456",
+    "letmein12345",
+    "admin1234567",
+    "filesec12345",
+];
 
 /// Top-level application.
 pub struct App {
@@ -1724,8 +1744,8 @@ impl App {
                 f.error = Some("Please enter a display name.".into());
                 return;
             }
-            if f.pass.chars().count() < 8 {
-                f.error = Some("Passphrase must be at least 8 characters.".into());
+            if let Some(error) = passphrase_policy_error(&f.pass) {
+                f.error = Some(error);
                 return;
             }
             if f.pass != f.pass2 {
@@ -2168,7 +2188,10 @@ impl App {
             _ => return,
         };
         self.spawn_job(ctx, "Creating vault…", move || {
-            let id = new_vault_id();
+            let id = match new_vault_id() {
+                Ok(id) => id,
+                Err(e) => return JobReport::err(e),
+            };
             let vault = Vault::new(&name, now_unix());
             if let Err(e) = store.save_vault(&identity, &id, &vault) {
                 return JobReport::err(e);
@@ -2555,10 +2578,17 @@ impl App {
             None => return,
         };
         let now = now_unix();
-        let pairs: Vec<(String, String)> = paths
+        let pairs: Vec<(String, String)> = match paths
             .iter()
-            .map(|p| (p.clone(), trash_dest(now, &trash_tag(), p)))
-            .collect();
+            .map(|p| trash_tag().map(|tag| (p.clone(), trash_dest(now, &tag, p))))
+            .collect::<StoreResult<_>>()
+        {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                self.set_toast(e, true);
+                return;
+            }
+        };
         let n = pairs.len();
         self.spawn_job(ctx, "Moving to Trash…", move || {
             if let Err(e) = store.rename_in_vault(&identity, &id, &reader, &pairs) {
@@ -2672,7 +2702,14 @@ impl App {
             Some(x) => x,
             None => return,
         };
-        let dest = trash_dest(now_unix(), &trash_tag(), &path);
+        let tag = match trash_tag() {
+            Ok(tag) => tag,
+            Err(e) => {
+                self.set_toast(e, true);
+                return;
+            }
+        };
+        let dest = trash_dest(now_unix(), &tag, &path);
         let leaf = leaf_name(&path).to_string();
         self.spawn_job(ctx, "Moving to Trash…", move || {
             // A manifest-only rename: the blobs stay put, nothing is decrypted.
@@ -3327,7 +3364,10 @@ impl App {
                 Ok(x) => x,
                 Err(e) => return JobReport::err(e.to_string()),
             };
-            let id = new_vault_id();
+            let id = match new_vault_id() {
+                Ok(id) => id,
+                Err(e) => return JobReport::err(e),
+            };
             if let Err(e) = store.import_reader_to_vault(&identity, &id, &reader) {
                 return JobReport::err(e);
             }
@@ -3545,10 +3585,14 @@ impl App {
             Some(p) => p,
             None => return,
         };
-        let bytes = match std::fs::read(&path) {
+        let bytes = match read_bounded_file(
+            &path,
+            MAX_PUBLIC_IDENTITY_FILE_LEN,
+            "FileSec public key file",
+        ) {
             Ok(b) => b,
             Err(e) => {
-                self.set_toast(e.to_string(), true);
+                self.set_toast(e, true);
                 return;
             }
         };
@@ -3739,8 +3783,8 @@ impl App {
         let pass = match &mut self.state {
             State::Unlocked(s) => match &mut s.export_identity {
                 Some(f) => {
-                    if f.pass.chars().count() < 8 {
-                        f.error = Some("Backup passphrase must be at least 8 characters.".into());
+                    if let Some(error) = passphrase_policy_error(&f.pass) {
+                        f.error = Some(error);
                         return;
                     }
                     if f.pass != f.pass2 {
@@ -3808,8 +3852,8 @@ impl App {
                         r.error = Some("Enter the backup's passphrase.".into());
                         return;
                     }
-                    if r.new_pass.chars().count() < 8 {
-                        r.error = Some("New passphrase must be at least 8 characters.".into());
+                    if let Some(error) = passphrase_policy_error(&r.new_pass) {
+                        r.error = Some(error);
                         return;
                     }
                     if r.new_pass != r.new_pass2 {
@@ -3833,7 +3877,11 @@ impl App {
             None => return,
         };
         self.spawn_job(ctx, "Restoring identity…", move || {
-            let text = match std::fs::read_to_string(&path) {
+            let text = match read_bounded_text_file(
+                &path,
+                MAX_IDENTITY_BACKUP_FILE_LEN,
+                "FileSec identity backup",
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     return JobReport {
@@ -4801,7 +4849,7 @@ fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>
                     );
                     ui.add_space(10.0);
                     field_label(ui, "New passphrase for this device");
-                    theme::text_input(ui, &mut r.new_pass, "At least 8 characters", true);
+                    theme::text_input(ui, &mut r.new_pass, PASSPHRASE_HINT, true);
                     ui.add_space(10.0);
                     field_label(ui, "Confirm new passphrase");
                     theme::text_input(ui, &mut r.new_pass2, "Repeat new passphrase", true);
@@ -4826,7 +4874,7 @@ fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>
                     theme::text_input(ui, &mut f.name, "e.g. Alice", false);
                     ui.add_space(10.0);
                     field_label(ui, "Passphrase");
-                    theme::text_input(ui, &mut f.pass, "At least 8 characters", true);
+                    theme::text_input(ui, &mut f.pass, PASSPHRASE_HINT, true);
                     ui.add_space(10.0);
                     field_label(ui, "Confirm passphrase");
                     theme::text_input(ui, &mut f.pass2, "Repeat passphrase", true);
@@ -6517,7 +6565,7 @@ fn export_identity_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
                 ui.add(
                     egui::TextEdit::singleline(&mut form.pass)
                         .password(true)
-                        .hint_text("At least 8 characters")
+                        .hint_text(PASSPHRASE_HINT)
                         .desired_width(240.0),
                 );
                 ui.end_row();
@@ -7022,6 +7070,113 @@ fn file_mtime(path: &std::path::Path) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
+fn passphrase_policy_error(passphrase: &str) -> Option<String> {
+    let chars: Vec<char> = passphrase.chars().collect();
+    if chars.len() < MIN_PASSPHRASE_CHARS {
+        return Some(format!(
+            "Passphrase must be at least {MIN_PASSPHRASE_CHARS} characters."
+        ));
+    }
+    let lowered = passphrase.to_lowercase();
+    if COMMON_WEAK_PASSPHRASES.contains(&lowered.as_str()) {
+        return Some(PASSPHRASE_STRENGTH_MESSAGE.into());
+    }
+    let unique = chars.iter().copied().collect::<HashSet<_>>().len();
+    if unique < 6 || has_long_repeated_run(&chars) {
+        return Some(PASSPHRASE_STRENGTH_MESSAGE.into());
+    }
+    if passphrase_strength_score(passphrase, &chars, unique) < MIN_PASSPHRASE_SCORE {
+        return Some(PASSPHRASE_STRENGTH_MESSAGE.into());
+    }
+    None
+}
+
+fn has_long_repeated_run(chars: &[char]) -> bool {
+    let mut last = None;
+    let mut run = 0usize;
+    for &ch in chars {
+        if Some(ch) == last {
+            run += 1;
+        } else {
+            last = Some(ch);
+            run = 1;
+        }
+        if run >= 5 {
+            return true;
+        }
+    }
+    false
+}
+
+fn passphrase_strength_score(passphrase: &str, chars: &[char], unique: usize) -> u32 {
+    let len = chars.len();
+    let mut score = 0u32;
+    if len >= MIN_PASSPHRASE_CHARS {
+        score += 2;
+    }
+    if len >= 16 {
+        score += 1;
+    }
+    if len >= 20 {
+        score += 1;
+    }
+    if len >= 28 {
+        score += 1;
+    }
+
+    let has_lower = chars.iter().any(|c| c.is_ascii_lowercase());
+    let has_upper = chars.iter().any(|c| c.is_ascii_uppercase());
+    let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+    let has_space = chars.iter().any(|c| c.is_whitespace());
+    let has_symbol = chars
+        .iter()
+        .any(|c| !c.is_alphanumeric() && !c.is_whitespace());
+    score += [has_lower, has_upper, has_digit, has_space, has_symbol]
+        .into_iter()
+        .filter(|has| *has)
+        .count() as u32;
+
+    let word_count = passphrase
+        .split_whitespace()
+        .filter(|word| word.chars().count() >= 3)
+        .count();
+    if word_count >= 4 && len >= 20 {
+        score += 2;
+    }
+    if unique >= 8 {
+        score += 1;
+    }
+    score
+}
+
+fn read_bounded_file(
+    path: &std::path::Path,
+    max_len: u64,
+    label: &'static str,
+) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err(format!("{label} is not a file."));
+    }
+    if meta.len() > max_len {
+        return Err(format!("{label} is too large."));
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > max_len {
+        return Err(format!("{label} is too large."));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_text_file(
+    path: &std::path::Path,
+    max_len: u64,
+    label: &'static str,
+) -> Result<String, String> {
+    let bytes = read_bounded_file(path, max_len, label)?;
+    String::from_utf8(bytes).map_err(|_| format!("{label} is not valid UTF-8."))
+}
+
 /// Pick a vault path for `base` that does not collide with any path in
 /// `existing`, appending " (n)" before the extension if needed.
 fn unique_name_in(existing: &HashSet<String>, base: &str) -> String {
@@ -7304,8 +7459,9 @@ fn snapshot_entries(reader: &VaultReaderV2) -> Vec<(String, EntryKind, u64)> {
 
 /// A short random hex tag that makes each trash token unique, so two deletions
 /// of the same path (even in the same second) never collide.
-fn trash_tag() -> String {
-    hex(&filesec_core::secret::random_vec(4).unwrap_or_else(|_| vec![0u8; 4]))
+fn trash_tag() -> StoreResult<String> {
+    let bytes = filesec_core::secret::random_array::<4>().map_err(|e| e.to_string())?;
+    Ok(hex(&bytes))
 }
 
 /// The parent directory of a normalized vault path ("" for a top-level entry).
@@ -8048,6 +8204,65 @@ mod ui_smoke {
     }
 
     #[test]
+    fn passphrase_policy_rejects_short_and_weak_inputs() {
+        assert_eq!(
+            passphrase_policy_error("short").unwrap(),
+            format!("Passphrase must be at least {MIN_PASSPHRASE_CHARS} characters.")
+        );
+        assert_eq!(
+            passphrase_policy_error("password1234").unwrap(),
+            PASSPHRASE_STRENGTH_MESSAGE
+        );
+        assert_eq!(
+            passphrase_policy_error("aaaaaaaaaaaaaaaa").unwrap(),
+            PASSPHRASE_STRENGTH_MESSAGE
+        );
+        assert_eq!(
+            passphrase_policy_error("verylongbutonlylowercase").unwrap(),
+            PASSPHRASE_STRENGTH_MESSAGE
+        );
+    }
+
+    #[test]
+    fn passphrase_policy_accepts_strong_local_passphrases() {
+        assert!(passphrase_policy_error("correct horse battery staple").is_none());
+        assert!(passphrase_policy_error("LongEnough123!").is_none());
+    }
+
+    #[test]
+    fn bounded_identity_import_reads_reject_oversized_files() {
+        let suffix = filesec_core::util::hex(&filesec_core::secret::random_array::<8>().unwrap());
+        let dir = std::env::temp_dir().join(format!("filesec-gui-bounds-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pubkey = dir.join("oversized.fsecpub");
+        std::fs::File::create(&pubkey)
+            .unwrap()
+            .set_len(MAX_PUBLIC_IDENTITY_FILE_LEN + 1)
+            .unwrap();
+        assert!(read_bounded_file(
+            &pubkey,
+            MAX_PUBLIC_IDENTITY_FILE_LEN,
+            "FileSec public key file"
+        )
+        .is_err());
+
+        let backup = dir.join("oversized.fsecid");
+        std::fs::File::create(&backup)
+            .unwrap()
+            .set_len(MAX_IDENTITY_BACKUP_FILE_LEN + 1)
+            .unwrap();
+        assert!(read_bounded_text_file(
+            &backup,
+            MAX_IDENTITY_BACKUP_FILE_LEN,
+            "FileSec identity backup"
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn screens_render_without_panic() {
         let ctx = test_ctx();
         let mut s = test_session();
@@ -8120,7 +8335,7 @@ mod ui_smoke {
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::at(&dir).expect("store");
         let id = Identity::generate("Tester", 0).expect("identity");
-        let vid = new_vault_id();
+        let vid = new_vault_id().unwrap();
         store
             .save_vault(&id, &vid, &Vault::new("Demo", 0))
             .expect("save vault");
@@ -8248,7 +8463,7 @@ mod ui_smoke {
         s.move_form = None;
 
         // Empty-vault state.
-        let empty_vid = new_vault_id();
+        let empty_vid = new_vault_id().unwrap();
         store
             .save_vault(s.identity.as_ref(), &empty_vid, &Vault::new("Empty", 0))
             .expect("save empty");
