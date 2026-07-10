@@ -132,9 +132,9 @@ pub use hardware::HardwareKey;
 mod hardware {
     use super::{Authenticator, PasskeyError, HMAC_SECRET_LEN};
     use ctap_hid_fido2::fidokey::{
-        get_assertion::get_assertion_params::Extension as GaExt,
-        make_credential::make_credential_params::Extension as McExt, GetAssertionArgsBuilder,
-        MakeCredentialArgsBuilder,
+        get_assertion::get_assertion_params::{Extension as GaExt, GetAssertionArgs},
+        make_credential::make_credential_params::{Extension as McExt, MakeCredentialArgs},
+        GetAssertionArgsBuilder, MakeCredentialArgsBuilder,
     };
     use ctap_hid_fido2::{Cfg, FidoKeyHidFactory};
     use filesec_core::keystore::PasskeyEnrollment;
@@ -154,6 +154,44 @@ mod hardware {
             .map_err(|e| PasskeyError::new(format!("no security key found: {e}")))
     }
 
+    /// High-security verification policy for a get-assertion: when a PIN is
+    /// supplied we authenticate with it (which performs user verification);
+    /// otherwise we keep the builder's default `uv = Some(true)` so the
+    /// authenticator still enforces built-in UV (biometric / its own PIN). We
+    /// deliberately never call `without_pin_and_uv()` — no-verification unlock is
+    /// not offered for the keystore (F10).
+    fn get_assertion_args<'a>(
+        rp_id: &str,
+        challenge: &[u8],
+        credential_id: &[u8],
+        hmac_salt: &[u8; HMAC_SECRET_LEN],
+        pin: Option<&'a str>,
+    ) -> GetAssertionArgs<'a> {
+        let mut builder = GetAssertionArgsBuilder::new(rp_id, challenge)
+            .credential_id(credential_id)
+            .extensions(&[GaExt::HmacSecret(Some(*hmac_salt))]);
+        if let Some(p) = pin {
+            builder = builder.pin(p);
+        }
+        builder.build()
+    }
+
+    /// The make-credential counterpart of [`get_assertion_args`]: enrollment
+    /// requires user verification by default and never falls back to a
+    /// no-verification ceremony (F10).
+    fn make_credential_args<'a>(
+        rp_id: &str,
+        challenge: &[u8],
+        pin: Option<&'a str>,
+    ) -> MakeCredentialArgs<'a> {
+        let mut builder =
+            MakeCredentialArgsBuilder::new(rp_id, challenge).extensions(&[McExt::HmacSecret(Some(true))]);
+        if let Some(p) = pin {
+            builder = builder.pin(p);
+        }
+        builder.build()
+    }
+
     /// Run a get-assertion with the `hmac-secret` extension and return the
     /// 32-byte output the key derived for `hmac_salt`.
     fn derive_hmac_secret(
@@ -164,15 +202,9 @@ mod hardware {
         pin: Option<&str>,
     ) -> Result<Zeroizing<[u8; HMAC_SECRET_LEN]>, PasskeyError> {
         let challenge = random32()?;
-        let mut builder = GetAssertionArgsBuilder::new(rp_id, &challenge)
-            .credential_id(credential_id)
-            .extensions(&[GaExt::HmacSecret(Some(*hmac_salt))]);
-        builder = match pin {
-            Some(p) => builder.pin(p),
-            None => builder.without_pin_and_uv(),
-        };
+        let args = get_assertion_args(rp_id, &challenge, credential_id, hmac_salt, pin);
         let assertions = device
-            .get_assertion_with_args(&builder.build())
+            .get_assertion_with_args(&args)
             .map_err(|e| PasskeyError::new(format!("authentication failed: {e}")))?;
         let first = assertions
             .into_iter()
@@ -198,14 +230,9 @@ mod hardware {
         ) -> Result<PasskeyEnrollment, PasskeyError> {
             let device = open_device()?;
             let challenge = random32()?;
-            let mut builder = MakeCredentialArgsBuilder::new(rp_id, &challenge)
-                .extensions(&[McExt::HmacSecret(Some(true))]);
-            builder = match pin {
-                Some(p) => builder.pin(p),
-                None => builder.without_pin_and_uv(),
-            };
+            let args = make_credential_args(rp_id, &challenge, pin);
             let attestation = device
-                .make_credential_with_args(&builder.build())
+                .make_credential_with_args(&args)
                 .map_err(|e| PasskeyError::new(format!("could not create a passkey: {e}")))?;
             let credential_id = attestation.credential_descriptor.id.clone();
             if credential_id.is_empty() {
@@ -236,6 +263,46 @@ mod hardware {
         ) -> Result<Zeroizing<[u8; HMAC_SECRET_LEN]>, PasskeyError> {
             let device = open_device()?;
             derive_hmac_secret(&device, rp_id, credential_id, hmac_salt, pin)
+        }
+    }
+
+    // These tests only assemble the CTAP2 request arguments and inspect them —
+    // no authenticator is touched — so they run in the (feature-gated) CI build
+    // without any physical key. They pin the F10 policy: no ceremony is ever
+    // configured to skip user verification.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const RP: &str = "filesec.local";
+
+        #[test]
+        fn no_pin_ceremonies_request_user_verification_by_default() {
+            // Enrollment with no PIN must still request UV (uv = Some(true)),
+            // never the old no-PIN/no-UV path.
+            let mc = make_credential_args(RP, &[0u8; 32], None);
+            assert_eq!(mc.uv, Some(true), "enroll must require user verification");
+            assert!(mc.pin.is_none());
+
+            // Unlock (get-assertion) with no PIN must likewise request UV.
+            let salt = [0x11u8; HMAC_SECRET_LEN];
+            let ga = get_assertion_args(RP, &[0u8; 32], b"cred", &salt, None);
+            assert_eq!(ga.uv, Some(true), "unlock must require user verification");
+            assert!(ga.pin.is_none());
+        }
+
+        #[test]
+        fn pin_ceremonies_authenticate_with_the_pin() {
+            // A supplied PIN is used to verify; the builder clears the separate
+            // uv hint because the PIN itself performs verification.
+            let mc = make_credential_args(RP, &[0u8; 32], Some("1234"));
+            assert_eq!(mc.pin, Some("1234"));
+            assert_eq!(mc.uv, None);
+
+            let salt = [0x22u8; HMAC_SECRET_LEN];
+            let ga = get_assertion_args(RP, &[0u8; 32], b"cred", &salt, Some("1234"));
+            assert_eq!(ga.pin, Some("1234"));
+            assert_eq!(ga.uv, None);
         }
     }
 }

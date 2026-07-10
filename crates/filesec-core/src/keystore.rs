@@ -64,6 +64,10 @@ const SALT_LEN: usize = 16;
 /// Length of the `hmac-secret` salt fed to the authenticator and of the 32-byte
 /// secret it returns.
 pub const HMAC_SECRET_LEN: usize = 32;
+/// Length of the random device-unlock token held in the OS keychain (see
+/// [`KeystoreFile::set_device_token`]). A full-entropy 256-bit secret, so the
+/// token itself is never enumerable and never a passphrase-equivalent.
+pub const DEVICE_TOKEN_LEN: usize = 32;
 
 /// AEAD associated data binding the v1 keystore purpose/version.
 const AAD_V1: &[u8] = b"FileSec keystore v1";
@@ -79,6 +83,9 @@ const AAD_BACKUP_V1: &[u8] = b"FileSec identity backup v1";
 /// Domain-separation context deriving a passkey slot's key-encryption key from
 /// the authenticator's `hmac-secret` output.
 const PASSKEY_KEK_CONTEXT: &str = "FileSec passkey keyslot v1";
+/// Domain-separation context deriving the device-unlock slot's key-encryption
+/// key from the random token held in the OS keychain.
+const DEVICE_KEK_CONTEXT: &str = "FileSec device unlock keyslot v1";
 
 /// The decrypted private identity bundle. Zeroized on drop.
 ///
@@ -222,6 +229,19 @@ fn passkey_wrap_aad(
         update_lp(&mut h, label.as_bytes());
         update_lp(&mut h, &added_at.to_le_bytes());
     }
+    let mut aad = WRAP_AAD_V2.to_vec();
+    aad.extend_from_slice(h.finalize().as_bytes());
+    aad
+}
+
+/// AEAD associated data for the device-unlock slot's DEK wrap. Binds the slot
+/// purpose so a device-wrapped DEK can never be confused with a passphrase- or
+/// passkey-wrapped one. The device token is the sole secret input; there are no
+/// public handles to bind (unlike a passkey), and the enclosing signed v3 state
+/// already authenticates the slot's presence.
+fn device_wrap_aad() -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    update_lp(&mut h, b"device");
     let mut aad = WRAP_AAD_V2.to_vec();
     aad.extend_from_slice(h.finalize().as_bytes());
     aad
@@ -470,6 +490,17 @@ struct PasskeySlot {
     wrapped_dek: Vec<u8>,
 }
 
+/// The optional device-unlock keyslot: the DEK wrapped under a key derived from
+/// a random 32-byte device token stored in the OS keychain. Backs "remember on
+/// this device" auto-unlock **without persisting the passphrase**. At most one
+/// exists; enrolling/removing it advances the signed v3 state (rollback
+/// protection), and the token alone is useless without this keystore file.
+#[derive(Clone, Serialize, Deserialize)]
+struct DeviceSlot {
+    nonce: Vec<u8>,
+    wrapped_dek: Vec<u8>,
+}
+
 /// On-disk v2 keystore body (serialized after the magic preamble).
 #[derive(Serialize, Deserialize)]
 struct KeystoreV2 {
@@ -479,6 +510,11 @@ struct KeystoreV2 {
     passphrase: PassphraseSlot,
     #[serde(default)]
     passkeys: Vec<PasskeySlot>,
+    /// Present only when device auto-unlock is enrolled. `skip_serializing_if`
+    /// keeps keystores without it byte-for-byte unchanged (so existing signed
+    /// state stays valid) and lets legacy v2 bodies deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<DeviceSlot>,
 }
 
 /// Build the single passphrase slot wrapping `dek`.
@@ -517,6 +553,7 @@ impl KeystoreV2 {
                 bundle_ct,
                 passphrase,
                 passkeys: Vec::new(),
+                device: None,
             },
             dek,
         ))
@@ -576,6 +613,29 @@ impl KeystoreV2 {
             wrapped_dek,
         });
         Ok(())
+    }
+
+    /// Wrap the (already recovered) `dek` under the device-unlock token,
+    /// replacing any existing device slot.
+    fn set_device_slot(&mut self, dek: &SymKey, token: &[u8]) -> Result<()> {
+        let kek = kdf::derive_subkey(DEVICE_KEK_CONTEXT, token);
+        let aad = device_wrap_aad();
+        let (nonce, wrapped_dek) = wrap_dek(&kek, dek, &aad)?;
+        self.device = Some(DeviceSlot { nonce, wrapped_dek });
+        Ok(())
+    }
+
+    /// Recover the DEK via the device-unlock slot. A wrong/absent token yields
+    /// [`Error::Auth`]/[`Error::Format`] rather than opening anything.
+    fn unlock_with_device(&self, token: &[u8]) -> Result<Identity> {
+        let slot = self
+            .device
+            .as_ref()
+            .ok_or(Error::Format("no device-unlock slot is enrolled"))?;
+        let kek = kdf::derive_subkey(DEVICE_KEK_CONTEXT, token);
+        let aad = device_wrap_aad();
+        let dek = unwrap_dek(&kek, &slot.nonce, &slot.wrapped_dek, &aad)?;
+        decrypt_bundle(&dek, &self.bundle_nonce, &self.bundle_ct)
     }
 }
 
@@ -892,6 +952,67 @@ impl KeystoreFile {
         }
     }
 
+    /// Enroll a random device-unlock `token` as an additional unlock method
+    /// ("remember on this device"). The passphrase recovers the DEK and signing
+    /// identity; `token` wraps that same DEK in a dedicated device slot. The
+    /// mutation advances and re-signs the rollback-protected v3 state, and the
+    /// passphrase slot is always retained.
+    ///
+    /// The token is a full-entropy secret held in the OS keychain — the raw
+    /// passphrase is never stored. Only a keystore already in the signed v3
+    /// format (the normal case after [`Self::from_bytes`]) can enroll one;
+    /// pre-anchor v1/v2 state must be recovered first.
+    ///
+    /// Mutates only the in-memory keystore — the caller must persist the result.
+    pub fn set_device_token(&mut self, passphrase: &[u8], token: &[u8]) -> Result<()> {
+        match &mut self.0 {
+            Inner::V3(v3) => {
+                let dek = v3.body.unlock_dek_with_passphrase(passphrase)?;
+                // Reconstruct the signing identity from the same DEK so the
+                // re-sign needs no second (expensive) Argon2id pass.
+                let signer = decrypt_bundle(&dek, &v3.body.bundle_nonce, &v3.body.bundle_ct)?;
+                v3.body.set_device_slot(&dek, token)?;
+                v3.advance(&signer)
+            }
+            Inner::V1(_) | Inner::V2(_) => Err(Error::LegacyState("keystore")),
+        }
+    }
+
+    /// Remove the device-unlock slot, if any. Advances and re-signs the v3 state
+    /// so a restored older keystore cannot silently reinstate a forgotten device.
+    /// A no-op (no slot present) leaves the state untouched.
+    ///
+    /// Mutates only the in-memory keystore — the caller must persist the result.
+    pub fn remove_device_token(&mut self, identity: &Identity) -> Result<()> {
+        match &mut self.0 {
+            Inner::V3(v3) => {
+                if v3.body.device.take().is_some() {
+                    v3.advance(identity)?;
+                }
+                Ok(())
+            }
+            Inner::V1(_) | Inner::V2(_) => Err(Error::LegacyState("keystore")),
+        }
+    }
+
+    /// Whether a device-unlock slot is enrolled (always false for legacy v1/v2).
+    #[must_use]
+    pub fn has_device_token(&self) -> bool {
+        matches!(&self.0, Inner::V3(v3) if v3.body.device.is_some())
+    }
+
+    /// Decrypt and reconstruct the [`Identity`] using the device-unlock `token`.
+    /// A wrong or absent token surfaces as [`Error::Auth`]/[`Error::Format`] and
+    /// never as a passphrase result, so a token can't be probed as a passphrase.
+    pub fn unlock_with_device_token(&self, token: &[u8]) -> Result<Identity> {
+        match &self.0 {
+            Inner::V3(v3) => v3.body.unlock_with_device(token),
+            Inner::V1(_) | Inner::V2(_) => {
+                Err(Error::Format("no device-unlock slot is enrolled"))
+            }
+        }
+    }
+
     /// Authenticated state metadata used by the independent high-water anchor.
     #[must_use]
     pub fn state_metadata(&self) -> Option<&StateMetadata> {
@@ -977,6 +1098,125 @@ mod tests {
         assert!(ks.unlock_with_passkey(0, &secret).is_err());
         // The independent passphrase slot still opens it.
         assert_eq!(ks.unlock(b"pw").unwrap().fingerprint(), id.fingerprint());
+    }
+
+    /// A new passkey slot binds its human label and enrollment timestamp into the
+    /// DEK-wrap AAD (`metadata_bound`), so tampering with either makes the genuine
+    /// `hmac-secret` unable to unwrap the DEK — passkey metadata is authenticated,
+    /// not merely advisory. (F15)
+    #[test]
+    fn passkey_label_and_timestamp_are_authenticated() {
+        let id = Identity::generate("Mallory", 5).unwrap();
+        let mut ks = KeystoreFile::create(&id, b"pw", fast_params()).unwrap();
+        let secret = [0x66u8; HMAC_SECRET_LEN];
+        ks.add_passkey(b"pw", enroll(0x66, b"cred-meta")).unwrap();
+        assert!(ks.unlock_with_passkey(0, &secret).is_ok());
+
+        // Tamper the stored label: the recomputed wrap AAD no longer matches.
+        match &mut ks.0 {
+            Inner::V3(v3) => v3.body.passkeys[0].label.push('!'),
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
+        }
+        assert!(ks.unlock_with_passkey(0, &secret).is_err());
+
+        // Restore the label, tamper the timestamp instead: still rejected.
+        match &mut ks.0 {
+            Inner::V3(v3) => {
+                v3.body.passkeys[0].label.pop();
+                v3.body.passkeys[0].added_at += 1;
+            }
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
+        }
+        assert!(ks.unlock_with_passkey(0, &secret).is_err());
+    }
+
+    /// Enrolling and removing a passkey each advance the signed keystore epoch, so
+    /// a restored older keystore is a lower epoch and gets rejected as a rollback
+    /// by the high-water anchor. (F15)
+    #[test]
+    fn passkey_add_and_remove_advance_the_epoch() {
+        let id = Identity::generate("Epoch", 0).unwrap();
+        let mut ks = KeystoreFile::create(&id, b"pw", fast_params()).unwrap();
+        assert_eq!(ks.state_metadata().unwrap().epoch, 1);
+        ks.add_passkey(b"pw", enroll(0x77, b"cred-e")).unwrap();
+        assert_eq!(ks.state_metadata().unwrap().epoch, 2);
+        ks.remove_passkey(0, &id).unwrap();
+        assert_eq!(ks.state_metadata().unwrap().epoch, 3);
+        // The signed state still verifies after each mutation.
+        assert!(KeystoreFile::from_bytes(&ks.to_bytes().unwrap()).is_ok());
+    }
+
+    /// The device-unlock token wraps the DEK in its own slot: it opens the
+    /// keystore, but is never usable as a raw passphrase, and removing it (or a
+    /// wrong token) fails closed while the passphrase keeps working. Enrolling and
+    /// removing the slot advance the rollback-protected epoch. (F09)
+    #[test]
+    fn device_token_unlocks_but_is_not_a_passphrase() {
+        let id = Identity::generate("Device", 3).unwrap();
+        let mut ks = KeystoreFile::create(&id, b"correct passphrase", fast_params()).unwrap();
+        assert!(!ks.has_device_token());
+        assert_eq!(ks.state_metadata().unwrap().epoch, 1);
+
+        let token = [0x9cu8; DEVICE_TOKEN_LEN];
+        ks.set_device_token(b"correct passphrase", &token).unwrap();
+        assert!(ks.has_device_token());
+        assert_eq!(ks.state_metadata().unwrap().epoch, 2);
+
+        // The token opens the keystore.
+        assert_eq!(
+            ks.unlock_with_device_token(&token).unwrap().fingerprint(),
+            id.fingerprint()
+        );
+        // A wrong token fails closed.
+        assert!(ks.unlock_with_device_token(&[0u8; DEVICE_TOKEN_LEN]).is_err());
+        // The token is NOT a passphrase: feeding it to the passphrase path fails.
+        assert!(matches!(ks.unlock(&token), Err(Error::BadPassphrase)));
+        // And the passphrase is not the token: it can't unwrap the device slot.
+        assert!(ks.unlock_with_device_token(b"correct passphrase").is_err());
+
+        // Enrolling requires the correct passphrase.
+        assert!(matches!(
+            ks.set_device_token(b"wrong passphrase", &token),
+            Err(Error::BadPassphrase)
+        ));
+
+        // Removing it advances the epoch and disables token unlock; the
+        // passphrase still opens the keystore.
+        ks.remove_device_token(&id).unwrap();
+        assert!(!ks.has_device_token());
+        assert_eq!(ks.state_metadata().unwrap().epoch, 3);
+        assert!(ks.unlock_with_device_token(&token).is_err());
+        assert_eq!(
+            ks.unlock(b"correct passphrase").unwrap().fingerprint(),
+            id.fingerprint()
+        );
+        // The signed state round-trips after enroll+remove.
+        assert!(KeystoreFile::from_bytes(&ks.to_bytes().unwrap()).is_ok());
+    }
+
+    /// A device-token enrollment does not disturb the secret bundle (same DEK,
+    /// same ciphertext) or the passphrase/passkey slots — it only adds a wrap.
+    #[test]
+    fn device_token_does_not_reencrypt_bundle_or_touch_other_slots() {
+        let id = Identity::generate("Z", 0).unwrap();
+        let mut ks = KeystoreFile::create(&id, b"pw", fast_params()).unwrap();
+        ks.add_passkey(b"pw", enroll(0x12, b"cred-x")).unwrap();
+        let (n0, c0) = match &ks.0 {
+            Inner::V3(v3) => (v3.body.bundle_nonce.clone(), v3.body.bundle_ct.clone()),
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
+        };
+        ks.set_device_token(b"pw", &[0x34; DEVICE_TOKEN_LEN]).unwrap();
+        match &ks.0 {
+            Inner::V3(v3) => {
+                assert_eq!(v3.body.bundle_nonce, n0, "bundle nonce must not change");
+                assert_eq!(v3.body.bundle_ct, c0, "bundle ciphertext must not change");
+                assert_eq!(v3.body.passkeys.len(), 1, "passkey slot preserved");
+            }
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
+        }
+        // Both the passkey and the token still unlock after enrollment.
+        assert!(ks.unlock_with_passkey(0, &[0x12; HMAC_SECRET_LEN]).is_ok());
+        assert!(ks.unlock_with_device_token(&[0x34; DEVICE_TOKEN_LEN]).is_ok());
     }
 
     fn fast_params() -> KdfParams {

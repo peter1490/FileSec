@@ -19,8 +19,9 @@ can open it.
 > build (`--features pqc`) adds a hybrid X25519+ML-KEM-768 / Ed25519+ML-DSA-65
 > suite and an AES-256-GCM suite; an **opt-in passkey** build
 > (`--features passkey`) lets you unlock with a FIDO2 hardware key, and an
-> **opt-in keyring** build (`--features keyring`) can remember your passphrase in
-> the OS keychain for automatic unlock on a trusted device. FileSec now ships as
+> **opt-in keyring** build (`--features keyring`) can remember a device unlock key
+> in the OS keychain for automatic unlock on a trusted device (your passphrase is
+> never stored). FileSec now ships as
 > **two signed installer builds — classical and post-quantum — for macOS, Windows,
 > and Linux**, with published checksums (see [Packaging & releases](#packaging--releases)).
 
@@ -109,14 +110,15 @@ of tags and fingerprints are constant-time.
 #### Opt-in passkey unlock (`--features passkey`)
 
 You can enroll a **hardware security key** (FIDO2: YubiKey, SoloKey, …) as an
-*additional* way to unlock your identity, alongside your passphrase. Because
-FileSec is offline there is no server to verify a WebAuthn assertion, so a
-passkey can't "log you in" the usual way; instead FileSec uses the FIDO2
-**`hmac-secret`** extension (a.k.a. WebAuthn PRF) — the authenticator
-deterministically returns a stable 32-byte secret, gated by physical possession
-of the key plus user verification (touch / PIN). That secret wraps the keystore.
-This is the same mechanism behind systemd-cryptenroll, age-plugin-fido2-hmac,
-and "unlock with passkey" in password managers.
+**alternative** way to unlock your identity — a second way in, not a second
+factor layered on the passphrase. Because FileSec is offline there is no server
+to verify a WebAuthn assertion, so a passkey can't "log you in" the usual way;
+instead FileSec uses the FIDO2 **`hmac-secret`** extension (a.k.a. WebAuthn PRF)
+— the authenticator deterministically returns a stable 32-byte secret, gated by
+physical possession of the key plus **user verification** (PIN or biometric,
+required by default). That secret wraps the keystore. This is the same mechanism
+behind systemd-cryptenroll, age-plugin-fido2-hmac, and "unlock with passkey" in
+password managers.
 
 The keystore uses a **keyslot** design (like LUKS / age). Your private identity
 is encrypted once under a random data key (DEK); the DEK is then wrapped once per
@@ -153,21 +155,28 @@ after.
 
 #### Opt-in keyring auto-unlock (`--features keyring`)
 
-For a trusted personal device you can ask FileSec to **remember your passphrase
-in the OS keychain** — macOS Keychain, Windows Credential Manager, or the Linux
-Secret Service (GNOME Keyring / KWallet) — so it unlocks automatically. Enable it
-under *My Identity → This device → Remember on this device…* (it re-confirms your
-passphrase first); the unlock screen then offers *🔓 Unlock with saved passphrase*
-and the next launch auto-unlocks. Turn it off any time with *Forget on this
-device*.
+For a trusted personal device you can ask FileSec to unlock automatically. It does
+this **without storing your passphrase**: enabling it generates a random 128-bit
+**device unlock key** that wraps the keystore's data key in a dedicated device
+keyslot, and only that token is kept in the OS keychain — macOS Keychain, Windows
+Credential Manager, or the Linux Secret Service (GNOME Keyring / KWallet). The
+token is useless without this machine's keystore file. Enable it under *My
+Identity → This device → Remember on this device…* (it re-confirms your passphrase
+first); the unlock screen then offers *🔓 Unlock on this device* and the next
+launch auto-unlocks. Turn it off any time with *Forget on this device* — which
+clears the token **and** removes the device keyslot, advancing the keystore's
+rollback-protected epoch so a restored older keystore can't silently re-enable it.
 
-This is strictly **opt-in and per-device**. Your passphrase is never replaced —
-it remains your recovery secret and keeps working everywhere — so this can never
-become a lockout. The trade-off is explicit: the keychain becomes a second way in,
-gated by your logged-in OS account, so only enable it on a machine you trust.
-The signed installer builds enable this feature; the default `cargo` build leaves
-it (and its secret-store dependency) out entirely. The backend crate is
-target-gated so each OS pulls only its own (no `zbus` on macOS/Windows). See
+This is strictly **opt-in and per-device**. Your passphrase is never stored or
+replaced — it remains your recovery secret and keeps working everywhere — so this
+can never become a lockout. The trade-off is explicit: the keychain becomes a
+second way in, gated by your logged-in OS account, so only enable it on a machine
+you trust. The token is device-local and non-syncing on macOS (login keychain)
+and Windows (per-user Credential Manager); on Linux the Secret Service gives no
+device-binding guarantee, so the UI shows a caveat there. The signed installer
+builds enable this feature; the default `cargo` build leaves it (and its
+secret-store dependency) out entirely. The backend crate is target-gated so each
+OS pulls only its own (no `zbus` on macOS/Windows). See
 [`crates/filesec-gui/src/autounlock.rs`](crates/filesec-gui/src/autounlock.rs).
 
 #### Rollback-resistant local state

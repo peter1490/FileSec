@@ -38,6 +38,16 @@ const MIN_PASSPHRASE_SCORE: u32 = 7;
 const PASSPHRASE_HINT: &str = "Strong passphrase";
 const PASSPHRASE_STRENGTH_MESSAGE: &str =
     "Use a stronger passphrase: combine several words or mix letters, numbers, and symbols.";
+/// Accurate description of what enrolling a security key does: it is an
+/// **alternative** unlock method (either the passphrase or the key opens the
+/// keystore), not a second factor layered on the passphrase. Kept as a constant
+/// so the "alternative unlock, not two-factor" wording stays regression-tested
+/// (F04). Also states the PIN/UV requirement introduced in F10.
+const PASSKEY_ALT_UNLOCK_DESC: &str =
+    "Unlock with a hardware security key (FIDO2) as an alternative to your passphrase — either \
+     one opens your keystore. This is a second way in, not a second factor. Your passphrase \
+     always keeps working, so a lost key is never a lockout. Enrolling and unlocking require \
+     user verification (your key's PIN or biometric).";
 const MAX_PUBLIC_IDENTITY_FILE_LEN: u64 = 256 * 1024;
 const MAX_IDENTITY_BACKUP_FILE_LEN: u64 = 4 * 1024 * 1024;
 const COMMON_WEAK_PASSPHRASES: &[&str] = &[
@@ -2174,9 +2184,10 @@ impl App {
         });
     }
 
-    /// Unlock using the passphrase saved in the OS keychain for this data dir.
-    /// If the saved secret is gone or stale it falls back to the passphrase
-    /// prompt with a clear message (and drops a stale entry).
+    /// Unlock using the random device token saved in the OS keychain for this
+    /// data dir. The token wraps the keystore's data key in a device keyslot —
+    /// the passphrase is never stored. If the token is gone or stale it falls
+    /// back to the passphrase prompt with a clear message (and drops the entry).
     fn spawn_unlock_keyring(&mut self, ctx: &egui::Context) {
         if let State::Unlock(u) = &mut self.state {
             u.error = None;
@@ -2187,12 +2198,12 @@ impl App {
         };
         self.spawn_job(ctx, "Unlocking from this device…", move || {
             let data_dir = store.data_dir().display().to_string();
-            let secret = match autounlock::load(&data_dir) {
+            let token = match autounlock::load_device_token(&data_dir) {
                 Ok(Some(s)) => s,
                 Ok(None) => {
                     return JobReport {
                         outcome: Outcome::UnlockFailed(
-                            "No saved passphrase for this device. Enter your passphrase.".into(),
+                            "This device has no saved unlock. Enter your passphrase.".into(),
                         ),
                         toast: None,
                     }
@@ -2213,15 +2224,16 @@ impl App {
                     }
                 }
             };
-            let identity = match ks.unlock(secret.as_slice()) {
+            let identity = match ks.unlock_with_device_token(token.as_slice()) {
                 Ok(i) => i,
                 Err(_) => {
-                    // The saved secret no longer opens the keystore (e.g. the
-                    // passphrase was changed elsewhere). Drop the stale entry.
-                    let _ = autounlock::clear(&data_dir);
+                    // The token no longer opens the keystore (e.g. auto-unlock
+                    // was reset elsewhere, or the device slot was removed).
+                    // Drop the stale token so the UI falls back cleanly.
+                    let _ = autounlock::clear_device_token(&data_dir);
                     return JobReport {
                         outcome: Outcome::UnlockFailed(
-                            "The saved passphrase no longer works and was removed. \
+                            "This device's saved unlock no longer works and was removed. \
                              Enter your passphrase."
                                 .into(),
                         ),
@@ -2265,8 +2277,9 @@ impl App {
         });
     }
 
-    /// Verify the entered passphrase against the keystore, then save it to the OS
-    /// keychain so this device can auto-unlock.
+    /// Verify the entered passphrase, then enroll a random device token: it wraps
+    /// the keystore's data key in a device keyslot and is saved to the OS
+    /// keychain. The passphrase itself is never stored (F09).
     fn spawn_enable_auto_unlock(&mut self, ctx: &egui::Context) {
         let pass = match &mut self.state {
             State::Unlocked(s) => match &mut s.auto_unlock_form {
@@ -2288,16 +2301,37 @@ impl App {
             None => return,
         };
         self.spawn_job(ctx, "Saving to this device…", move || {
-            let ks = match store.load_keystore() {
+            let mut ks = match store.load_keystore() {
                 Ok(k) => k,
                 Err(e) => return JobReport::err(e),
             };
-            // Confirm the passphrase actually opens the keystore before saving it.
-            if ks.unlock(pass.as_bytes()).is_err() {
-                return JobReport::err("That passphrase is incorrect.");
+            // Confirm the passphrase opens the keystore, and keep the identity so
+            // a keychain failure can undo the on-disk device slot cleanly.
+            let identity = match ks.unlock(pass.as_bytes()) {
+                Ok(i) => i,
+                Err(_) => return JobReport::err("That passphrase is incorrect."),
+            };
+            // A full-entropy device token — never the passphrase — is what lands
+            // in the keychain.
+            let token = match filesec_core::secret::random_secret(
+                filesec_core::keystore::DEVICE_TOKEN_LEN,
+            ) {
+                Ok(t) => t,
+                Err(_) => return JobReport::err("Secure random generation failed."),
+            };
+            if let Err(e) = ks.set_device_token(pass.as_bytes(), &token) {
+                return JobReport::err(e.to_string());
+            }
+            if let Err(e) = store.save_keystore(&ks) {
+                return JobReport::err(e);
             }
             let data_dir = store.data_dir().display().to_string();
-            if let Err(e) = autounlock::save(&data_dir, pass.as_bytes()) {
+            if let Err(e) = autounlock::save_device_token(&data_dir, &token) {
+                // Best-effort: undo the on-disk device slot so it doesn't dangle
+                // without a matching token. The passphrase always still works.
+                if ks.remove_device_token(&identity).is_ok() {
+                    let _ = store.save_keystore(&ks);
+                }
                 return JobReport::err(e.to_string());
             }
             JobReport::ok(
@@ -2307,15 +2341,34 @@ impl App {
         });
     }
 
-    /// Forget the passphrase saved in the OS keychain for this data dir.
+    /// Forget this device's auto-unlock: clear the keychain token and remove the
+    /// device keyslot from the keystore (advancing its rollback-protected epoch,
+    /// so a restored older keystore cannot silently re-enable it).
     fn spawn_disable_auto_unlock(&mut self, ctx: &egui::Context) {
         let store = match self.store_arc() {
             Some(s) => s,
             None => return,
         };
+        let identity = match self.ident_arc() {
+            Some(i) => i,
+            None => return,
+        };
         self.spawn_job(ctx, "Updating this device…", move || {
             let data_dir = store.data_dir().display().to_string();
-            if let Err(e) = autounlock::clear(&data_dir) {
+            // Remove the device keyslot first (if any), then clear the token.
+            match store.load_keystore() {
+                Ok(mut ks) if ks.has_device_token() => {
+                    if let Err(e) = ks.remove_device_token(&identity) {
+                        return JobReport::err(e.to_string());
+                    }
+                    if let Err(e) = store.save_keystore(&ks) {
+                        return JobReport::err(e);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return JobReport::err(e),
+            }
+            if let Err(e) = autounlock::clear_device_token(&data_dir) {
                 return JobReport::err(e.to_string());
             }
             JobReport::ok(
@@ -5105,19 +5158,18 @@ fn unlock_ui(u: &mut Unlock, ui: &mut egui::Ui, action: &mut Option<Action>) {
                 );
             }
 
-            // Saved-passphrase (OS keychain) unlock, when one is stored for this
-            // device and this build can read it.
+            // This-device (OS keychain) unlock, when a device token is stored for
+            // this device and this build can read it.
             if !u.legacy_recovery && u.has_saved && autounlock::SUPPORTED {
                 theme::divider_or(ui);
-                if theme::secondary_button_full(ui, "🔓  Unlock with saved passphrase").clicked()
-                {
+                if theme::secondary_button_full(ui, "🔓  Unlock on this device").clicked() {
                     *action = Some(Action::UnlockWithKeyring);
                 }
             } else if !u.legacy_recovery && u.has_saved {
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(
-                        "A passphrase is saved for this device, but this build can't use it \
+                        "This device has a saved unlock, but this build can't use it \
                          (rebuild with --features keyring). Use your passphrase.",
                     )
                     .color(c.text_muted)
@@ -6442,13 +6494,9 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
             theme::card(ui, |ui| {
                 ui.label(RichText::new("Security keys").size(16.0).strong());
                 ui.label(
-                    RichText::new(
-                        "Unlock with a hardware security key (FIDO2) in addition to your \
-                         passphrase. Your passphrase always keeps working — a lost key is \
-                         never a lockout.",
-                    )
-                    .color(cc.text_muted)
-                    .small(),
+                    RichText::new(PASSKEY_ALT_UNLOCK_DESC)
+                        .color(cc.text_muted)
+                        .small(),
                 );
                 ui.add_space(8.0);
                 if s.passkeys.is_empty() {
@@ -6491,14 +6539,19 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                 ui.label(RichText::new("This device").size(16.0).strong());
                 ui.label(
                     RichText::new(
-                        "Save your passphrase in this computer's keychain so FileSec unlocks \
-                         automatically here. Your passphrase still works and stays your \
-                         recovery secret. Anyone with access to your logged-in account could \
-                         then open FileSec, so only enable this on a trusted personal device.",
+                        "Save a device unlock key in this computer's keychain so FileSec unlocks \
+                         automatically here. Your passphrase is not stored — it still works and \
+                         stays your recovery secret. Anyone with access to your logged-in \
+                         account could then open FileSec, so only enable this on a trusted \
+                         personal device.",
                     )
                     .color(cc.text_muted)
                     .small(),
                 );
+                if let Some(warning) = autounlock::device_binding_warning() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(warning).color(cc.warn).small());
+                }
                 ui.add_space(8.0);
                 if s.auto_unlock {
                     ui.horizontal(|ui| {
@@ -6595,9 +6648,9 @@ fn add_passkey_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
     let (close, ()) = theme::modal(ctx, "Add security key", |ui| {
         let c = theme::colors(ui);
         ui.label(
-            "Enroll a FIDO2 hardware key (YubiKey, SoloKey, …) as an extra way to unlock. \
-             You'll be asked to touch it twice — once to create the key, once to set up \
-             unlock. Your passphrase keeps working too.",
+            "Enroll a FIDO2 hardware key (YubiKey, SoloKey, …) as an alternative way to unlock. \
+             You'll be asked to verify (PIN or biometric) and touch it — once to create the key, \
+             once to set up unlock. Your passphrase keeps working too.",
         );
         ui.add_space(10.0);
         egui::Grid::new("add_passkey_grid")
@@ -6623,7 +6676,7 @@ fn add_passkey_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
                 ui.add(
                     egui::TextEdit::singleline(&mut form.pin)
                         .password(true)
-                        .hint_text("optional — only if your key has one")
+                        .hint_text("your key's PIN, if it uses one for verification")
                         .desired_width(240.0),
                 );
                 ui.end_row();
@@ -6657,9 +6710,9 @@ fn autounlock_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<A
     let (close, ()) = theme::modal(ctx, "Remember on this device", |ui| {
         let c = theme::colors(ui);
         ui.label(
-            "Save your passphrase in this computer's keychain so FileSec unlocks \
-             automatically on this device. Your passphrase still works everywhere and \
-             remains your recovery secret.",
+            "Save a device unlock key in this computer's keychain so FileSec unlocks \
+             automatically on this device. Your passphrase is not stored — it still works \
+             everywhere and remains your recovery secret.",
         );
         ui.add_space(8.0);
         ui.label(
@@ -8391,6 +8444,39 @@ mod ui_smoke {
     fn passphrase_policy_accepts_strong_local_passphrases() {
         assert!(passphrase_policy_error("correct horse battery staple").is_none());
         assert!(passphrase_policy_error("LongEnough123!").is_none());
+    }
+
+    /// The security-key card must describe an *alternative* unlock method, not a
+    /// second factor. Guards against the wording drifting back to "in addition to
+    /// your passphrase" / "two-factor" language, which would misrepresent the
+    /// model (either the passphrase or the key opens the keystore). (F04)
+    #[test]
+    fn security_key_wording_says_alternative_not_two_factor() {
+        let d = PASSKEY_ALT_UNLOCK_DESC.to_lowercase();
+        assert!(d.contains("alternative"), "must call it an alternative unlock");
+        assert!(
+            d.contains("not a second factor"),
+            "must explicitly disclaim two-factor framing"
+        );
+        assert!(!d.contains("in addition to"), "must not imply layering on the passphrase");
+        assert!(
+            !d.contains("two-factor") && !d.contains("two factor"),
+            "must not call itself two-factor authentication"
+        );
+    }
+
+    /// Auto-unlock's device-binding advisory is shown exactly when storage is
+    /// available but not device-bound (Linux Secret Service), and stays silent
+    /// when it is device-bound (macOS/Windows) or unsupported. Keeps the F09
+    /// warning wired to the real platform property rather than hard-coded. (F09)
+    #[test]
+    fn device_binding_warning_matches_platform_support() {
+        let warning = autounlock::device_binding_warning();
+        if autounlock::SUPPORTED && !autounlock::DEVICE_BOUND {
+            assert!(warning.is_some(), "non-device-bound storage must warn");
+        } else {
+            assert!(warning.is_none(), "device-bound/unsupported must not warn");
+        }
     }
 
     #[test]

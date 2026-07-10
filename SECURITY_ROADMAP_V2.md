@@ -405,6 +405,49 @@ Required tests:
 
 ### Stage 6: Authentication, Keychain, And Passkey Hardening
 
+**Implementation status (2026-07-10): complete.** "Remember on this device"
+auto-unlock no longer stores the passphrase. Enabling it now generates a random
+**128-bit device token** (`filesec-core::keystore::DEVICE_TOKEN_LEN`) that wraps
+the keystore's DEK in a new dedicated **device keyslot** (added to the v2 body as
+an optional, `skip_serializing_if`-omitted field so existing signed keystores are
+byte-for-byte unchanged); only that token is written to the OS keychain, and it is
+useless without this machine's keystore file. Enrolling/removing the slot goes
+through the signed v3 state (`set_device_token`/`remove_device_token`), so it
+advances the rollback-protected epoch — a restored older keystore cannot silently
+re-enable a device that was turned off, and the Stage 2 anchor quarantines it. The
+GUI `spawn_enable_auto_unlock` verifies the passphrase, enrolls the token, and
+persists both (rolling the on-disk slot back if the keychain write fails);
+`spawn_disable_auto_unlock` removes the slot *and* clears the token; and
+`spawn_unlock_keyring` opens via `unlock_with_device_token`, self-clearing a
+stale token so the UI falls back to the passphrase. Device binding is exposed as
+`autounlock::DEVICE_BOUND` (true on macOS's non-syncing login keychain and
+Windows' per-user Credential Manager, false on the Linux Secret Service) with a
+`device_binding_warning()` the "This device" card surfaces on Linux; a fully
+custom `ThisDeviceOnly`/biometric-gated access-control class is intentionally not
+added, as it would require a direct `security-framework`/Windows FFI dependency
+and `unsafe` this dependency-light, MSRV-pinned, `unsafe`-free build avoids — the
+keyring backends' default device-local, non-syncing storage plus the Linux warning
+cover the reachable guarantee.
+
+F10: the passkey enroll and get-assertion ceremonies now **require user
+verification by default**. The no-PIN/no-UV `without_pin_and_uv()` fallback is
+gone; a supplied PIN authenticates via the PIN, and a no-PIN ceremony keeps the
+builder's `uv = Some(true)` so the authenticator still enforces built-in UV
+(biometric or its own PIN). The request-argument assembly was factored into pure
+`make_credential_args`/`get_assertion_args` helpers so the "UV requested by
+default" policy is unit-tested without hardware. F15: passkey label/timestamp and
+slot count are already authenticated — new slots bind label+timestamp into the
+DEK-wrap AAD (`metadata_bound`, Stage 2) and the signed v3 body covers the whole
+passkey list — and add/remove advance the epoch; Stage 6 adds regression tests
+for both. F04: the security-key card wording was corrected from "in addition to
+your passphrase" to an **alternative** unlock method ("a second way in, not a
+second factor") via a tested `PASSKEY_ALT_UNLOCK_DESC` constant, and the enroll
+dialog now states the PIN/UV requirement. The Stage 6 tests — device-token
+unlock/not-a-passphrase/wrong-token/epoch-advance, device-token store round-trip +
+rollback rejection, passkey label/timestamp tamper detection, passkey add/remove
+epoch advance, the feature-gated passkey PIN/UV builder tests, and the
+wording/device-binding logic tests — are part of the workspace suite.
+
 Objective:
 
 Make local unlock mechanisms match high-security expectations and prevent convenience features from silently weakening the core passphrase model.

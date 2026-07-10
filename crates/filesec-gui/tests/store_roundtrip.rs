@@ -4,7 +4,7 @@
 use filesec_core::contacts::{ContactBook, Trust};
 use filesec_core::identity::Identity;
 use filesec_core::kdf::KdfParams;
-use filesec_core::keystore::{KeystoreFile, PasskeyEnrollment, HMAC_SECRET_LEN};
+use filesec_core::keystore::{KeystoreFile, PasskeyEnrollment, DEVICE_TOKEN_LEN, HMAC_SECRET_LEN};
 use filesec_core::state::{StateAnchor, StateObjectType};
 use filesec_core::vault::Vault;
 use filesec_gui::store::{
@@ -198,6 +198,50 @@ fn keystore_rollback_is_rejected_and_quarantined() {
     let error = store.load_keystore().err().expect("rollback must fail");
     assert!(error.contains("rollback detected"), "{error}");
     assert!(!dir.join("keystore.fsk").exists());
+    assert!(quarantine_has(&dir, "keystore.fsk.rollback-"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn device_token_roundtrips_through_the_store_and_is_rollback_protected() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let id = Identity::generate("Alice", 0).unwrap();
+    let pass = b"correct horse battery staple";
+    let mut ks = KeystoreFile::create(&id, pass, fast_kdf()).unwrap();
+    store.save_keystore(&ks).unwrap();
+    assert!(!store.load_keystore().unwrap().has_device_token());
+
+    // Enroll a random device token (the "remember on this device" flow) and
+    // persist it. The passphrase is never written; only this token wraps the DEK.
+    let token = [0x5eu8; DEVICE_TOKEN_LEN];
+    ks.set_device_token(pass, &token).unwrap();
+    store.save_keystore(&ks).unwrap();
+
+    // Reloaded from disk, the device slot survives and opens the keystore, the
+    // passphrase still works, and the token is not usable as a passphrase.
+    let reloaded = store.load_keystore().unwrap();
+    assert!(reloaded.has_device_token());
+    assert_eq!(
+        reloaded
+            .unlock_with_device_token(&token)
+            .unwrap()
+            .fingerprint(),
+        id.fingerprint()
+    );
+    assert_eq!(reloaded.unlock(pass).unwrap().fingerprint(), id.fingerprint());
+    assert!(reloaded.unlock(&token).is_err());
+
+    // Forgetting the device (disable flow) removes the slot and advances the
+    // signed epoch, so restoring the token-enrolled keystore is a rollback and is
+    // rejected + quarantined.
+    let with_token = std::fs::read(dir.join("keystore.fsk")).unwrap();
+    let mut latest = store.load_keystore().unwrap();
+    latest.remove_device_token(&id).unwrap();
+    store.save_keystore(&latest).unwrap();
+    std::fs::write(dir.join("keystore.fsk"), with_token).unwrap();
+    let error = store.load_keystore().err().expect("rollback must fail");
+    assert!(error.contains("rollback detected"), "{error}");
     assert!(quarantine_has(&dir, "keystore.fsk.rollback-"));
     let _ = std::fs::remove_dir_all(&dir);
 }
