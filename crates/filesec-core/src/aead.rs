@@ -49,6 +49,14 @@ pub const TAG_LEN: usize = 16;
 pub const STREAM_NONCE_LEN: usize = NONCE_LEN - 5;
 /// Default plaintext chunk size for streamed data (64 KiB).
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+/// Hard upper bound on any streamed chunk size. The chunk size travels in
+/// untrusted headers/manifests and directly drives per-chunk buffer allocation
+/// (`chunk_size + TAG_LEN`), so it is clamped here — at the single allocation
+/// chokepoint — before any buffer is sized from it. Far above the 64 KiB default
+/// FileSec ever writes, so no legitimate container is affected; a hostile header
+/// claiming a multi-gigabyte chunk is rejected before it can force a giant
+/// allocation.
+pub const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// The 5 bytes the `aead` STREAM construction reserves at the tail of the nonce
 /// (a BE32 chunk counter plus a one-byte last-chunk flag).
 const STREAM_OVERHEAD: usize = 5;
@@ -276,7 +284,7 @@ pub fn encrypt_stream_with<R: Read, W: Write>(
     if stream_nonce.len() != alg.stream_nonce_len() {
         return Err(Error::Format("stream nonce length"));
     }
-    if chunk_size == 0 {
+    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
         return Err(Error::Format("chunk size"));
     }
     let mut enc = Some(StreamEncryptor::new(alg, key, stream_nonce)?);
@@ -319,7 +327,7 @@ pub fn decrypt_stream_with<R: Read, W: Write>(
     if stream_nonce.len() != alg.stream_nonce_len() {
         return Err(Error::Format("stream nonce length"));
     }
-    if chunk_size == 0 {
+    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
         return Err(Error::Format("chunk size"));
     }
     let enc_chunk = chunk_size + TAG_LEN;
@@ -478,7 +486,7 @@ impl<R: Read> StreamDecryptReader<R> {
         if stream_nonce.len() != alg.stream_nonce_len() {
             return Err(Error::Format("stream nonce length"));
         }
-        if chunk_size == 0 {
+        if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
             return Err(Error::Format("chunk size"));
         }
         let dec = StreamDecryptor::new(alg, key, stream_nonce)?;
@@ -562,5 +570,71 @@ impl<R: Read> Read for StreamDecryptReader<R> {
                 Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::secret::random_vec;
+
+    fn key_and_nonce(alg: AeadAlg) -> (SymKey, Vec<u8>) {
+        (
+            SymKey::random().unwrap(),
+            random_vec(alg.stream_nonce_len()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn stream_encrypt_rejects_chunk_size_above_cap() {
+        let alg = AeadAlg::XChaCha20Poly1305;
+        let (key, nonce) = key_and_nonce(alg);
+        let mut out = Vec::new();
+        // One past the cap must be rejected before any chunk buffer is sized.
+        let err = encrypt_stream_with(
+            alg,
+            &key,
+            &nonce,
+            b"aad",
+            &b"hello"[..],
+            &mut out,
+            MAX_CHUNK_SIZE + 1,
+        );
+        assert!(matches!(err, Err(Error::Format("chunk size"))));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stream_decrypt_reader_rejects_chunk_size_above_cap() {
+        let alg = AeadAlg::XChaCha20Poly1305;
+        let (key, nonce) = key_and_nonce(alg);
+        let err = StreamDecryptReader::new_with(
+            alg,
+            &key,
+            &nonce,
+            b"aad",
+            std::io::empty(),
+            MAX_CHUNK_SIZE + 1,
+        )
+        .err();
+        assert!(matches!(err, Some(Error::Format("chunk size"))));
+    }
+
+    #[test]
+    fn stream_roundtrip_at_cap_is_allowed() {
+        // The cap itself is a valid (if enormous) chunk size; a small payload
+        // still round-trips. Uses a tiny plaintext so no giant buffer is filled.
+        let alg = AeadAlg::XChaCha20Poly1305;
+        let (key, nonce) = key_and_nonce(alg);
+        let pt = b"the cap is inclusive";
+        let mut ct = Vec::new();
+        // A modest-but-large chunk size well under the cap keeps the test cheap
+        // while proving the guard is a ceiling, not an off-by-one on the default.
+        let chunk = DEFAULT_CHUNK_SIZE;
+        encrypt_stream_with(alg, &key, &nonce, b"aad", &pt[..], &mut ct, chunk).unwrap();
+        let mut got = Vec::new();
+        decrypt_stream_with(alg, &key, &nonce, b"aad", &ct[..], &mut got, chunk).unwrap();
+        assert_eq!(got, pt);
     }
 }

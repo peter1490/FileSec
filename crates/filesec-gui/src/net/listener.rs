@@ -13,7 +13,7 @@ use filesec_core::transport::{RecordType, Responder};
 use filesec_core::{codec, format, Identity};
 
 use super::nat::PortMapping;
-use super::wire::{read_frame, write_frame};
+use super::wire::{read_frame, read_handshake_frame, write_frame};
 use super::{
     generate_pairing_code, group_code, now_unix, DecisionMsg, Emitter, ListenConfig, NatStatus,
     NetCommand, NetEvent, OfferMsg,
@@ -26,6 +26,15 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_POLL: Duration = Duration::from_millis(150);
 /// How long to wait for the user to accept/reject an incoming offer.
 const OFFER_DECISION_TIMEOUT: Duration = Duration::from_secs(300);
+/// Hard ceiling on a declared inbound transfer size. The receiver streams the
+/// offered `.fsec` to a temp file and stops only once `received` exceeds the
+/// *declared* size, so an unbounded declared size would let a verified-but-hostile
+/// sender fill the disk. This caps the declared size (and therefore the bytes
+/// ever written) before a single byte is accepted. Well above any realistic vault
+/// yet a firm bound against disk exhaustion. (Querying actual free space portably
+/// would need a platform dependency this dependency-light build avoids; the cap is
+/// the enforced defense.)
+const MAX_TRANSFER_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 
 pub fn run(
     config: ListenConfig,
@@ -132,12 +141,12 @@ fn handle_conn(
     // waiting for; the core rejects anyone else even if they authenticate validly.
     let mut responder =
         Responder::new(identity, Some(code.as_bytes()), expected).map_err(|e| e.to_string())?;
-    let hello = read_frame(&mut stream).map_err(|e| e.to_string())?;
+    let hello = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
     let auth = responder
         .read_hello_write_auth(&hello)
         .map_err(|e| e.to_string())?;
     write_frame(&mut stream, &auth).map_err(|e| e.to_string())?;
-    let confirm = read_frame(&mut stream).map_err(|e| e.to_string())?;
+    let confirm = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
     let (peer, mut session) = match responder.read_confirm(&confirm) {
         Ok(pair) => pair,
         Err(filesec_core::Error::PeerIdentityMismatch) => {
@@ -166,7 +175,7 @@ fn handle_conn(
     }
 
     // Read the offer.
-    let offer_frame = read_frame(&mut stream).map_err(|e| e.to_string())?;
+    let offer_frame = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
     let (rtype, plaintext) = session
         .open_record(&offer_frame)
         .map_err(|e| e.to_string())?;
@@ -176,6 +185,12 @@ fn handle_conn(
     let offer: OfferMsg = codec::from_slice(&plaintext).map_err(|e| e.to_string())?;
     if offer.sender_fpr != peer.fingerprint {
         return Err("the offer's sender does not match the connected identity".into());
+    }
+    // Reject an absurdly large declared size before prompting the user or writing
+    // a byte — the received-size check below only bounds bytes to this declared
+    // size, so an uncapped size is a disk-exhaustion lever.
+    if !transfer_size_acceptable(offer.size) {
+        return Err("the offered transfer is too large to accept".into());
     }
     emitter.emit(NetEvent::Offer {
         filename: offer.filename.clone(),
@@ -316,4 +331,24 @@ fn local_lan_ip() -> Option<String> {
     // makes the OS pick the default-route source address.
     socket.connect(("203.0.113.1", 9)).ok()?;
     socket.local_addr().ok().map(|a| a.ip().to_string())
+}
+
+/// Whether a sender's declared inbound transfer size is within the acceptance
+/// ceiling. The received-byte check only bounds writes to the *declared* size, so
+/// this is the guard that keeps a hostile declared size from filling the disk.
+fn transfer_size_acceptable(size: u64) -> bool {
+    size <= MAX_TRANSFER_SIZE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_size_cap_rejects_above_ceiling() {
+        assert!(transfer_size_acceptable(0));
+        assert!(transfer_size_acceptable(MAX_TRANSFER_SIZE));
+        assert!(!transfer_size_acceptable(MAX_TRANSFER_SIZE + 1));
+        assert!(!transfer_size_acceptable(u64::MAX));
+    }
 }

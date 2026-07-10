@@ -46,6 +46,17 @@ const PREAMBLE_LEN: usize = 11;
 const MAX_HEADER_LEN: usize = 32 * 1024 * 1024;
 /// Upper bound on the encrypted manifest size.
 const MAX_MANIFEST_LEN: u64 = 512 * 1024 * 1024;
+/// Upper bound on the number of entries a manifest may declare. Bounds the
+/// per-entry work (and per-file allocation) a hostile manifest can drive, even
+/// when it fits inside [`MAX_MANIFEST_LEN`]. Ten million entries is far beyond
+/// any real vault yet keeps validation and reconstruction linear and bounded.
+const MAX_MANIFEST_ENTRIES: usize = 10_000_000;
+/// Upper bound on a whole container read fully into memory by
+/// [`import_vault_from_path`]. The streaming [`open_vault_from_path`] /
+/// [`verify_and_open`] paths carry no such limit (they hold only a chunk at a
+/// time); this bounds only the deliberately non-streaming, buffer-everything
+/// import so an attacker-sized file cannot force an unbounded allocation.
+const MAX_IN_MEMORY_CONTAINER_LEN: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Plaintext header. Everything here is bound as AAD and signed.
 ///
@@ -709,7 +720,7 @@ pub fn import_vault(bytes: &[u8], identity: &Identity) -> Result<ImportedVault> 
     {
         return Err(Error::Format("bad nonce length"));
     }
-    if header.data_chunk_size == 0 {
+    if header.data_chunk_size == 0 || header.data_chunk_size as usize > aead::MAX_CHUNK_SIZE {
         return Err(Error::Format("bad chunk size"));
     }
     if header.manifest_len < aead::TAG_LEN as u64 || header.manifest_len > MAX_MANIFEST_LEN {
@@ -863,6 +874,9 @@ fn validate_manifest_layout(
     if chunk_size == 0 {
         return Err(Error::Format("bad chunk size"));
     }
+    if manifest.entries.len() > MAX_MANIFEST_ENTRIES {
+        return Err(Error::Format("too many manifest entries"));
+    }
     let mut total_plaintext: u64 = 0;
     let mut seen = BTreeSet::new();
     for entry in &manifest.entries {
@@ -949,8 +963,24 @@ fn reconstruct_vault_streaming<R: Read>(manifest: &Manifest, mut plaintext: R) -
 }
 
 /// Import a container directly from a file path.
+///
+/// This is the non-streaming path: it reads the whole container into memory, so
+/// the file is stat-bounded against [`MAX_IN_MEMORY_CONTAINER_LEN`] *before* the
+/// read to keep an attacker-sized file from forcing an unbounded allocation. For
+/// large containers prefer the streaming [`open_vault_from_path`] /
+/// [`verify_and_open`], which hold only a chunk at a time.
 pub fn import_vault_from_path(path: &Path, identity: &Identity) -> Result<ImportedVault> {
+    let meta = fs_err::metadata(path)?;
+    if !meta.is_file() {
+        return Err(Error::Format("container path is not a file"));
+    }
+    if meta.len() > MAX_IN_MEMORY_CONTAINER_LEN {
+        return Err(Error::Format("container too large to import in memory"));
+    }
     let bytes = fs_err::read(path)?;
+    if bytes.len() as u64 > MAX_IN_MEMORY_CONTAINER_LEN {
+        return Err(Error::Format("container too large to import in memory"));
+    }
     import_vault(&bytes, identity)
 }
 
@@ -1706,7 +1736,7 @@ fn open_reader_inner(
     {
         return Err(Error::Format("bad nonce length"));
     }
-    if header.data_chunk_size == 0 {
+    if header.data_chunk_size == 0 || header.data_chunk_size as usize > aead::MAX_CHUNK_SIZE {
         return Err(Error::Format("bad chunk size"));
     }
     if header.manifest_len < aead::TAG_LEN as u64 || header.manifest_len > MAX_MANIFEST_LEN {
@@ -1785,4 +1815,106 @@ fn open_reader_inner(
         suite,
     };
     Ok((reader, sender))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Serialize `header` behind a valid preamble (no manifest/data — the read
+    /// under test fails before those are consulted).
+    fn container_with_header(header: &Header) -> Vec<u8> {
+        let header_bytes = codec::to_vec(header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&header_bytes);
+        out
+    }
+
+    /// A syntactically valid classical header with the given data chunk size and
+    /// otherwise dummy (but length-correct) fields, so parsing reaches the chunk
+    /// check.
+    fn header_with_chunk(data_chunk_size: u32) -> Header {
+        let alg = SuiteId::Classic.aead_alg();
+        Header {
+            suite_id: SuiteId::Classic.to_u16(),
+            vault_id: [0u8; 16],
+            sender_sign_public: [0u8; sign::PUBLIC_LEN],
+            sender_kem_public: [0u8; kem::PUBLIC_LEN],
+            sender_mldsa_public: None,
+            sender_mlkem_public: None,
+            sender_fpr: [0u8; 32],
+            recipients: Vec::new(),
+            manifest_nonce: vec![0u8; alg.nonce_len()],
+            manifest_len: aead::TAG_LEN as u64,
+            data_stream_nonce: vec![0u8; alg.stream_nonce_len()],
+            data_chunk_size,
+            data_len: aead::TAG_LEN as u64,
+        }
+    }
+
+    #[test]
+    fn oversized_chunk_size_rejected_before_allocation() {
+        // A hostile header declaring a chunk size one past the cap must be
+        // rejected before any chunk-sized buffer is allocated (and before the
+        // signature is even consulted).
+        let identity = Identity::generate("Reader", 0).unwrap();
+        let bytes = container_with_header(&header_with_chunk((aead::MAX_CHUNK_SIZE + 1) as u32));
+        assert!(matches!(
+            import_vault(&bytes, &identity),
+            Err(Error::Format("bad chunk size"))
+        ));
+    }
+
+    #[test]
+    fn zero_chunk_size_rejected() {
+        let identity = Identity::generate("Reader", 0).unwrap();
+        let bytes = container_with_header(&header_with_chunk(0));
+        assert!(matches!(
+            import_vault(&bytes, &identity),
+            Err(Error::Format("bad chunk size"))
+        ));
+    }
+
+    fn dir(path: &str) -> Entry {
+        Entry {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            size: 0,
+            mtime: None,
+            mode: None,
+            blake3: [0u8; 32],
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn manifest_layout_rejects_duplicate_paths() {
+        let manifest = Manifest {
+            vault_name: "v".into(),
+            created_at: 0,
+            entries: vec![dir("a"), dir("a")],
+        };
+        assert!(matches!(
+            validate_manifest_layout(&manifest, 64, aead::TAG_LEN as u64),
+            Err(Error::Format("duplicate path in manifest"))
+        ));
+    }
+
+    #[test]
+    fn manifest_layout_accepts_wellformed_empty_data() {
+        // An all-directory manifest has zero plaintext, which still costs one
+        // tag-only chunk; the reconciliation must accept that.
+        let manifest = Manifest {
+            vault_name: "v".into(),
+            created_at: 0,
+            entries: vec![dir("a"), dir("a/b")],
+        };
+        let (total, chunks) =
+            validate_manifest_layout(&manifest, 64, aead::TAG_LEN as u64).unwrap();
+        assert_eq!((total, chunks), (0, 1));
+    }
 }

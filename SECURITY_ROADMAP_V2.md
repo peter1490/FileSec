@@ -183,6 +183,25 @@ Required tests:
 
 ### Stage 3: Input And Resource Hardening
 
+**Implementation status (2026-07-10): complete.** Untrusted lengths are now
+bounded before allocation across the board: a single `aead::MAX_CHUNK_SIZE`
+(16 MiB) ceiling is enforced at every stream allocation chokepoint and echoed in
+the v1 header and v2 manifest parsers; the v1 manifest carries an entry-count
+cap; the non-streaming `import_vault_from_path` is stat-bounded (the streaming
+open/verify path already held only a chunk at a time); v2 `file_id`s are
+validated as exactly 32 lowercase-hex characters (no separators, dots, or
+uppercase) at the single path-joining chokepoint and again for the whole manifest
+on open/recover; pasted/armored public keys are length-capped before base64
+decode; and the P2P wire now splits its frame cap into a tight 64 KiB
+handshake/control limit versus the 16 MiB data limit, with a hard declared
+transfer-size ceiling rejected before any byte is written. Public-identity,
+identity-backup, keystore, contacts, and registry reads were already
+stat-then-bounded in Stages 1–2. Portable free-space querying is intentionally
+not added (it would need a platform dependency this dependency-light, MSRV-pinned
+build avoids); the declared-size ceiling is the enforced disk-exhaustion defense.
+The Stage 3 chunk-cap, blob-id (unit + property), oversized-paste, manifest-layout,
+and split frame-cap tests are part of the workspace suite.
+
 Objective:
 
 Bound all untrusted inputs before memory allocation, disk write, expensive KDF work, or long-running parse/decrypt work.

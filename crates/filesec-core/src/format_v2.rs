@@ -74,6 +74,68 @@ const MANIFEST_ENVELOPE_VERSION: u16 = 3;
 /// Upper bound on the plaintext header / sealed manifest reads (untrusted-input guard).
 const MAX_HEADER_LEN: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_LEN: u64 = 512 * 1024 * 1024;
+/// Upper bound on the number of entries a decrypted manifest may declare, so a
+/// manifest that fits inside [`MAX_MANIFEST_LEN`] still cannot drive unbounded
+/// per-entry work. Mirrors the v1 [`crate::format`] limit.
+const MAX_MANIFEST_ENTRIES: usize = 10_000_000;
+/// Exact length of a blob `file_id`: 32 lowercase-hex characters (16 random bytes).
+const BLOB_ID_LEN: usize = 32;
+
+/// Validate a blob `file_id` as **exactly** 32 lowercase-hex characters and
+/// nothing else — no path separators, dots, uppercase, or other bytes — so it can
+/// never be interpreted as a path, an absolute path, or a `..` traversal
+/// component when joined under `blobs/`. The manifest is authenticated (sealed to
+/// the owner), so this is defense in depth: even a manifest forged with the
+/// owner's own key cannot turn a blob id into a path that escapes the vault dir.
+fn validate_blob_id(id: &str) -> Result<()> {
+    if id.len() != BLOB_ID_LEN {
+        return Err(Error::Format("blob id must be 32 hex chars"));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::Format("blob id must be lowercase hex"));
+    }
+    Ok(())
+}
+
+/// Validate a freshly decrypted manifest before any per-entry processing: bound
+/// the entry count, reject duplicate/invalid paths, and — for each file — confirm
+/// the blob id is a single hex path component, the chunk size is within
+/// [`aead::MAX_CHUNK_SIZE`], the blob nonce length matches the suite, and the blob
+/// key is present. Runs once on open/recover so later blob reads can trust the
+/// metadata they act on.
+fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()> {
+    if manifest.entries.len() > MAX_MANIFEST_ENTRIES {
+        return Err(Error::Format("too many manifest entries"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for e in &manifest.entries {
+        let norm = normalize_path(&e.path)?;
+        if !seen.insert(norm) {
+            return Err(Error::Format("duplicate path in manifest"));
+        }
+        if e.kind == EntryKind::File {
+            validate_blob_id(
+                e.file_id
+                    .as_deref()
+                    .ok_or(Error::Format("missing blob id"))?,
+            )?;
+            if e.chunk_size == 0 || e.chunk_size as usize > aead::MAX_CHUNK_SIZE {
+                return Err(Error::Format("bad chunk size"));
+            }
+            if e.key.is_none() {
+                return Err(Error::Format("missing blob key"));
+            }
+            match &e.nonce {
+                Some(n) if n.len() == alg.stream_nonce_len() => {}
+                _ => return Err(Error::Format("bad blob nonce length")),
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Plaintext header file. Stable for the vault's lifetime; fed as AAD into the
 /// manifest AEAD and every blob STREAM (anti-downgrade binding).
@@ -325,6 +387,7 @@ impl VaultReaderV2 {
         )?);
         envelope.state.verify_payload(&pt)?;
         let manifest: ManifestV2 = codec::from_slice(&pt)?;
+        validate_manifest_v2(&manifest, suite.aead_alg())?;
         let view = view_of(&manifest);
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -368,6 +431,7 @@ impl VaultReaderV2 {
             ciphertext,
         )?);
         let manifest: ManifestV2 = codec::from_slice(&pt)?;
+        validate_manifest_v2(&manifest, suite.aead_alg())?;
         let view = view_of(&manifest);
         let mut reader = Self {
             dir: dir.to_path_buf(),
@@ -1035,12 +1099,16 @@ impl VaultReaderV2 {
     }
 }
 
-/// The `file_id` of a file entry (errors if absent — a corrupt manifest).
+/// The `file_id` of a file entry, validated as a single lowercase-hex path
+/// component (errors if absent or malformed — a corrupt manifest). Every path
+/// that turns a `file_id` into an on-disk blob path routes through here.
 fn blob_id(entry: &EntryV2) -> Result<&str> {
-    entry
+    let id = entry
         .file_id
         .as_deref()
-        .ok_or(Error::Format("file entry missing blob id"))
+        .ok_or(Error::Format("file entry missing blob id"))?;
+    validate_blob_id(id)?;
+    Ok(id)
 }
 
 fn new_file_id() -> Result<String> {
@@ -1382,5 +1450,71 @@ mod tests {
         drop(recovered);
         assert!(VaultReaderV2::open(&dir, &identity).is_ok());
         let _ = fs_err::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_blob_id_accepts_generated_ids() {
+        for _ in 0..64 {
+            let id = new_file_id().unwrap();
+            assert!(validate_blob_id(&id).is_ok(), "generated id {id} rejected");
+        }
+    }
+
+    #[test]
+    fn validate_blob_id_rejects_malformed_components() {
+        assert!(validate_blob_id("0123456789abcdef0123456789abcdef").is_ok());
+        // Each is exactly the kind of value a blob id must never be, and — except
+        // the length cases — each is 32 bytes so the *character* rule is what
+        // rejects it (not a length shortcut).
+        for bad in [
+            "",                                  // empty
+            "0123456789abcdef0123456789abcde",   // 31 chars (too short)
+            "0123456789abcdef0123456789abcdef0", // 33 chars (too long)
+            "0123456789ABCDEF0123456789abcdef",  // uppercase
+            "0123456789abcdef0123456789abcde/",  // slash (traversal component)
+            "0123456789abcdef.123456789abcdef",  // dot
+            "/123456789abcdef0123456789abcdef",  // leading slash (absolute-ish)
+            "..2456789abcdef0123456789abcdef0",  // starts with ..
+            "0123456789abcdef0123456789abcdeg",  // non-hex char
+        ] {
+            assert!(validate_blob_id(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn open_rejects_blob_id_with_path_traversal() {
+        // A manifest re-sealed with the owner's own key but carrying a traversal
+        // blob id must still be refused on open — the id is validated as a single
+        // hex component before it is ever joined to a path.
+        let dir = tmp("evil-blob-id");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader
+            .put_file_bytes("secret.txt", b"hi", None, None)
+            .unwrap();
+        let idx = reader
+            .manifest
+            .entries
+            .iter()
+            .position(|e| e.kind == EntryKind::File)
+            .unwrap();
+        reader.manifest.entries[idx].file_id = Some("../../etc/evil".into());
+        reader.reseal_manifest().unwrap();
+        drop(reader);
+        assert!(matches!(
+            VaultReaderV2::open(&dir, &identity),
+            Err(Error::Format(_))
+        ));
+        let _ = fs_err::remove_dir_all(&dir);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn validate_blob_id_matches_spec(s in ".*") {
+            let got = validate_blob_id(&s).is_ok();
+            let want = s.len() == BLOB_ID_LEN
+                && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            proptest::prop_assert_eq!(got, want);
+        }
     }
 }

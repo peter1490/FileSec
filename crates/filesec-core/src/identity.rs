@@ -16,6 +16,13 @@ use crate::{codec, util};
 const FPR_CONTEXT: &[u8] = b"FileSec identity fingerprint v1";
 const ARMOR_BEGIN: &str = "-----BEGIN FILESEC PUBLIC KEY-----";
 const ARMOR_END: &str = "-----END FILESEC PUBLIC KEY-----";
+/// Upper bound on the raw text of a pasted/armored public key — and on the
+/// base64 body extracted from it — before any decode is attempted. A hybrid
+/// public identity is only a few KiB of CBOR (~5 KiB of base64); 128 KiB is far
+/// above any legitimate key yet keeps a multi-megabyte paste from driving a large
+/// decode allocation. Applied before `data_encoding::decode`, which would
+/// otherwise size its output buffer from the untrusted input length.
+const MAX_ARMORED_TEXT_LEN: usize = 128 * 1024;
 
 /// The public, shareable half of an identity.
 ///
@@ -129,6 +136,9 @@ impl PublicIdentity {
 
     /// Decode an ASCII-armored block (tolerant of surrounding whitespace).
     pub fn from_armored(text: &str) -> Result<Self> {
+        if text.len() > MAX_ARMORED_TEXT_LEN {
+            return Err(Error::Format("armored key is too large"));
+        }
         let mut body = String::new();
         let mut in_block = false;
         for line in text.lines() {
@@ -160,6 +170,9 @@ impl PublicIdentity {
     /// the strict armored form first, then falls back to decoding the remaining
     /// text as base64 (padded or not).
     pub fn from_pasted(text: &str) -> Result<Self> {
+        if text.len() > MAX_ARMORED_TEXT_LEN {
+            return Err(Error::Format("pasted key is too large"));
+        }
         if let Ok(id) = Self::from_armored(text) {
             return Ok(id);
         }
@@ -420,5 +433,51 @@ impl Identity {
             .as_ref()
             .ok_or(Error::MissingPqcKey("identity has no ML-KEM key"))?;
         crate::mlkem::decapsulate(&m.seed, ciphertext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn pubid() -> PublicIdentity {
+        Identity::generate("Alice", 0).unwrap().public()
+    }
+
+    #[test]
+    fn armored_roundtrip_still_parses() {
+        let id = pubid();
+        let armored = id.to_armored().unwrap();
+        assert_eq!(PublicIdentity::from_armored(&armored).unwrap(), id);
+        assert_eq!(PublicIdentity::from_pasted(&armored).unwrap(), id);
+    }
+
+    #[test]
+    fn from_armored_rejects_oversized_text_before_decode() {
+        // A valid armored block padded past the cap with junk lines must be
+        // rejected before any base64 decode is attempted.
+        let mut text = pubid().to_armored().unwrap();
+        text.push_str(&"A".repeat(MAX_ARMORED_TEXT_LEN + 1));
+        assert!(matches!(
+            PublicIdentity::from_armored(&text),
+            Err(Error::Format("armored key is too large"))
+        ));
+    }
+
+    #[test]
+    fn from_pasted_rejects_oversized_text_before_decode() {
+        let text = "A".repeat(MAX_ARMORED_TEXT_LEN + 1);
+        assert!(matches!(
+            PublicIdentity::from_pasted(&text),
+            Err(Error::Format("pasted key is too large"))
+        ));
+    }
+
+    #[test]
+    fn from_pasted_accepts_bare_base64_body() {
+        let id = pubid();
+        let body = data_encoding::BASE64.encode(&id.to_bytes().unwrap());
+        assert_eq!(PublicIdentity::from_pasted(&body).unwrap(), id);
     }
 }

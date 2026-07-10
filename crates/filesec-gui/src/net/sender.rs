@@ -17,7 +17,7 @@ use std::time::Duration;
 use filesec_core::transport::{Initiator, RecordType, Session};
 use filesec_core::{codec, ExportOptions, Identity};
 
-use super::wire::{read_frame, write_frame};
+use super::wire::{read_handshake_frame, write_frame};
 use super::{normalize_code, DecisionMsg, Emitter, NetCommand, NetEvent, OfferMsg, SendConfig};
 use crate::store::Store;
 
@@ -74,7 +74,7 @@ pub fn run(
     .map_err(|e| e.to_string())?;
     let hello = initiator.write_hello().map_err(|e| e.to_string())?;
     write_frame(&mut stream, &hello).map_err(|e| e.to_string())?;
-    let auth = read_frame(&mut stream).map_err(|e| e.to_string())?;
+    let auth = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
     let (confirm, mut session) = initiator
         .read_auth_write_confirm(&auth)
         .map_err(|e| e.to_string())?;
@@ -112,7 +112,7 @@ pub fn run(
     emitter.emit(NetEvent::Status(format!("Waiting for {who} to accept…")));
 
     let _ = stream.set_read_timeout(Some(DECISION_TIMEOUT));
-    let decision_frame = read_frame(&mut stream).map_err(|e| e.to_string())?;
+    let decision_frame = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let (rtype, plaintext) = session
         .open_record(&decision_frame)
