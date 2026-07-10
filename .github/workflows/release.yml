@@ -5,25 +5,33 @@ name: Release
 # and `filesec-pqc` (the same app plus direct peer-to-peer network transfer) —
 # for macOS, Windows and Linux, packages each into native installers
 # (.dmg / .msi + NSIS / .deb) plus a portable archive, code-signs and notarizes
-# where credentials are configured, and publishes everything with a SHA256SUMS
-# file to a GitHub Release. Both builds compile the post-quantum suites in; new
-# identities are classical by default in both. The matrix key `classical` is the
-# standard (no-networking) build and `pqc` is the networking build — kept as keys
-# only to avoid churning artifact names.
+# where credentials are configured, generates a per-variant SBOM, and publishes
+# everything with a SHA256SUMS file and SLSA build-provenance attestations to a
+# GitHub Release. Both builds compile the post-quantum suites in; new identities
+# are classical by default in both. The matrix key `classical` is the standard
+# (no-networking) build and `pqc` is the networking build — kept as keys only to
+# avoid churning artifact names.
 #
 # Each variant is built in its own `cargo build -p <package>` invocation so the
 # networking code is never unified into the standard binary. Signing and
 # notarization are mandatory for official version tags on the upstream repo.
 # Forks and manual development runs may still build unsigned artifacts, but they
-# do not publish stable upstream releases. See RELEASE.md for the secrets.
+# do not publish stable upstream releases (the publish job is gated on the tag
+# and the upstream repository). See RELEASE.md for the secrets.
+#
+# Supply-chain note: every third-party GitHub Action is pinned by commit SHA with
+# the human-readable version in a trailing comment, and every release-time cargo
+# tool (cargo-wix, cargo-deb, cargo-sbom) is pinned by version. Bump the SHA/
+# version and its comment together when upgrading.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
+# Least privilege by default; the publish job widens its own grant.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,11 +54,12 @@ jobs:
       AC_API_ISSUER: ${{ secrets.AC_API_ISSUER }}
       RELEASE_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec' && '1' || '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Set variant parameters
         run: |
@@ -113,7 +122,7 @@ jobs:
           BIN_PATH="dist/$BIN" OUT_DMG="dist/$BASE.dmg" \
             bash packaging/macos/package_macos.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-${{ matrix.variant }}
           path: |
@@ -133,9 +142,11 @@ jobs:
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
       RELEASE_SIGNING_REQUIRED: ${{ startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec' && '1' || '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Install NSIS
         run: |
@@ -196,15 +207,16 @@ jobs:
             -DSRC_EXE="target\\release\\$BIN.exe" -DOUT_FILE="$OUT" -DREG_KEY="$REG_KEY" \
             packaging/windows/filesec.nsi
 
-      # MSI via cargo-wix. Marked best-effort: cargo-wix's first `init` generates
-      # a default WiX source that occasionally needs hand-tuning per project;
-      # commit crates/<pkg>/wix/main.wxs once to make this deterministic.
+      # MSI via cargo-wix, built from the committed WiX source
+      # (crates/<pkg>/wix/main.wxs) so the installer is deterministic and
+      # reviewable — no per-run `wix init` regeneration that could drift. The
+      # windows-latest image ships the WiX v3 toolset cargo-wix drives. This is a
+      # required release artifact for official tags (no continue-on-error): a
+      # broken MSI now fails the release rather than silently shipping without it.
       - name: MSI installer
-        continue-on-error: true
         shell: bash
         run: |
-          cargo install cargo-wix --locked
-          cargo wix init -p "$PKG" --force
+          cargo install cargo-wix --version 0.3.9 --locked
           cargo wix -p "$PKG" --no-build --nocapture \
             --output "dist/$BIN-$VERSION-x86_64.msi"
 
@@ -216,7 +228,7 @@ jobs:
           $msi = "dist/$env:BIN-$env:VERSION-x86_64.msi"
           if (Test-Path $msi) { ./packaging/windows/sign.ps1 -File $msi }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-${{ matrix.variant }}
           path: dist/*
@@ -230,7 +242,7 @@ jobs:
       matrix:
         variant: [classical, pqc]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -238,8 +250,10 @@ jobs:
             libgtk-3-dev libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
             libudev-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Set variant parameters
         run: |
@@ -264,24 +278,56 @@ jobs:
 
       - name: Build .deb
         run: |
-          cargo install cargo-deb --locked
+          cargo install cargo-deb --version 3.7.0 --locked
           cargo deb -p "$PKG" --no-build
           cp target/debian/*.deb dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ matrix.variant }}
           path: dist/*
 
+  # -------------------------------------------------------------------- SBOM
+  # One CycloneDX/SPDX software bill of materials per shipped variant, from the
+  # resolved dependency graph. cargo-sbom only reads `cargo metadata`, so it needs
+  # the toolchain but no system build libraries. Pinned by version; required for
+  # publish so a release always carries its SBOMs.
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
+
+      - name: Generate per-variant SBOMs (SPDX 2.3 JSON)
+        run: |
+          cargo install cargo-sbom --version 0.10.0 --locked
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cargo sbom --cargo-package filesec-gui > "dist/filesec-$VERSION.spdx.json"
+          cargo sbom --cargo-package filesec-pqc > "dist/filesec-pqc-$VERSION.spdx.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: dist/*.spdx.json
+
   # ----------------------------------------------------------------- Publish
   publish:
     name: Publish GitHub Release
-    needs: [macos, windows, linux]
+    needs: [macos, windows, linux, sbom]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec'
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # OIDC token for build-provenance attestation (Sigstore)
+      attestations: write # write the provenance to the attestations store
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
@@ -291,14 +337,26 @@ jobs:
           find artifacts -type f \( \
             -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \
             -o -name '*.deb' -o -name '*.msi' -o -name '*-setup.exe' \
+            -o -name '*.spdx.json' \
           \) -exec cp -n {} release/ \;
-          cd release
-          sha256sum * > SHA256SUMS
+          # Checksum every collected artifact. Write SHA256SUMS outside release/
+          # first so the glob never tries to hash the file being created, then
+          # move it in alongside the artifacts it covers.
+          ( cd release && sha256sum * > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS )
           echo "----- SHA256SUMS -----"
-          cat SHA256SUMS
+          cat release/SHA256SUMS
+
+      # SLSA build-provenance attestation for every published file, including the
+      # SHA256SUMS manifest itself (so consumers can verify the checksum list is
+      # authentic, then verify each download against it) and the SBOMs. Verify
+      # with: gh attestation verify <file> --repo peter1490/FileSec
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release/*
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           files: release/*
           fail_on_unmatched_files: true

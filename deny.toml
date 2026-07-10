@@ -1,0 +1,103 @@
+# cargo-deny configuration — FileSec's supply-chain gate.
+#
+# Enforced in CI by the "supply-chain" job in .github/workflows/ci.yml, using the
+# pinned cargo-deny version. Run locally with:
+#
+#     cargo deny check
+#
+# FileSec is deliberately dependency-light and MSRV-pinned (see the root
+# Cargo.toml). This policy fails the build on known security advisories, on any
+# license outside the permissive allow-list, and on a dependency pulled from
+# anywhere other than crates.io.
+
+[graph]
+# Gate the platforms we actually ship binaries for. A crate that only exists for
+# some other target should not gate our releases.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+# Evaluate feature-gated dependencies too (pqc, net, keyring, passkey), so the
+# gate covers every crate a shipped build can pull in — not just the default one.
+all-features = true
+
+[advisories]
+# RustSec advisory database. Any active vulnerability fails the check; yanked
+# crates fail as well. Every entry in `ignore` must be a specific advisory ID
+# with a justification: the reachability analysis, why the fix cannot be applied
+# under our constraints, and the condition that lets us drop the exception. A new
+# advisory (any ID not listed here) still fails the build — the gate stays live.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # ttf-parser 0.25.1 — unmaintained (no vulnerability, no patch exists).
+    # Reached only transitively through egui's text stack
+    # (egui -> epaint -> ab_glyph -> owned_ttf_parser -> ttf-parser); egui 0.32
+    # pins it and there is no maintained drop-in. Nothing FileSec can change until
+    # egui migrates its font backend (e.g. to skrifa). Drop this when the egui
+    # upgrade that replaces ttf-parser lands.
+    "RUSTSEC-2026-0192",
+
+    # quick-xml 0.39.4 — two DoS advisories (quadratic attribute-duplicate check;
+    # unbounded NsReader namespace allocation), both patched only in >= 0.41.0, a
+    # semver-major jump. Present on Linux only, pulled by accesskit's AT-SPI
+    # accessibility backend (accesskit_unix), which egui 0.32 pins; it parses the
+    # local desktop accessibility bus, not untrusted file or network input, so the
+    # remote-DoS scenario in the advisories does not apply to FileSec. Not
+    # updatable without bumping the whole egui/accesskit stack (which would break
+    # the 1.86 MSRV pin). Drop these when that stack moves to quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # time 0.3.41 — stack-exhaustion DoS in the RFC 2822 date parser, patched only
+    # in >= 0.3.47, which requires Rust 1.88 (above FileSec's 1.86 MSRV — every
+    # patched release raised the MSRV). Pulled only by the passkey feature
+    # (ctap-hid-fido2 -> x509-parser -> asn1-rs -> time) to hold certificate
+    # validity dates, which asn1-rs builds from ASN.1 numeric components; the
+    # vulnerable RFC 2822 string parser is never called on this path. Drop this
+    # when the MSRV moves to >= 1.88 (then `cargo update -p time`).
+    "RUSTSEC-2026-0009",
+]
+
+[licenses]
+# Every license that appears as a required term anywhere in the current
+# dependency graph. Permissive-only. The AND-combined font and Unicode-data
+# licenses are here because egui's bundled default fonts (epaint_default_fonts)
+# and the ICU normalization tables legitimately require them; MPL-2.0 covers
+# option-ext (via the directories crate). Adding a crate whose license is not
+# listed here is intentionally a build failure — vet it and add it explicitly.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate transitive versions are a hygiene signal, not a hard failure, in a
+# crypto + GUI tree that legitimately carries a few pinned transitive versions.
+multiple-versions = "warn"
+# A `version = "*"` dependency is never acceptable for a crates.io dependency in
+# a security-sensitive build. Internal workspace crates are pulled by `path` (no
+# version, which cargo treats as `*`) and are exempt.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies, no alternate registries. The vendored
+# NAT-PMP and hidapi code lives in-tree, so this must stay empty of git sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

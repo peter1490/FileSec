@@ -7,6 +7,11 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+# Application crate: shipped as a binary, never published to crates.io. It pulls
+# filesec-gui by `path` (no version), which is only valid for an unpublished
+# crate — so this must stay false (and lets cargo-deny's allow-wildcard-paths
+# apply). See deny.toml.
+publish = false
 
 [[bin]]
 name = "filesec-pqc"

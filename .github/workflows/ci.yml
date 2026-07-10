@@ -10,6 +10,11 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Supply-chain note: every third-party GitHub Action is pinned by commit SHA with
+# the human-readable version in a trailing comment, so a moved or compromised tag
+# cannot silently change what runs in CI. Bump the SHA and the comment together
+# when upgrading an action. Installed cargo tools are likewise pinned by version.
+
 jobs:
   # Classical (default) build + tests + lint on all three OSes. The bare cargo
   # commands operate on the default workspace members (filesec-core, filesec-gui),
@@ -22,7 +27,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # eframe/winit + rfd need a few system libraries to build on Linux.
       - name: Install Linux build deps
@@ -35,11 +40,13 @@ jobs:
 
       # Linux needs rustc >= 1.87 (rfd/directories -> zbus); macOS/Windows build
       # on the 1.86 MSRV. `stable` satisfies all and the locked deps still apply.
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned by SHA, so the toolchain channel must be named explicitly.
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -53,20 +60,24 @@ jobs:
       - name: Test (classical)
         run: cargo test --locked
 
-  # Opt-in feature builds, exercised on a single OS to keep CI fast. The
-  # post-quantum suites, the direct-transfer networking, and the OS-keychain
-  # auto-unlock each get their own clippy + test pass. (The passkey feature
-  # vendors hidapi/C and needs physical hardware, so it is not built here — see
-  # crates/filesec-gui/src/passkey.rs.)
+  # Opt-in feature builds, exercised on a single OS to keep CI fast. These gate
+  # the exact feature combinations that ship in the release binaries (see
+  # .github/workflows/release.yml): the `filesec` binary is built with
+  # pqc,keyring,passkey and the `filesec-pqc` binary additionally enables net.
+  # Each shipped feature set gets a clippy/test pass here so users never receive a
+  # combination CI did not compile. macOS carries the FIDO2/HID stack the passkey
+  # feature needs; hardware-backed passkey tests still require a physical key and
+  # stay #[ignore]d (see crates/filesec-gui/src/passkey.rs).
   features:
-    name: features (pqc, net, keyring)
+    name: features (release feature sets)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Clippy (pqc)
         run: cargo clippy -p filesec-core -p filesec-gui --all-targets --features pqc --locked
@@ -80,11 +91,71 @@ jobs:
       - name: Test (net)
         run: cargo test -p filesec-core -p filesec-gui --features net --locked
 
-      - name: Clippy (keyring)
+      - name: Clippy (keyring compile path)
         run: cargo clippy -p filesec-gui --all-targets --features keyring --locked
+
+      - name: Clippy (passkey compile path)
+        run: cargo clippy -p filesec-gui --all-targets --features passkey --locked
+
+      # The exact feature set of the shipped `filesec` binary.
+      - name: "Clippy (filesec release features: pqc,keyring,passkey)"
+        run: cargo clippy -p filesec-gui --all-targets --features "pqc,keyring,passkey" --locked
 
       - name: Clippy (post-quantum variant binary)
         run: cargo clippy -p filesec-pqc --all-targets --locked
 
       - name: Build (post-quantum variant binary)
         run: cargo build -p filesec-pqc --locked
+
+  # Supply-chain gate. Blocks known-vulnerable/yanked dependencies, disallowed
+  # licenses, and any crate sourced from outside crates.io. cargo-deny is the
+  # comprehensive gate (advisories + licenses + bans + sources, config in
+  # deny.toml); cargo-audit is the canonical RustSec scanner run as a cross-check
+  # (config in .cargo/audit.toml). Both tools are pinned by version, and their
+  # accepted-advisory ignore lists are kept in lockstep. Neither reads the
+  # workspace's MSRV, so they build with the CI `stable` toolchain.
+  supply-chain:
+    name: supply-chain (audit, deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
+
+      - name: Install pinned supply-chain tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+
+      # Fails the build on any advisory not explicitly accepted in deny.toml, on a
+      # non-permissive license, or on a non-crates.io source.
+      - name: cargo deny
+        run: cargo deny --all-features check
+
+      # Canonical RustSec cross-check against Cargo.lock.
+      - name: cargo audit
+        run: cargo audit
+
+  # Validate the GitHub Actions workflows themselves: action-reference format,
+  # expression syntax, matrix/needs/permissions consistency, and the signing-gate
+  # conditions. actionlint is downloaded at a pinned version and verified against
+  # its published SHA-256 before use. Shellcheck integration is disabled (the
+  # release scripts intentionally rely on word-splitting `$BUILD_ARGS`); the
+  # structural workflow checks are the ones that matter here.
+  workflows:
+    name: lint workflows (actionlint)
+    runs-on: ubuntu-latest
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run actionlint
+        run: |
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "$url" -o actionlint.tar.gz
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -shellcheck=

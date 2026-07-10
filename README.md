@@ -323,10 +323,21 @@ Tagging `v*` builds, signs, and publishes **two installer families** — classic
 (`filesec`) and post-quantum (`filesec-pqc`) — for macOS (`.dmg`), Windows
 (`.msi` + NSIS) and Linux (`.deb`), each with a portable archive and a published
 `SHA256SUMS`. macOS builds are codesigned + notarized and Windows builds are
-Authenticode-signed when the maintainer's certificates are configured as repo
-secrets. A complementary `cargo-dist` configuration provides `curl | sh`
+Authenticode-signed; on the upstream repo an official tag **fails** rather than
+publish unsigned artifacts. Every release also carries a per-variant **SBOM**
+(SPDX) and **SLSA build-provenance attestations** covering the artifacts and the
+`SHA256SUMS` manifest (`gh attestation verify <file> --repo peter1490/FileSec`).
+The Windows `.msi` is built from a committed, reviewable WiX source so it is
+deterministic. A complementary `cargo-dist` configuration provides `curl | sh`
 installers. See [RELEASE.md](RELEASE.md) for the full process and required
 secrets.
+
+CI additionally runs a **supply-chain gate** — `cargo deny` (RustSec advisories,
+license allow-list, crates.io-only sources) and `cargo audit` — on every push and
+pull request, and lints the workflows with `actionlint`. All GitHub Actions are
+pinned by commit SHA and all release-time cargo tools by version. See
+[`deny.toml`](deny.toml) for the policy and accepted, justified advisory
+exceptions.
 
 ### A typical two-party exchange
 

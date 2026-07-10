@@ -1,0 +1,27 @@
+# cargo-audit configuration.
+#
+# cargo-audit is the canonical RustSec advisory scanner; it runs in the
+# "supply-chain" CI job alongside cargo-deny (which additionally gates licenses,
+# bans, and sources). Both read the same RustSec database, so this ignore list
+# MUST be kept in lockstep with the `[advisories] ignore` list in ../deny.toml —
+# each entry there has the full justification. A summary is repeated here so this
+# file is self-explanatory; see deny.toml for the reachability analysis and the
+# condition under which each exception is dropped.
+#
+# By default cargo-audit fails on vulnerabilities and only warns on informational
+# (unmaintained) advisories; every ID below is listed so neither tool blocks CI
+# on these accepted, MSRV-constrained, low-reachability transitive advisories. A
+# new advisory (any ID not listed) still fails the build.
+
+[advisories]
+ignore = [
+    # ttf-parser 0.25.1 — unmaintained, no patch; egui text stack pins it.
+    "RUSTSEC-2026-0192",
+    # quick-xml 0.39.4 — two DoS; patched only in >= 0.41 (major); Linux AT-SPI
+    # via egui/accesskit, not untrusted input.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # time 0.3.41 — RFC 2822 parser DoS; patched only in >= 0.3.47 (needs Rust
+    # 1.88 > our 1.86 MSRV); RFC 2822 path unreached (passkey x509 cert dates).
+    "RUSTSEC-2026-0009",
+]

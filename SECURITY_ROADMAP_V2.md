@@ -493,6 +493,68 @@ Required tests:
 
 ### Stage 7: Release, CI, And Supply-Chain Hardening
 
+**Implementation status (2026-07-10): complete.** CI gained a **supply-chain
+gate** (`.github/workflows/ci.yml`, `supply-chain` job) running `cargo deny`
+(new [`deny.toml`](deny.toml): RustSec advisories, a permissive-only license
+allow-list enumerated from the actual graph, crates.io-only sources, and a
+wildcard/duplicate bans policy) and `cargo audit` (new `.cargo/audit.toml`) as a
+canonical RustSec cross-check; both tools are pinned by version and share one
+justified, in-lockstep advisory-`ignore` list. The two leaf app crates are now
+`publish = false` (they pull internal crates by `path`, so `allow-wildcard-paths`
+applies and a real `version = "*"` on a crates.io dep still fails). The gate is
+live and green: it surfaced four real transitive advisories — `ttf-parser`
+unmaintained (RUSTSEC-2026-0192, no patch, deep in egui's text stack),
+`quick-xml` DoS ×2 (RUSTSEC-2026-0194/0195, patched only in the ≥ 0.41 semver
+major, Linux-only AT-SPI via egui/accesskit, not untrusted input), and `time`
+RFC-2822 DoS (RUSTSEC-2026-0009, patched only in ≥ 0.3.47 which requires Rust
+1.88 above the 1.86 MSRV, and the vulnerable RFC-2822 path is unreached on the
+passkey X.509 chain) — each of which is accepted with a documented reachability
+analysis and drop condition rather than an MSRV-breaking or egui-breaking bump.
+A new advisory (any un-listed ID), a non-permissive license, a non-crates.io
+source, or a yanked crate still fails the build.
+
+The **CI feature matrix** now gates every shipped combination: the classical
+`filesec` release set (`pqc,keyring,passkey`), the `filesec-pqc` binary (which
+adds `net`), the net and PQC test passes, and the standalone keyring and passkey
+compile paths. A new `workflows` job runs **`actionlint`** (pinned and
+SHA-256-verified) so the workflows themselves are validated on every push/PR
+(shellcheck integration disabled: the release scripts deliberately word-split
+`$BUILD_ARGS`; the structural checks, including the signing-gate expressions, are
+the point).
+
+The **release pipeline** (`.github/workflows/release.yml`) is now fully
+supply-chain-pinned: every GitHub Action is pinned by commit SHA with a version
+comment, and every release-time cargo tool (`cargo-wix`, `cargo-deb`,
+`cargo-sbom`) by `--version`. The macOS/Windows signing-required gates (F11, from
+Stage 1) are unchanged and still fail official upstream tags that lack signing
+secrets; the publish job stays gated on the tag and the upstream repository, so
+forks/dispatch runs build unsigned but never publish. New in this stage: a per-
+variant **SBOM** (SPDX 2.3, `cargo-sbom`) job, **SLSA build-provenance
+attestations** (`actions/attest-build-provenance`) over every published file
+*and* the `SHA256SUMS` manifest (so the checksum list itself is attestable), a
+least-privilege `permissions` model (top-level `contents: read`; the publish job
+alone widens to `contents/id-token/attestations: write`), and a checksum step
+that no longer self-hashes its own manifest. The Windows **MSI is now
+deterministic**: authentic `cargo-wix`-generated `crates/<pkg>/wix/main.wxs`
+sources are committed and built with `--no-build` (no per-run `wix init`
+regeneration), and the step is a required release artifact (the
+`continue-on-error` best-effort marker is gone). `RELEASE.md` and `README.md`
+were rewritten to match the actual shipped feature sets, the device-token
+auto-unlock model (Stage 6), and the new SBOM/provenance/supply-chain story.
+
+Intentional scoping, consistent with the dependency-light, MSRV-1.86 posture:
+`cargo vet` is **not** adopted (a from-scratch audit set would be empty and block
+every build); the equivalent guarantee is provided by the enforced
+`cargo deny` + `cargo audit` gates plus a documented manual-review process for
+crypto/parsing dependencies (see `RELEASE.md` → "Dependency review process"). The
+three accepted vulnerability/unmaintained advisories are held as documented,
+time-boxed exceptions because their only fixes break the MSRV or the pinned egui
+stack; they are all low-reachability transitive advisories. The Stage 7 changes
+are workflow/config/docs only — no crate source or `Cargo.lock` change — and were
+validated locally with `cargo-deny 0.20.2` (the pinned CI version, exit 0 on all
+four checks) and `actionlint 1.7.12`; the default workspace still builds and its
+131 tests pass on 1.86.
+
 Objective:
 
 Make official releases reproducible, signed, provenance-backed, dependency-audited, and clearly distinguishable from fork or development artifacts.
