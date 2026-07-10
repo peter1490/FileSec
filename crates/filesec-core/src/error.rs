@@ -99,12 +99,13 @@ pub enum Error {
     #[error("the peer's identity does not match the expected contact")]
     PeerIdentityMismatch,
 
-    /// During a direct network transfer, the one-time pairing code did not match
-    /// (or one side supplied a code and the other did not). Surfaced as a
-    /// best-effort hint when the peer identity is otherwise correct but the
-    /// authenticated handshake fails to agree on keys.
-    #[error("the pairing code does not match")]
-    PairingCodeMismatch,
+    /// During a direct network transfer, the dialing peer failed to prove
+    /// knowledge of the per-transfer 128-bit transfer secret. The responder
+    /// aborts *before* disclosing any identity or signature material, so an
+    /// attacker who does not hold the secret learns nothing and gets no offline
+    /// oracle against it.
+    #[error("the transfer code does not match")]
+    TransferSecretMismatch,
 
     /// A transport handshake message was malformed, arrived out of order, or
     /// named an unsupported protocol version/suite.

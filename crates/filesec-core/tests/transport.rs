@@ -10,6 +10,9 @@ use filesec_core::transport::{Initiator, Responder, Session};
 use filesec_core::{Error, Identity, RecordType};
 use proptest::prelude::*;
 
+/// A fixed 128-bit-class transfer secret shared by both sides in the tests.
+const SECRET: &[u8] = b"a-shared-transfer-secret-0123456789ab";
+
 fn pair() -> (Identity, Identity) {
     (
         Identity::generate("Alice", 1).expect("alice"),
@@ -23,11 +26,11 @@ fn handshake(
     initiator_id: &Identity,
     responder_id: &Identity,
     expected_peer_fpr: [u8; 32],
-    init_code: Option<&[u8]>,
-    resp_code: Option<&[u8]>,
+    init_secret: &[u8],
+    resp_secret: &[u8],
 ) -> Result<(Session, Session, [u8; 32]), Error> {
-    let initiator = Initiator::new(initiator_id, expected_peer_fpr, init_code)?;
-    let mut responder = Responder::new(responder_id, resp_code, None)?;
+    let initiator = Initiator::new(initiator_id, expected_peer_fpr, init_secret)?;
+    let mut responder = Responder::new(responder_id, resp_secret, None)?;
     let hello = initiator.write_hello()?;
     let auth = responder.read_hello_write_auth(&hello)?;
     let (confirm, isess) = initiator.read_auth_write_confirm(&auth)?;
@@ -39,7 +42,7 @@ fn handshake(
 fn full_handshake_and_transfer_roundtrip() {
     let (alice, bob) = pair();
     let (mut isess, mut rsess, peer_fpr) =
-        handshake(&alice, &bob, bob.fingerprint(), None, None).expect("handshake");
+        handshake(&alice, &bob, bob.fingerprint(), SECRET, SECRET).expect("handshake");
 
     // The responder learns the initiator's real, verified fingerprint.
     assert_eq!(peer_fpr, alice.fingerprint());
@@ -73,11 +76,11 @@ fn full_handshake_and_transfer_roundtrip() {
 }
 
 #[test]
-fn matching_pairing_code_succeeds() {
+fn matching_transfer_secret_succeeds() {
     let (alice, bob) = pair();
-    let code = b"1234-5678";
-    let (_i, _r, peer) =
-        handshake(&alice, &bob, bob.fingerprint(), Some(code), Some(code)).expect("handshake");
+    let secret = b"another-shared-secret-abcdef012345";
+    let (_i, _r, peer) = handshake(&alice, &bob, bob.fingerprint(), secret, secret)
+        .expect("handshake with matching secrets");
     assert_eq!(peer, alice.fingerprint());
 }
 
@@ -96,36 +99,43 @@ fn expect_handshake_error(
 }
 
 #[test]
-fn mismatched_pairing_code_aborts() {
+fn mismatched_transfer_secret_aborts() {
     let (alice, bob) = pair();
+    // Different secrets: the responder's proof gate fails and it returns
+    // `TransferSecretMismatch` without ever producing an `Auth`.
     let result = handshake(
         &alice,
         &bob,
         bob.fingerprint(),
-        Some(b"11111111"),
-        Some(b"22222222"),
+        b"secret-held-by-the-sender-only",
+        b"a-different-secret-on-the-receiver",
     );
-    expect_handshake_error(result, "PairingCodeMismatch", |e| {
-        matches!(e, Error::PairingCodeMismatch)
+    expect_handshake_error(result, "TransferSecretMismatch", |e| {
+        matches!(e, Error::TransferSecretMismatch)
     });
 }
 
 #[test]
-fn one_sided_pairing_code_aborts() {
+fn secret_proof_gates_responder_disclosure() {
+    // Offline-oracle regression: a peer that does not hold the secret drives the
+    // responder directly. The responder must emit NO bytes (no identity, no
+    // signature) that an attacker could harvest or use as a verification oracle.
     let (alice, bob) = pair();
-    // Initiator supplies a code, responder expects none → the initiator (which
-    // knows a code was in play) reports a pairing-code mismatch.
-    let result = handshake(&alice, &bob, bob.fingerprint(), Some(b"99999999"), None);
-    expect_handshake_error(result, "PairingCodeMismatch", |e| {
-        matches!(e, Error::PairingCodeMismatch)
-    });
+    let wrong = Initiator::new(&alice, bob.fingerprint(), b"attacker's guess #1").unwrap();
+    let mut responder = Responder::new(&bob, SECRET, None).unwrap();
+    let hello = wrong.write_hello().unwrap();
+    match responder.read_hello_write_auth(&hello) {
+        Err(Error::TransferSecretMismatch) => {}
+        Err(e) => panic!("expected TransferSecretMismatch, got {e:?}"),
+        Ok(_auth) => panic!("responder disclosed Auth to a peer without the secret"),
+    }
 }
 
 #[test]
 fn wrong_expected_fingerprint_aborts() {
     let (alice, bob) = pair();
     // Initiator dials expecting Alice's own fingerprint, but reaches Bob.
-    let result = handshake(&alice, &bob, alice.fingerprint(), None, None);
+    let result = handshake(&alice, &bob, alice.fingerprint(), SECRET, SECRET);
     expect_handshake_error(result, "PeerIdentityMismatch", |e| {
         matches!(e, Error::PeerIdentityMismatch)
     });
@@ -134,9 +144,9 @@ fn wrong_expected_fingerprint_aborts() {
 #[test]
 fn responder_accepts_its_designated_sender() {
     let (alice, bob) = pair(); // alice = initiator/sender, bob = responder/receiver
-    let initiator = Initiator::new(&alice, bob.fingerprint(), None).unwrap();
+    let initiator = Initiator::new(&alice, bob.fingerprint(), SECRET).unwrap();
     // Bob designates Alice as the expected sender.
-    let mut responder = Responder::new(&bob, None, Some(alice.fingerprint())).unwrap();
+    let mut responder = Responder::new(&bob, SECRET, Some(alice.fingerprint())).unwrap();
     let hello = initiator.write_hello().unwrap();
     let auth = responder.read_hello_write_auth(&hello).unwrap();
     let (confirm, _isess) = initiator.read_auth_write_confirm(&auth).unwrap();
@@ -148,10 +158,10 @@ fn responder_accepts_its_designated_sender() {
 fn responder_rejects_an_undesignated_sender() {
     let (alice, bob) = pair();
     let carol = Identity::generate("Carol", 3).expect("carol");
-    let initiator = Initiator::new(&alice, bob.fingerprint(), None).unwrap();
+    let initiator = Initiator::new(&alice, bob.fingerprint(), SECRET).unwrap();
     // Bob is expecting Carol, but Alice connects — even though Alice authenticates
     // validly, she is not the designated sender.
-    let mut responder = Responder::new(&bob, None, Some(carol.fingerprint())).unwrap();
+    let mut responder = Responder::new(&bob, SECRET, Some(carol.fingerprint())).unwrap();
     let hello = initiator.write_hello().unwrap();
     let auth = responder.read_hello_write_auth(&hello).unwrap();
     let (confirm, _isess) = initiator.read_auth_write_confirm(&auth).unwrap();
@@ -165,7 +175,8 @@ fn responder_rejects_an_undesignated_sender() {
 #[test]
 fn tampered_record_fails_to_open() {
     let (alice, bob) = pair();
-    let (mut isess, mut rsess, _) = handshake(&alice, &bob, bob.fingerprint(), None, None).unwrap();
+    let (mut isess, mut rsess, _) =
+        handshake(&alice, &bob, bob.fingerprint(), SECRET, SECRET).unwrap();
     let mut frame = isess
         .seal_record(RecordType::Data, b"secret payload")
         .unwrap();
@@ -178,7 +189,8 @@ fn tampered_record_fails_to_open() {
 #[test]
 fn reordered_records_fail() {
     let (alice, bob) = pair();
-    let (mut isess, mut rsess, _) = handshake(&alice, &bob, bob.fingerprint(), None, None).unwrap();
+    let (mut isess, mut rsess, _) =
+        handshake(&alice, &bob, bob.fingerprint(), SECRET, SECRET).unwrap();
     let first = isess.seal_record(RecordType::Data, b"one").unwrap();
     let second = isess.seal_record(RecordType::Data, b"two").unwrap();
     // Deliver the second record first: counter mismatch ⇒ authentication fails.
@@ -190,7 +202,8 @@ fn reordered_records_fail() {
 #[test]
 fn dropped_record_fails() {
     let (alice, bob) = pair();
-    let (mut isess, mut rsess, _) = handshake(&alice, &bob, bob.fingerprint(), None, None).unwrap();
+    let (mut isess, mut rsess, _) =
+        handshake(&alice, &bob, bob.fingerprint(), SECRET, SECRET).unwrap();
     let _first = isess.seal_record(RecordType::Data, b"one").unwrap();
     let second = isess.seal_record(RecordType::Data, b"two").unwrap();
     // Receiver never sees the first frame; the second is at the wrong counter.
@@ -200,7 +213,8 @@ fn dropped_record_fails() {
 #[test]
 fn duplicated_record_fails() {
     let (alice, bob) = pair();
-    let (mut isess, mut rsess, _) = handshake(&alice, &bob, bob.fingerprint(), None, None).unwrap();
+    let (mut isess, mut rsess, _) =
+        handshake(&alice, &bob, bob.fingerprint(), SECRET, SECRET).unwrap();
     let frame = isess.seal_record(RecordType::Data, b"one").unwrap();
     assert!(rsess.open_record(&frame).is_ok());
     // Replaying the same frame fails (the receive counter has advanced).
@@ -217,7 +231,7 @@ proptest! {
     ) {
         let (alice, bob) = pair();
         let (mut isess, mut rsess, _) =
-            handshake(&alice, &bob, bob.fingerprint(), None, None).unwrap();
+            handshake(&alice, &bob, bob.fingerprint(), SECRET, SECRET).unwrap();
         for payload in payloads {
             let frame = isess.seal_record(RecordType::Data, &payload).unwrap();
             let (t, pt) = rsess.open_record(&frame).unwrap();

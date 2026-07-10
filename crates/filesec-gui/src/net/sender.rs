@@ -18,7 +18,9 @@ use filesec_core::transport::{Initiator, RecordType, Session};
 use filesec_core::{codec, ExportOptions, Identity};
 
 use super::wire::{read_handshake_frame, write_frame};
-use super::{normalize_code, DecisionMsg, Emitter, NetCommand, NetEvent, OfferMsg, SendConfig};
+use super::{
+    decode_transfer_code, DecisionMsg, Emitter, NetCommand, NetEvent, OfferMsg, SendConfig,
+};
 use crate::store::Store;
 
 /// How long to wait for the TCP connection itself. Kept short: this is the
@@ -58,20 +60,19 @@ pub fn run(
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
 
-    // 2. Mutual-auth handshake; aborts in core on a fingerprint or pairing-code
+    // 2. Mutual-auth handshake; aborts in core on a fingerprint or transfer-secret
     //    mismatch. Completing it proves the receiver is up *and* is the contact we
-    //    meant to reach — all before we encrypt a single byte.
-    let code = config
-        .pairing_code
+    //    meant to reach — all before we encrypt a single byte. The transfer secret
+    //    is mandatory: without it the receiver will not disclose its identity.
+    let secret = config
+        .transfer_code
         .as_deref()
-        .map(normalize_code)
-        .filter(|c| !c.is_empty());
-    let initiator = Initiator::new(
-        identity,
-        config.recipient_fpr,
-        code.as_deref().map(str::as_bytes),
-    )
-    .map_err(|e| e.to_string())?;
+        .and_then(decode_transfer_code)
+        .ok_or_else(|| {
+            "Enter the transfer code the receiver is showing (letters and numbers).".to_string()
+        })?;
+    let initiator =
+        Initiator::new(identity, config.recipient_fpr, &secret).map_err(|e| e.to_string())?;
     let hello = initiator.write_hello().map_err(|e| e.to_string())?;
     write_frame(&mut stream, &hello).map_err(|e| e.to_string())?;
     let auth = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;

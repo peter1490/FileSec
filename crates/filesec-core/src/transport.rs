@@ -16,10 +16,10 @@
 //! with an [`RecordType::OfferDecision`], then the initiator streams
 //! [`RecordType::Data`] records and a final [`RecordType::Done`].
 //!
-//! # Handshake (SIGMA-I, 1.5 round trips)
+//! # Handshake (SIGMA-I with a transfer-secret gate, 1.5 round trips)
 //!
 //! ```text
-//! initiator I ── Hello   ─────────────▶ responder R   (I's ephemeral + nonce; no identity yet)
+//! initiator I ── Hello   ─────────────▶ responder R   (I's ephemeral + nonce + secret proof; no identity yet)
 //! initiator I ◀─ Auth    ────────────── responder R   (R's ephemeral + nonce + identity + signature)
 //! initiator I ── Confirm ─────────────▶ responder R   (I's identity + signature, AEAD-sealed)
 //!                  … channel open, records flow …
@@ -27,13 +27,13 @@
 //!
 //! Both sides contribute a fresh ephemeral X25519 key (forward secrecy) and a
 //! 32-byte nonce. An *ephemeral transcript hash* `th0` commits to the protocol
-//! version, suite, both ephemerals, both nonces, and a commitment to the optional
-//! pairing code. Authentication is by Ed25519 **signature over `th0` and the
-//! signer's identity keys** (SIGMA's "sign the key exchange, bind the identity"),
-//! never by a static DH — so compromising a party's long-term *agreement* key
-//! cannot impersonate a peer (KCI resistance). Identities are revealed under the
-//! session key, so the initiator stays anonymous until it has verified the
-//! responder.
+//! version, suite, both ephemerals, both nonces, the **responder's fingerprint**,
+//! and a commitment to the mandatory **transfer secret**. Authentication is by
+//! Ed25519 **signature over `th0` and the signer's identity keys** (SIGMA's "sign
+//! the key exchange, bind the identity"), never by a static DH — so compromising a
+//! party's long-term *agreement* key cannot impersonate a peer (KCI resistance).
+//! Identities are revealed under the session key, so the initiator stays anonymous
+//! until it has verified the responder.
 //!
 //! Session keys are derived from the ephemeral↔ephemeral DH bound to `th0`:
 //! `k = BLAKE3-derive_key(label, ee_dh ‖ th0)`, one key per direction. The
@@ -50,17 +50,27 @@
 //!   hands the caller the authenticated peer fingerprint via [`PeerAuth`]; the GUI
 //!   then enforces that this peer is a `Trust::Verified` contact.
 //!
-//! # Pairing code (per-transfer second factor)
+//! # Transfer secret (mandatory per-transfer gate)
 //!
-//! An optional one-time code is folded into `th0` via
-//! `BLAKE3("FileSec p2p pairing v1" ‖ code)`. Because it is inside the signed
-//! transcript *and* the key schedule, a mismatch makes the responder's signature
-//! fail to verify on the initiator (and `Confirm` fail to open on the responder):
-//! the session simply cannot form. When the peer identity otherwise matches, such
-//! a failure is reported as [`Error::PairingCodeMismatch`] as a best-effort hint.
-//! A short numeric code is low entropy and, against an attacker who *already*
-//! controls a valid verified identity, offline-guessable; it is a layered second
-//! factor on top of the public-key identity gate, not a standalone authenticator.
+//! Every transfer is gated by a fresh **128-bit transfer secret** the receiver
+//! generates and shows out of band. It plays two roles:
+//!
+//! 1. **Proof before disclosure.** The initiator's `Hello` carries a keyed proof
+//!    `i_psk_tag = MAC(k_psk, version ‖ suite ‖ i_ephemeral ‖ i_nonce)` where
+//!    `k_psk = derive_key(secret)`. The responder verifies this proof (constant
+//!    time) *before* it computes or sends its `Auth` — so a network peer that
+//!    cannot prove the secret never receives the responder's identity or
+//!    signature, and gets no offline oracle over that signature. A failed proof
+//!    aborts with [`Error::TransferSecretMismatch`] and emits nothing.
+//! 2. **Transcript / key binding.** A commitment to the secret is folded into
+//!    `th0`, so it is inside both the signed transcript *and* the key schedule:
+//!    even setting the proof aside, a session cannot form unless both sides hold
+//!    the same secret.
+//!
+//! At 128 bits the secret is not offline-enumerable (unlike the old 8-digit code
+//! it replaces), so the proof carried on the wire is not a usable oracle. The
+//! secret is a second factor layered on the public-key identity gate: the
+//! verified-contact requirement still applies independently.
 //!
 //! # Record layer
 //!
@@ -75,12 +85,14 @@
 //! # Threat-model boundaries (not protected)
 //!
 //! Traffic analysis (record sizes and timing — hence the file-size class — are
-//! visible); the responder's address being learned by anyone who completes
-//! `Hello`; denial-of-service from unauthenticated dialers (mitigated only by the
-//! caller's handshake timeouts and single-listener policy); endpoint compromise;
-//! and the correctness of the user's out-of-band safety-number verification, which
-//! is the trust root. There is no post-compromise security / ratcheting — one
-//! ephemeral DH per transfer, which suffices for a one-shot transfer.
+//! visible); the responder's address being learned by anyone it accepts a TCP
+//! connection from (though its *identity* is now withheld until the transfer
+//! secret is proven); denial-of-service from unauthenticated dialers (mitigated by
+//! the caller's handshake deadlines, bounded worker pool, and per-IP backoff — see
+//! `filesec-gui`'s `net` module); endpoint compromise; and the correctness of the
+//! user's out-of-band safety-number verification, which is the trust root. There
+//! is no post-compromise security / ratcheting — one ephemeral DH per transfer,
+//! which suffices for a one-shot transfer.
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -91,22 +103,32 @@ use crate::kem::EphemeralKeyPair;
 use crate::secret::{ct_eq, random_array, SymKey};
 use crate::{aead, codec, kdf, sign};
 
-/// Wire magic: ASCII `FSECP2P` plus a one-byte format tag.
-const MAGIC: [u8; 8] = *b"FSECP2P\x01";
+/// Wire magic: ASCII `FSECP2P` plus a one-byte format tag. The tag is `\x02` for
+/// the transfer-secret protocol; a peer speaking the retired `\x01` pairing-code
+/// protocol fails the magic check and is refused (no silent downgrade).
+const MAGIC: [u8; 8] = *b"FSECP2P\x02";
 /// Handshake protocol version (bumped on any breaking change to the messages).
-const PROTO_VERSION: u16 = 1;
+/// v2 introduces the mandatory transfer-secret proof and drops the optional
+/// pairing code; the responder rejects any other version.
+const PROTO_VERSION: u16 = 2;
 /// The single classical cipher-suite this version offers (XChaCha20-Poly1305 /
 /// X25519 / Ed25519 / BLAKE3). Named atomically and bound into `th0` so it cannot
 /// be downgraded in-band.
 const SUITE_CLASSIC: u16 = 0x0001;
 
-/// Domain labels (versioned, in the crate's `"FileSec … v1"` family).
-const TRANSCRIPT_LABEL: &[u8] = b"FileSec p2p transcript v1";
-const PAIRING_LABEL: &[u8] = b"FileSec p2p pairing v1";
-const RESPONDER_AUTH_LABEL: &[u8] = b"FileSec p2p responder auth v1";
-const INITIATOR_AUTH_LABEL: &[u8] = b"FileSec p2p initiator auth v1";
-const SESSION_KEY_I2R: &str = "FileSec p2p session key i2r v1";
-const SESSION_KEY_R2I: &str = "FileSec p2p session key r2i v1";
+/// Domain labels (versioned, in the crate's `"FileSec … v2"` family for the
+/// transfer-secret protocol).
+const TRANSCRIPT_LABEL: &[u8] = b"FileSec p2p transcript v2";
+/// Context for deriving the pre-shared proof key from the raw transfer secret.
+const PSK_CONTEXT: &str = "FileSec p2p transfer secret v2";
+/// Keyed-MAC label for the `Hello` proof of secret knowledge.
+const HELLO_PROOF_LABEL: &[u8] = b"FileSec p2p hello proof v2";
+/// Keyed label for the secret commitment folded into `th0`.
+const SECRET_COMMIT_LABEL: &[u8] = b"FileSec p2p secret commit v2";
+const RESPONDER_AUTH_LABEL: &[u8] = b"FileSec p2p responder auth v2";
+const INITIATOR_AUTH_LABEL: &[u8] = b"FileSec p2p initiator auth v2";
+const SESSION_KEY_I2R: &str = "FileSec p2p session key i2r v2";
+const SESSION_KEY_R2I: &str = "FileSec p2p session key r2i v2";
 
 /// Direction byte mixed into every record nonce so a frame can never be reflected
 /// back to its sender under the same key/counter.
@@ -131,6 +153,9 @@ struct HelloMsg {
     suite: u16,
     i_ephemeral: [u8; 32],
     i_nonce: [u8; 32],
+    /// Keyed proof that the initiator holds the transfer secret. The responder
+    /// verifies this before disclosing any identity/signature material.
+    i_psk_tag: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,24 +181,42 @@ struct ConfirmInner {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// Commit to the optional pairing code (a fixed "absent" marker when `None`).
-fn pairing_commit(code: Option<&[u8]>) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(PAIRING_LABEL);
-    match code {
-        Some(c) => {
-            h.update(&[1u8]);
-            h.update(c);
-        }
-        None => {
-            h.update(&[0u8]);
-        }
-    }
-    *h.finalize().as_bytes()
+/// Derive the pre-shared proof key from the raw transfer secret. All proof and
+/// commitment values are keyed by this, so nothing derived from the secret leaks
+/// the secret itself (BLAKE3 keyed/derive are one-way).
+fn derive_psk(secret: &[u8]) -> SymKey {
+    kdf::derive_subkey(PSK_CONTEXT, secret)
+}
+
+/// The initiator's proof that it holds the transfer secret: a keyed MAC over its
+/// public `Hello` contribution. Bound to *this* Hello's ephemeral and nonce so a
+/// captured proof cannot be lifted onto a different key exchange.
+fn hello_proof(
+    k_psk: &SymKey,
+    version: u16,
+    suite: u16,
+    i_ephemeral: &[u8; 32],
+    i_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut data = Vec::with_capacity(HELLO_PROOF_LABEL.len() + 2 + 2 + 32 + 32);
+    data.extend_from_slice(HELLO_PROOF_LABEL);
+    data.extend_from_slice(&version.to_be_bytes());
+    data.extend_from_slice(&suite.to_be_bytes());
+    data.extend_from_slice(i_ephemeral);
+    data.extend_from_slice(i_nonce);
+    *blake3::keyed_hash(k_psk.as_bytes(), &data).as_bytes()
+}
+
+/// The commitment to the transfer secret folded into `th0` (never sent on the
+/// wire; only its influence on `th0`, signatures, and keys is observable).
+fn secret_commit(k_psk: &SymKey) -> [u8; 32] {
+    *blake3::keyed_hash(k_psk.as_bytes(), SECRET_COMMIT_LABEL).as_bytes()
 }
 
 /// The ephemeral transcript hash: everything both sides know before identities
-/// are exchanged. Signatures and session keys are bound to this value.
+/// are exchanged. Signatures and session keys are bound to this value. It now
+/// also binds the (expected) responder fingerprint and the transfer-secret
+/// commitment.
 #[allow(clippy::too_many_arguments)]
 fn transcript0(
     version: u16,
@@ -182,7 +225,8 @@ fn transcript0(
     i_nonce: &[u8; 32],
     r_ephemeral: &[u8; 32],
     r_nonce: &[u8; 32],
-    pairing_commit: &[u8; 32],
+    r_fingerprint: &[u8; 32],
+    secret_commit: &[u8; 32],
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(TRANSCRIPT_LABEL);
@@ -192,7 +236,8 @@ fn transcript0(
     h.update(i_nonce);
     h.update(r_ephemeral);
     h.update(r_nonce);
-    h.update(pairing_commit);
+    h.update(r_fingerprint);
+    h.update(secret_commit);
     *h.finalize().as_bytes()
 }
 
@@ -399,36 +444,51 @@ pub struct Initiator<'a> {
     ephemeral: EphemeralKeyPair,
     nonce: [u8; 32],
     expected_peer_fpr: [u8; 32],
-    pairing_commit: [u8; 32],
-    code_set: bool,
+    k_psk: SymKey,
+    secret_commit: [u8; 32],
 }
 
 impl<'a> Initiator<'a> {
     /// Begin a handshake toward the contact identified by `expected_peer_fpr`,
-    /// optionally gated by a normalized one-time `pairing_code`.
+    /// gated by the mandatory `transfer_secret` (the receiver's per-transfer
+    /// 128-bit code). The secret must be non-empty.
     pub fn new(
         identity: &'a Identity,
         expected_peer_fpr: [u8; 32],
-        pairing_code: Option<&[u8]>,
+        transfer_secret: &[u8],
     ) -> Result<Self> {
+        if transfer_secret.is_empty() {
+            return Err(Error::HandshakeProtocol("a transfer secret is required"));
+        }
+        let k_psk = derive_psk(transfer_secret);
+        let secret_commit = secret_commit(&k_psk);
         Ok(Self {
             identity,
             ephemeral: EphemeralKeyPair::generate()?,
             nonce: random_array::<32>()?,
             expected_peer_fpr,
-            pairing_commit: pairing_commit(pairing_code),
-            code_set: pairing_code.is_some(),
+            k_psk,
+            secret_commit,
         })
     }
 
-    /// Produce the `Hello` message bytes (the first thing on the wire).
+    /// Produce the `Hello` message bytes (the first thing on the wire), carrying
+    /// the keyed proof that we hold the transfer secret.
     pub fn write_hello(&self) -> Result<Vec<u8>> {
+        let i_ephemeral = self.ephemeral.public();
         let hello = HelloMsg {
             magic: MAGIC,
             version: PROTO_VERSION,
             suite: SUITE_CLASSIC,
-            i_ephemeral: self.ephemeral.public(),
+            i_ephemeral,
             i_nonce: self.nonce,
+            i_psk_tag: hello_proof(
+                &self.k_psk,
+                PROTO_VERSION,
+                SUITE_CLASSIC,
+                &i_ephemeral,
+                &self.nonce,
+            ),
         };
         codec::to_vec(&hello)
     }
@@ -436,14 +496,16 @@ impl<'a> Initiator<'a> {
     /// Consume the responder's `Auth`; verify it is the expected contact and that
     /// its signature is valid; then return the `Confirm` bytes to send and the
     /// open [`Session`]. Aborts with [`Error::PeerIdentityMismatch`] on a wrong
-    /// identity and [`Error::PairingCodeMismatch`]/[`Error::BadSignature`] on a
-    /// failed authentication.
+    /// identity and [`Error::BadSignature`] on a failed authentication.
     pub fn read_auth_write_confirm(self, auth_bytes: &[u8]) -> Result<(Vec<u8>, Session)> {
         let auth: AuthMsg = codec::from_slice(auth_bytes)?;
         let r_sig = fixed::<{ sign::SIGNATURE_LEN }>(&auth.r_sig)?;
         let r_sign_pub = auth.r_identity.sign_public;
         let r_kem_pub = auth.r_identity.kem_public;
 
+        // We bind the responder fingerprint we *expected* to reach; if the live
+        // responder is someone else, its own `th0` differs and its signature will
+        // not verify below (in addition to the explicit fingerprint check).
         let th0 = transcript0(
             PROTO_VERSION,
             SUITE_CLASSIC,
@@ -451,7 +513,8 @@ impl<'a> Initiator<'a> {
             &self.nonce,
             &auth.r_ephemeral,
             &auth.r_nonce,
-            &self.pairing_commit,
+            &self.expected_peer_fpr,
+            &self.secret_commit,
         );
 
         // Check the identity FIRST so a plain "wrong contact" is distinguishable
@@ -463,14 +526,10 @@ impl<'a> Initiator<'a> {
 
         let sig_msg = responder_sig_msg(&th0, &r_sign_pub, &r_kem_pub);
         if sign::verify(&r_sign_pub, &sig_msg, &r_sig).is_err() {
-            // Identity matched but the signature did not: most likely a wrong
-            // pairing code (it changes th0) or active tampering. Either way we
-            // abort; the variant is only a hint for the user.
-            return Err(if self.code_set {
-                Error::PairingCodeMismatch
-            } else {
-                Error::BadSignature
-            });
+            // Identity matched but the signature did not: a secret mismatch is
+            // caught earlier by the responder's proof gate (it never sends a valid
+            // Auth), so reaching here means active tampering with the transcript.
+            return Err(Error::BadSignature);
         }
 
         let ee_dh = self.ephemeral.agree(&auth.r_ephemeral)?;
@@ -516,42 +575,50 @@ pub struct Responder<'a> {
     identity: &'a Identity,
     ephemeral: EphemeralKeyPair,
     nonce: [u8; 32],
-    pairing_commit: [u8; 32],
-    code_set: bool,
+    k_psk: SymKey,
+    secret_commit: [u8; 32],
     expected_peer_fpr: Option<[u8; 32]>,
     pending: Option<ResponderPending>,
 }
 
 impl<'a> Responder<'a> {
-    /// Prepare to answer a handshake, optionally gated by a normalized one-time
-    /// `pairing_code` the user is reading out of band.
+    /// Prepare to answer a handshake, gated by the mandatory `transfer_secret`
+    /// the user is reading out of band. The secret must be non-empty.
     ///
     /// When `expected_peer_fpr` is `Some`, the receiver has **designated** which
     /// contact it is expecting: any peer that authenticates as a different
     /// identity is rejected ([`Error::PeerIdentityMismatch`]) — symmetric with the
-    /// initiator's own expected-peer check. The responder still answers `Hello`
-    /// with its (public) `Auth` before it learns who connected, but it never
-    /// proceeds past the handshake — no offer, no data — unless the live peer is
-    /// the designated, authenticated contact. Pass `None` to accept any
-    /// authenticated peer (the caller then applies its own policy).
+    /// initiator's own expected-peer check. The responder answers `Hello` with its
+    /// `Auth` *only after the transfer-secret proof verifies*, and never proceeds
+    /// past the handshake — no offer, no data — unless the live peer is the
+    /// designated, authenticated contact. Pass `None` to accept any authenticated
+    /// peer (the caller then applies its own policy).
     pub fn new(
         identity: &'a Identity,
-        pairing_code: Option<&[u8]>,
+        transfer_secret: &[u8],
         expected_peer_fpr: Option<[u8; 32]>,
     ) -> Result<Self> {
+        if transfer_secret.is_empty() {
+            return Err(Error::HandshakeProtocol("a transfer secret is required"));
+        }
+        let k_psk = derive_psk(transfer_secret);
+        let secret_commit = secret_commit(&k_psk);
         Ok(Self {
             identity,
             ephemeral: EphemeralKeyPair::generate()?,
             nonce: random_array::<32>()?,
-            pairing_commit: pairing_commit(pairing_code),
-            code_set: pairing_code.is_some(),
+            k_psk,
+            secret_commit,
             expected_peer_fpr,
             pending: None,
         })
     }
 
-    /// Consume the initiator's `Hello`; derive the session keys; return the `Auth`
-    /// bytes to send back (carrying the responder's identity and signature).
+    /// Consume the initiator's `Hello`; **verify the transfer-secret proof before
+    /// disclosing anything**; then derive the session keys and return the `Auth`
+    /// bytes (carrying the responder's identity and signature). A peer that cannot
+    /// prove the secret is refused with [`Error::TransferSecretMismatch`] and no
+    /// bytes are produced.
     pub fn read_hello_write_auth(&mut self, hello_bytes: &[u8]) -> Result<Vec<u8>> {
         let hello: HelloMsg = codec::from_slice(hello_bytes)?;
         if hello.magic != MAGIC {
@@ -564,6 +631,19 @@ impl<'a> Responder<'a> {
             return Err(Error::HandshakeProtocol("unsupported handshake suite"));
         }
 
+        // Gate: prove knowledge of the transfer secret *before* we compute or
+        // reveal any identity/signature material. Constant-time compare.
+        let expect_tag = hello_proof(
+            &self.k_psk,
+            hello.version,
+            hello.suite,
+            &hello.i_ephemeral,
+            &hello.i_nonce,
+        );
+        if !ct_eq(&expect_tag, &hello.i_psk_tag) {
+            return Err(Error::TransferSecretMismatch);
+        }
+
         let th0 = transcript0(
             PROTO_VERSION,
             SUITE_CLASSIC,
@@ -571,7 +651,8 @@ impl<'a> Responder<'a> {
             &hello.i_nonce,
             &self.ephemeral.public(),
             &self.nonce,
-            &self.pairing_commit,
+            &self.identity.fingerprint(),
+            &self.secret_commit,
         );
         let ee_dh = self.ephemeral.agree(&hello.i_ephemeral)?;
         let (k_i2r, k_r2i) = derive_session_keys(&ee_dh, &th0);
@@ -600,16 +681,9 @@ impl<'a> Responder<'a> {
 
         let nonce = record_nonce(DIR_I2R, CONFIRM_CTR);
         let aad = record_aad(&pending.th0, CONFIRM_TYPE, CONFIRM_CTR);
-        // A wrong pairing code makes k_i2r differ, so this open fails; map that to
-        // the pairing-code hint when a code was in use.
-        let inner_bytes =
-            aead::open(&pending.k_i2r, &nonce, &aad, &confirm.sealed).map_err(|e| {
-                if self.code_set {
-                    Error::PairingCodeMismatch
-                } else {
-                    e
-                }
-            })?;
+        // The secret is already proven at Hello, so a failure to open here is
+        // active tampering with the sealed Confirm, surfaced as `Auth`.
+        let inner_bytes = aead::open(&pending.k_i2r, &nonce, &aad, &confirm.sealed)?;
         let inner: ConfirmInner = codec::from_slice(&inner_bytes)?;
         let i_sig = fixed::<{ sign::SIGNATURE_LEN }>(&inner.i_sig)?;
 
@@ -650,6 +724,9 @@ mod tests {
     use super::*;
     use crate::identity::Identity;
 
+    /// A fixed non-empty transfer secret for the white-box tests.
+    const SECRET: &[u8] = b"white-box transfer secret 0123456789";
+
     fn ids() -> (Identity, Identity) {
         (
             Identity::generate("I", 1).unwrap(),
@@ -657,6 +734,8 @@ mod tests {
         )
     }
 
+    /// A `Hello` with an arbitrary (possibly wrong) proof tag — used by the
+    /// magic/version/suite tests, which reject *before* the proof is checked.
     fn hello_with(version: u16, suite: u16, magic: [u8; 8]) -> Vec<u8> {
         codec::to_vec(&HelloMsg {
             magic,
@@ -664,6 +743,7 @@ mod tests {
             suite,
             i_ephemeral: [7u8; 32],
             i_nonce: [9u8; 32],
+            i_psk_tag: [0u8; 32],
         })
         .unwrap()
     }
@@ -671,8 +751,21 @@ mod tests {
     #[test]
     fn bad_magic_rejected() {
         let (_i, r) = ids();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let bytes = hello_with(PROTO_VERSION, SUITE_CLASSIC, *b"NOTFSEC!");
+        assert!(matches!(
+            resp.read_hello_write_auth(&bytes),
+            Err(Error::HandshakeProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn retired_v1_magic_rejected() {
+        // A peer speaking the old pairing-code protocol (tag \x01) is refused:
+        // there is no silent downgrade to the pre-secret handshake.
+        let (_i, r) = ids();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
+        let bytes = hello_with(1, SUITE_CLASSIC, *b"FSECP2P\x01");
         assert!(matches!(
             resp.read_hello_write_auth(&bytes),
             Err(Error::HandshakeProtocol(_))
@@ -682,7 +775,7 @@ mod tests {
     #[test]
     fn downgrade_version_rejected() {
         let (_i, r) = ids();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let bytes = hello_with(PROTO_VERSION + 1, SUITE_CLASSIC, MAGIC);
         assert!(matches!(
             resp.read_hello_write_auth(&bytes),
@@ -693,7 +786,7 @@ mod tests {
     #[test]
     fn downgrade_suite_rejected() {
         let (_i, r) = ids();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let bytes = hello_with(PROTO_VERSION, 0x0099, MAGIC);
         assert!(matches!(
             resp.read_hello_write_auth(&bytes),
@@ -702,10 +795,56 @@ mod tests {
     }
 
     #[test]
+    fn wrong_secret_rejected_before_disclosure() {
+        // The offline-oracle regression: a dialer with the *wrong* secret gets
+        // `TransferSecretMismatch` and — crucially — the responder returns no
+        // bytes, so no identity or signature material is disclosed to harvest.
+        let (i, r) = ids();
+        let initiator = Initiator::new(&i, r.fingerprint(), b"the wrong secret value").unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
+        let hello = initiator.write_hello().unwrap();
+        let result = resp.read_hello_write_auth(&hello);
+        assert!(
+            matches!(result, Err(Error::TransferSecretMismatch)),
+            "a wrong secret must abort before Auth"
+        );
+    }
+
+    #[test]
+    fn empty_secret_refused() {
+        let (i, r) = ids();
+        assert!(matches!(
+            Initiator::new(&i, r.fingerprint(), b""),
+            Err(Error::HandshakeProtocol(_))
+        ));
+        assert!(matches!(
+            Responder::new(&r, b"", None),
+            Err(Error::HandshakeProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn tampered_hello_proof_rejected() {
+        // Flipping a bit of the proof tag (or any field it covers) is caught by
+        // the constant-time proof check before disclosure.
+        let (i, r) = ids();
+        let initiator = Initiator::new(&i, r.fingerprint(), SECRET).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
+        let hello = initiator.write_hello().unwrap();
+        let mut parsed: HelloMsg = codec::from_slice(&hello).unwrap();
+        parsed.i_psk_tag[0] ^= 0xff;
+        let tampered = codec::to_vec(&parsed).unwrap();
+        assert!(matches!(
+            resp.read_hello_write_auth(&tampered),
+            Err(Error::TransferSecretMismatch)
+        ));
+    }
+
+    #[test]
     fn tampered_auth_signature_rejected() {
         let (i, r) = ids();
-        let initiator = Initiator::new(&i, r.fingerprint(), None).unwrap();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let initiator = Initiator::new(&i, r.fingerprint(), SECRET).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let hello = initiator.write_hello().unwrap();
         let auth = resp.read_hello_write_auth(&hello).unwrap();
         let mut parsed: AuthMsg = codec::from_slice(&auth).unwrap();
@@ -722,8 +861,8 @@ mod tests {
         // Mutating the responder's ephemeral changes th0, so the signature the
         // initiator recomputes no longer matches what the responder signed.
         let (i, r) = ids();
-        let initiator = Initiator::new(&i, r.fingerprint(), None).unwrap();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let initiator = Initiator::new(&i, r.fingerprint(), SECRET).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let hello = initiator.write_hello().unwrap();
         let auth = resp.read_hello_write_auth(&hello).unwrap();
         let mut parsed: AuthMsg = codec::from_slice(&auth).unwrap();
@@ -740,12 +879,12 @@ mod tests {
         // An Auth captured for one initiator cannot be replayed to another: the
         // fresh ephemeral/nonce make a different th0, so the signature fails.
         let (i, r) = ids();
-        let init_a = Initiator::new(&i, r.fingerprint(), None).unwrap();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let init_a = Initiator::new(&i, r.fingerprint(), SECRET).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let hello_a = init_a.write_hello().unwrap();
         let auth = resp.read_hello_write_auth(&hello_a).unwrap();
 
-        let init_b = Initiator::new(&i, r.fingerprint(), None).unwrap();
+        let init_b = Initiator::new(&i, r.fingerprint(), SECRET).unwrap();
         let _ = init_b.write_hello().unwrap();
         assert!(matches!(
             init_b.read_auth_write_confirm(&auth),
@@ -756,8 +895,8 @@ mod tests {
     #[test]
     fn tampered_confirm_rejected() {
         let (i, r) = ids();
-        let initiator = Initiator::new(&i, r.fingerprint(), None).unwrap();
-        let mut resp = Responder::new(&r, None, None).unwrap();
+        let initiator = Initiator::new(&i, r.fingerprint(), SECRET).unwrap();
+        let mut resp = Responder::new(&r, SECRET, None).unwrap();
         let hello = initiator.write_hello().unwrap();
         let auth = resp.read_hello_write_auth(&hello).unwrap();
         let (mut confirm, _isess) = initiator.read_auth_write_confirm(&auth).unwrap();

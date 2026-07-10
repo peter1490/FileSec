@@ -1,9 +1,12 @@
 //! End-to-end loopback tests for the direct-transfer net layer: a real listener
 //! and sender, on dedicated threads, over `127.0.0.1`. Exercises the wire framing,
-//! the listener/sender state machines, the contact-book gate, the pairing code,
-//! and the verify-and-import path — without a window or a real network.
+//! the listener/sender state machines, the contact-book gate, the transfer secret,
+//! the concurrent worker pool / slowloris defense, and the verify-and-import path
+//! — without a window or a real network.
 #![cfg(feature = "net")]
 
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,7 +67,7 @@ fn fixture() -> (Arc<Identity>, Arc<Identity>, Arc<Store>, Arc<Store>, String) {
 }
 
 /// Start Bob listening (designating `expected` as the sender) and return his
-/// handle plus the chosen port and pairing code.
+/// handle plus the chosen port and transfer code.
 fn start_bob(
     bob: Arc<Identity>,
     store: Arc<Store>,
@@ -90,9 +93,9 @@ fn start_bob(
     let (lan_addr, code) = match event {
         NetEvent::Listening {
             lan_addr,
-            pairing_code,
+            transfer_code,
             ..
-        } => (lan_addr, pairing_code),
+        } => (lan_addr, transfer_code),
         other => panic!("expected Listening, got {other:?}"),
     };
     let port = lan_addr
@@ -125,7 +128,7 @@ fn loopback_transfer_imports_the_vault() {
             port,
             recipient: bob.public(),
             recipient_fpr: bob.fingerprint(),
-            pairing_code: Some(code),
+            transfer_code: Some(code),
             vault_id: vid,
         },
         alice.clone(),
@@ -179,7 +182,7 @@ fn loopback_rejects_unverified_sender() {
             port,
             recipient: bob.public(),
             recipient_fpr: bob.fingerprint(),
-            pairing_code: Some(code),
+            transfer_code: Some(code),
             vault_id: vid,
         },
         alice,
@@ -221,7 +224,7 @@ fn loopback_rejects_a_non_designated_sender() {
             port,
             recipient: bob.public(),
             recipient_fpr: bob.fingerprint(),
-            pairing_code: Some(code),
+            transfer_code: Some(code),
             vault_id: vid,
         },
         alice,
@@ -243,7 +246,7 @@ fn loopback_rejects_a_non_designated_sender() {
 }
 
 #[test]
-fn loopback_wrong_pairing_code_aborts() {
+fn loopback_wrong_transfer_code_aborts() {
     let (alice, bob, send_store, recv_store, vid) = fixture();
 
     let mut contacts = ContactBook::default();
@@ -253,14 +256,16 @@ fn loopback_wrong_pairing_code_aborts() {
     let (mut bob_h, port, _code) =
         start_bob(bob.clone(), recv_store, contacts, Some(alice.fingerprint()));
 
-    // Alice supplies the wrong code.
+    // Alice supplies a *validly formatted* but wrong transfer code (26 Crockford
+    // symbols → all-zero secret), so the proof reaches the wire and the receiver's
+    // gate — not the client-side format check — is what refuses it.
     let mut alice_h = net::start_sender(
         SendConfig {
             host: "127.0.0.1".into(),
             port,
             recipient: bob.public(),
             recipient_fpr: bob.fingerprint(),
-            pairing_code: Some("00000000".into()),
+            transfer_code: Some("00000000000000000000000000".into()),
             vault_id: vid,
         },
         alice,
@@ -268,14 +273,15 @@ fn loopback_wrong_pairing_code_aborts() {
         egui::Context::default(),
     );
 
-    // The sender's handshake must fail (pairing-code mismatch); no import happens.
+    // The sender's handshake must fail (the receiver never discloses its Auth to a
+    // peer that can't prove the secret); no import happens.
     let sender_event = recv_until(&alice_h, Duration::from_secs(10), |e| {
         matches!(e, NetEvent::Error(_) | NetEvent::Sent { .. })
     })
     .expect("the sender should report an outcome");
     assert!(
         matches!(sender_event, NetEvent::Error(_)),
-        "a wrong pairing code must abort, got {sender_event:?}"
+        "a wrong transfer code must abort, got {sender_event:?}"
     );
 
     let received = recv_until(&bob_h, Duration::from_secs(2), |e| {
@@ -286,6 +292,67 @@ fn loopback_wrong_pairing_code_aborts() {
         "nothing should be imported on a bad code"
     );
 
+    bob_h.stop();
+    alice_h.stop();
+}
+
+/// A stalled dialer that completes no handshake must not prevent a legitimate
+/// sender from being served — the concurrent worker pool plus the handshake
+/// deadline are what make that hold.
+#[test]
+fn loopback_slowloris_does_not_block_a_real_transfer() {
+    let (alice, bob, send_store, recv_store, vid) = fixture();
+
+    let mut contacts = ContactBook::default();
+    contacts.upsert(alice.public(), 0);
+    contacts.set_trust(&alice.fingerprint(), Trust::Verified, 0);
+
+    let (mut bob_h, port, code) = start_bob(
+        bob.clone(),
+        recv_store.clone(),
+        contacts,
+        Some(alice.fingerprint()),
+    );
+
+    // A slowloris: open a connection, send a partial length prefix, then hold the
+    // socket open without ever completing the handshake. Kept in scope so it is
+    // not closed early.
+    let mut slow = TcpStream::connect(("127.0.0.1", port)).expect("slowloris connects");
+    // Announce a 1000-byte frame but send only two of the four length bytes.
+    slow.write_all(&[0x00, 0x00]).ok();
+    slow.flush().ok();
+
+    // Meanwhile the real sender should still get through on another worker.
+    let mut alice_h = net::start_sender(
+        SendConfig {
+            host: "127.0.0.1".into(),
+            port,
+            recipient: bob.public(),
+            recipient_fpr: bob.fingerprint(),
+            transfer_code: Some(code),
+            vault_id: vid,
+        },
+        alice.clone(),
+        send_store,
+        egui::Context::default(),
+    );
+
+    let offer = recv_until(&bob_h, Duration::from_secs(10), |e| {
+        matches!(e, NetEvent::Offer { .. })
+    })
+    .expect("an offer should arrive despite the stalled peer");
+    assert!(matches!(offer, NetEvent::Offer { .. }));
+    bob_h.send(NetCommand::AcceptOffer);
+
+    let meta = match recv_until(&bob_h, Duration::from_secs(20), |e| {
+        matches!(e, NetEvent::Received { .. } | NetEvent::Error(_))
+    }) {
+        Some(NetEvent::Received { meta, .. }) => meta,
+        other => panic!("the real transfer must complete, got {other:?}"),
+    };
+    assert_eq!(meta.name, "Shared");
+
+    drop(slow);
     bob_h.stop();
     alice_h.stop();
 }
@@ -344,7 +411,7 @@ fn loopback_large_multifile_roundtrips_with_exact_size() {
             port,
             recipient: bob.public(),
             recipient_fpr: bob.fingerprint(),
-            pairing_code: Some(code),
+            transfer_code: Some(code),
             vault_id: vid,
         },
         alice.clone(),

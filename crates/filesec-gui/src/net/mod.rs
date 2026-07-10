@@ -11,6 +11,7 @@
 //! flow down. The UI drains events non-blocking each frame; the net thread wakes
 //! the UI via `egui::Context::request_repaint` on every event.
 
+mod concurrency;
 mod listener;
 mod nat;
 mod sender;
@@ -51,8 +52,10 @@ pub struct SendConfig {
     /// The contact's fingerprint, checked against the live peer ("right IP, wrong
     /// identity" aborts).
     pub recipient_fpr: [u8; 32],
-    /// The pairing code the user typed (raw; normalized before use). `None` = none.
-    pub pairing_code: Option<String>,
+    /// The transfer code the user typed (the receiver's per-transfer 128-bit
+    /// secret, in grouped/base32 display form; decoded before use). Mandatory — a
+    /// transfer cannot proceed without it. `None` is rejected by the sender.
+    pub transfer_code: Option<String>,
     /// The local vault to send.
     pub vault_id: String,
 }
@@ -73,13 +76,14 @@ pub enum NatStatus {
 #[derive(Debug)]
 pub enum NetEvent {
     /// The listener is up. `lan_addr` is always shown; `public_addr` is present
-    /// when the router mapping succeeded. `pairing_code` is the one-time code the
-    /// user reads out to the sender.
+    /// when the router mapping succeeded. `transfer_code` is the per-transfer
+    /// 128-bit secret (grouped display form) the user passes to the sender out of
+    /// band.
     Listening {
         lan_addr: String,
         public_addr: Option<String>,
         nat: NatStatus,
-        pairing_code: String,
+        transfer_code: String,
     },
     /// The sender is dialing the receiver.
     Connecting,
@@ -132,7 +136,8 @@ pub enum NetCommand {
     Stop,
 }
 
-/// Sends [`NetEvent`]s up and wakes the UI. Cloned into the worker thread.
+/// Sends [`NetEvent`]s up and wakes the UI. Cloned into each worker thread.
+#[derive(Clone)]
 struct Emitter {
     tx: mpsc::Sender<NetEvent>,
     ctx: egui::Context,
@@ -194,8 +199,9 @@ pub fn start_listener(
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let emitter = Emitter { tx: event_tx, ctx };
+    let contacts = Arc::new(contacts);
     let join = thread::spawn(move || {
-        if let Err(msg) = listener::run(config, &identity, &store, &contacts, &emitter, &cmd_rx) {
+        if let Err(msg) = listener::run(config, identity, store, contacts, &emitter, &cmd_rx) {
             emitter.emit(NetEvent::Error(msg));
         }
         emitter.emit(NetEvent::Stopped);
@@ -248,32 +254,113 @@ struct DecisionMsg {
 }
 
 // ---------------------------------------------------------------------------
-// Pairing-code helpers
+// Transfer-secret codec
+//
+// The per-transfer second factor is a fresh 128-bit secret (16 bytes). It is
+// shown to the user as Crockford base32 — a 26-symbol alphabet that omits the
+// ambiguous `I L O U` and folds look-alikes on input — grouped for readability.
+// The raw 16 bytes are what the transport actually keys on; the display string
+// only has to round-trip back to those bytes. (A QR presentation is deferred: a
+// correct in-tree QR encoder is substantial, and adding a QR crate would break
+// this build's deliberately dependency-light, MSRV-pinned posture — the copyable
+// grouped code covers the same out-of-band channel.)
 // ---------------------------------------------------------------------------
 
-/// Generate a fresh 8-digit one-time pairing code (the normalized form).
-fn generate_pairing_code() -> Result<String, String> {
-    let bytes = filesec_core::secret::random_array::<8>().map_err(|e| e.to_string())?;
-    Ok(bytes.iter().map(|b| char::from(b'0' + (b % 10))).collect())
+/// Length of the raw transfer secret in bytes (128 bits).
+pub(crate) const TRANSFER_SECRET_LEN: usize = 16;
+/// Number of base32 symbols a 16-byte secret encodes to (`⌈128 / 5⌉`).
+const SECRET_SYMBOLS: usize = 26;
+/// Crockford base32 alphabet (no `I`, `L`, `O`, `U`).
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// Display grouping size.
+const GROUP: usize = 4;
+
+/// Generate a fresh 128-bit transfer secret.
+fn generate_transfer_secret() -> Result<[u8; TRANSFER_SECRET_LEN], String> {
+    filesec_core::secret::random_array::<TRANSFER_SECRET_LEN>().map_err(|e| e.to_string())
 }
 
-/// Group an 8-digit code for display, e.g. `1234-5678`.
-fn group_code(code: &str) -> String {
-    if code.len() == 8 {
-        format!("{}-{}", &code[..4], &code[4..])
-    } else {
-        code.to_string()
+/// Encode the raw secret to its canonical (ungrouped, upper-case) base32 form.
+fn encode_transfer_secret(bytes: &[u8; TRANSFER_SECRET_LEN]) -> String {
+    let mut out = String::with_capacity(SECRET_SYMBOLS);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in bytes {
+        buffer = (buffer << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(char::from(CROCKFORD[((buffer >> bits) & 0x1f) as usize]));
+        }
     }
+    if bits > 0 {
+        out.push(char::from(
+            CROCKFORD[((buffer << (5 - bits)) & 0x1f) as usize],
+        ));
+    }
+    out
 }
 
-/// Normalize a user-entered code: keep only alphanumerics, lowercased — so spacing,
-/// dashes, and case don't matter when the two sides compare.
-fn normalize_code(input: &str) -> String {
-    input
+/// Insert group separators into a canonical code for display, e.g.
+/// `ABCD-EFGH-…`.
+fn group_transfer_code(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / GROUP);
+    for (i, c) in code.chars().enumerate() {
+        if i > 0 && i % GROUP == 0 {
+            out.push('-');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The full display string for a freshly generated secret: grouped base32.
+fn display_transfer_code(bytes: &[u8; TRANSFER_SECRET_LEN]) -> String {
+    group_transfer_code(&encode_transfer_secret(bytes))
+}
+
+/// Fold one input character to its base32 value, tolerating case and the usual
+/// look-alikes (`O`→`0`, `I`/`L`→`1`). Returns `None` for a non-symbol.
+fn decode_symbol(c: char) -> Option<u8> {
+    let c = match c.to_ascii_uppercase() {
+        'O' => '0',
+        'I' | 'L' => '1',
+        other => other,
+    };
+    CROCKFORD
+        .iter()
+        .position(|&a| char::from(a) == c)
+        .map(|p| p as u8)
+}
+
+/// Decode a user-entered transfer code back to the raw 16-byte secret. Separators
+/// and whitespace are ignored; the payload must be exactly [`SECRET_SYMBOLS`]
+/// valid symbols or this returns `None`.
+fn decode_transfer_code(input: &str) -> Option<[u8; TRANSFER_SECRET_LEN]> {
+    let symbols: Vec<u8> = input
         .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(decode_symbol)
+        .collect::<Option<Vec<u8>>>()?;
+    if symbols.len() != SECRET_SYMBOLS {
+        return None;
+    }
+    let mut out = [0u8; TRANSFER_SECRET_LEN];
+    let mut idx = 0;
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for sym in symbols {
+        buffer = (buffer << 5) | u32::from(sym);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            if idx < TRANSFER_SECRET_LEN {
+                out[idx] = ((buffer >> bits) & 0xff) as u8;
+                idx += 1;
+            }
+        }
+    }
+    (idx == TRANSFER_SECRET_LEN).then_some(out)
 }
 
 /// Current Unix time in seconds (best-effort; 0 if the clock is before the epoch).
@@ -282,4 +369,55 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_round_trips_through_display() {
+        let secret = generate_transfer_secret().unwrap();
+        let display = display_transfer_code(&secret);
+        // Grouped, uses only the Crockford alphabet + separators.
+        assert!(display.contains('-'));
+        assert_eq!(decode_transfer_code(&display), Some(secret));
+    }
+
+    #[test]
+    fn decode_is_tolerant_of_case_spacing_and_lookalikes() {
+        let secret = [0x9au8; TRANSFER_SECRET_LEN];
+        let canon = encode_transfer_secret(&secret);
+        // Same code re-typed lower-case, spaced, and with look-alike glyphs.
+        let messy: String = canon
+            .chars()
+            .map(|c| match c {
+                '0' => 'O',
+                '1' => 'l',
+                other => other.to_ascii_lowercase(),
+            })
+            .collect();
+        let spaced = format!("  {}  ", group_transfer_code(&messy).replace('-', " "));
+        assert_eq!(decode_transfer_code(&spaced), Some(secret));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_length_and_bad_symbols() {
+        assert_eq!(decode_transfer_code(""), None);
+        assert_eq!(decode_transfer_code("ABCD-EFGH"), None); // too short
+        let secret = [0x11u8; TRANSFER_SECRET_LEN];
+        let canon = encode_transfer_secret(&secret);
+        assert_eq!(decode_transfer_code(&format!("{canon}Z")), None); // too long
+                                                                      // `U` is not in the Crockford alphabet and is not a folded look-alike.
+        let with_bad = format!("U{}", &canon[1..]);
+        assert_eq!(decode_transfer_code(&with_bad), None);
+    }
+
+    #[test]
+    fn canonical_form_has_expected_shape() {
+        let secret = generate_transfer_secret().unwrap();
+        let canon = encode_transfer_secret(&secret);
+        assert_eq!(canon.len(), SECRET_SYMBOLS);
+        assert!(canon.bytes().all(|b| CROCKFORD.contains(&b)));
+    }
 }

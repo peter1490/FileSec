@@ -321,6 +321,44 @@ Required tests:
 
 ### Stage 5: Network Transfer Hardening
 
+**Implementation status (2026-07-10): complete.** The direct-transfer handshake is
+now **protocol v2** (`filesec-core::transport`), gated by a mandatory **128-bit
+transfer secret** that replaces the retired 8-digit pairing code. The initiator's
+`Hello` carries a keyed proof of the secret (`MAC(k_psk, version ‖ suite ‖
+i_ephemeral ‖ i_nonce)`); the responder verifies it **constant-time before it
+computes or sends any identity/signature material**, so a peer that cannot prove
+the secret gets `TransferSecretMismatch` and zero disclosed bytes — closing the
+old offline-signature oracle (an attacker who does not hold the secret can neither
+harvest the responder's identity/signature nor test candidate codes, and at 128
+bits the wire proof is not itself enumerable). The transcript `th0` now binds the
+transfer-secret commitment and the (expected) responder fingerprint in addition to
+the version, suite, both ephemerals, and both nonces, so signatures and session
+keys cannot form without a matching secret. The magic tag and version were bumped
+(`FSECP2P\x02`, v2); a peer speaking the old pairing-code protocol fails the magic
+and version checks — there is no silent downgrade. The verified-contact
+requirement is unchanged for both send and receive. The listener no longer serves
+one connection at a time: an accept loop feeds a **bounded worker pool**
+(`net::concurrency::Semaphore`, cap 8; excess connections are closed immediately),
+each worker runs the handshake under a hard **10s wall-clock deadline** enforced by
+a new deadline-aware frame reader (`wire::read_handshake_frame_deadline`, which
+re-checks the deadline between partial reads so a dribbling slowloris cannot hold a
+slot), the offer/receive/import phase is serialized to one authenticated peer at a
+time (a second concurrent verified sender is closed silently rather than clobbering
+the UI), and repeatedly-failing source IPs are backed off exponentially
+(`net::concurrency::RateLimiter`, reset on a proven secret). The handshake/control
+vs. data frame caps stay split (Stage 3), the declared-transfer-size ceiling is
+enforced before any byte is written, and the network receive temp is the
+Stage 4-style pre-created private (`0600`) file opened in place. The transfer
+secret is shown as a copyable, grouped Crockford base32 code that tolerates case,
+spacing, and look-alike glyphs on entry; a QR presentation is intentionally
+deferred (a correct in-tree QR encoder is substantial and a QR crate would break
+this build's dependency-light, MSRV-pinned posture — the copyable code covers the
+same out-of-band channel). The Stage 5 tests — v2 success, wrong-secret-before-
+disclosure/offline-oracle regression, retired-v1/downgrade rejection, tampered
+proof, the transfer-secret codec round-trip/tolerance, the deadline reader, the
+semaphore + rate-limiter policy, and the loopback slowloris/wrong-code/verified/
+unverified/wrong-sender/large-transfer cases — are part of the workspace suite.
+
 Objective:
 
 Make P2P transfer resistant to network attackers, pairing-code enumeration, slowloris behavior, and resource exhaustion.

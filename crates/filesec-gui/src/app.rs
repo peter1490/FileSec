@@ -575,13 +575,13 @@ enum ActiveKind {
     Send,
 }
 
-/// The listening address(es) + pairing code shown to the user in receive mode.
+/// The listening address(es) + transfer code shown to the user in receive mode.
 #[cfg(feature = "net")]
 struct ListenView {
     lan_addr: String,
     public_addr: Option<String>,
     nat: String,
-    pairing_code: String,
+    transfer_code: String,
 }
 
 /// A pending incoming offer awaiting the user's accept/reject.
@@ -4299,7 +4299,7 @@ impl App {
                     lan_addr,
                     public_addr,
                     nat,
-                    pairing_code,
+                    transfer_code,
                 } => {
                     let nat = match nat {
                         NatStatus::Disabled => "Local network only.".to_string(),
@@ -4314,7 +4314,7 @@ impl App {
                             lan_addr,
                             public_addr,
                             nat,
-                            pairing_code,
+                            transfer_code,
                         });
                     }
                 }
@@ -4595,16 +4595,19 @@ fn build_send_config(
         .send_vault
         .clone()
         .ok_or_else(|| "Pick a vault to send.".to_string())?;
-    let pairing_code = {
+    let transfer_code = {
         let p = forms.send_pairing.trim();
-        (!p.is_empty()).then(|| p.to_string())
+        if p.is_empty() {
+            return Err("Enter the transfer code the receiver is showing.".into());
+        }
+        Some(p.to_string())
     };
     Ok(crate::net::SendConfig {
         host,
         port,
         recipient: contact.identity.clone(),
         recipient_fpr: contact.fingerprint(),
-        pairing_code,
+        transfer_code,
         vault_id,
     })
 }
@@ -4794,15 +4797,15 @@ fn send_card(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
         ui.add_space(8.0);
         ui.label(
-            RichText::new("Pairing code (from the receiver)")
+            RichText::new("Transfer code (from the receiver)")
                 .small()
                 .color(cc.text_muted),
         );
         net_input(
             ui,
             &mut s.transfer.send_pairing,
-            "e.g. 1234-5678",
-            field_w.min(220.0),
+            "e.g. ABCD-EFGH-JKMN-…",
+            field_w.min(260.0),
         );
 
         ui.add_space(12.0);
@@ -4842,22 +4845,26 @@ fn active_transfer_card(active: &ActiveTransfer, ui: &mut egui::Ui, action: &mut
             ui.label(RichText::new(&lv.nat).color(cc.text_muted).small());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("Pairing code:");
+                ui.label("Transfer code:");
                 ui.label(
-                    RichText::new(&lv.pairing_code)
+                    RichText::new(&lv.transfer_code)
                         .monospace()
                         .strong()
                         .size(16.0)
                         .color(cc.accent),
                 );
                 if ui.small_button("Copy").clicked() {
-                    ui.ctx().copy_text(lv.pairing_code.clone());
+                    ui.ctx().copy_text(lv.transfer_code.clone());
                 }
             });
             ui.label(
-                RichText::new("Give the address and this code to the sender.")
-                    .color(cc.text_muted)
-                    .small(),
+                RichText::new(
+                    "Give the address and this one-time code to the sender. The transfer \
+                     can't start until they enter it — it also keeps your identity private \
+                     from anyone who doesn't have it.",
+                )
+                .color(cc.text_muted)
+                .small(),
             );
         }
 
