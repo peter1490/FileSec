@@ -229,7 +229,10 @@ fn device_token_roundtrips_through_the_store_and_is_rollback_protected() {
             .fingerprint(),
         id.fingerprint()
     );
-    assert_eq!(reloaded.unlock(pass).unwrap().fingerprint(), id.fingerprint());
+    assert_eq!(
+        reloaded.unlock(pass).unwrap().fingerprint(),
+        id.fingerprint()
+    );
     assert!(reloaded.unlock(&token).is_err());
 
     // Forgetting the device (disable flow) removes the slot and advances the

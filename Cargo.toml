@@ -14,6 +14,10 @@
 resolver = "2"
 members = ["crates/filesec-core", "crates/filesec-gui", "crates/filesec-pqc"]
 default-members = ["crates/filesec-core", "crates/filesec-gui"]
+# `fuzz/` is a detached cargo-fuzz crate (its own workspace + Cargo.lock). It is
+# nightly-only (libfuzzer-sys) and must never be pulled into the MSRV-1.86 stable
+# build, the locked default build, or the cargo-deny/audit supply-chain scan.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.2.0"

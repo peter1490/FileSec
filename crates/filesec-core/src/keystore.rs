@@ -1007,9 +1007,7 @@ impl KeystoreFile {
     pub fn unlock_with_device_token(&self, token: &[u8]) -> Result<Identity> {
         match &self.0 {
             Inner::V3(v3) => v3.body.unlock_with_device(token),
-            Inner::V1(_) | Inner::V2(_) => {
-                Err(Error::Format("no device-unlock slot is enrolled"))
-            }
+            Inner::V1(_) | Inner::V2(_) => Err(Error::Format("no device-unlock slot is enrolled")),
         }
     }
 
@@ -1168,7 +1166,9 @@ mod tests {
             id.fingerprint()
         );
         // A wrong token fails closed.
-        assert!(ks.unlock_with_device_token(&[0u8; DEVICE_TOKEN_LEN]).is_err());
+        assert!(ks
+            .unlock_with_device_token(&[0u8; DEVICE_TOKEN_LEN])
+            .is_err());
         // The token is NOT a passphrase: feeding it to the passphrase path fails.
         assert!(matches!(ks.unlock(&token), Err(Error::BadPassphrase)));
         // And the passphrase is not the token: it can't unwrap the device slot.
@@ -1205,7 +1205,8 @@ mod tests {
             Inner::V3(v3) => (v3.body.bundle_nonce.clone(), v3.body.bundle_ct.clone()),
             Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
         };
-        ks.set_device_token(b"pw", &[0x34; DEVICE_TOKEN_LEN]).unwrap();
+        ks.set_device_token(b"pw", &[0x34; DEVICE_TOKEN_LEN])
+            .unwrap();
         match &ks.0 {
             Inner::V3(v3) => {
                 assert_eq!(v3.body.bundle_nonce, n0, "bundle nonce must not change");
@@ -1216,7 +1217,9 @@ mod tests {
         }
         // Both the passkey and the token still unlock after enrollment.
         assert!(ks.unlock_with_passkey(0, &[0x12; HMAC_SECRET_LEN]).is_ok());
-        assert!(ks.unlock_with_device_token(&[0x34; DEVICE_TOKEN_LEN]).is_ok());
+        assert!(ks
+            .unlock_with_device_token(&[0x34; DEVICE_TOKEN_LEN])
+            .is_ok());
     }
 
     fn fast_params() -> KdfParams {

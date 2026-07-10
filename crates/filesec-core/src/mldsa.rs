@@ -29,15 +29,20 @@ pub const SIGNATURE_LEN: usize = 3309;
 pub const SEED_LEN: usize = 32;
 
 /// Re-derive the signing key from a stored seed.
+///
+/// Both intermediate copies of the seed — the fixed-size stack array and the
+/// library's `B32` wrapper — are wiped once the key is derived, so no stray copy
+/// of the seed outlives this call on the stack (F17).
 fn signing_key_from_seed(seed: &[u8]) -> Result<SigningKey<MlDsa65>> {
     if seed.len() != SEED_LEN {
         return Err(Error::BadKey("ml-dsa seed length"));
     }
-    let mut arr = [0u8; SEED_LEN];
+    let mut arr = Zeroizing::new([0u8; SEED_LEN]);
     arr.copy_from_slice(seed);
-    let b32 = B32::from(arr);
-    arr.iter_mut().for_each(|b| *b = 0);
-    Ok(SigningKey::<MlDsa65>::from_seed(&b32))
+    let mut b32 = B32::from(*arr);
+    let sk = SigningKey::<MlDsa65>::from_seed(&b32);
+    b32.iter_mut().for_each(|b| *b = 0);
+    Ok(sk)
 }
 
 /// Generate a fresh keypair, returning `(public_key_bytes, seed)`.

@@ -11,7 +11,9 @@
 //! * [`envelope`], [`manifest`], [`vault`], [`format`] — the `.fsec` container.
 //! * [`safe_io`] — hardened, atomic, symlink-rejecting writes for plaintext.
 //!
-//! See the workspace plan for the format specification and threat model.
+//! See `THREAT_MODEL.md` at the repo root for the authoritative threat model
+//! (what is protected, against whom, and what is out of scope) and the workspace
+//! plan for the container format specification.
 
 // Deny the most dangerous footguns. Crypto code must not silently panic on
 // untrusted input or unwrap fallible results.
@@ -48,7 +50,7 @@ pub mod vault;
 pub use error::{Error, Result};
 pub use format::{AddedFile, ExportOptions, ImportedVault, VaultReader, VerifiedSender};
 pub use format_v2::VaultReaderV2;
-pub use identity::{Identity, PublicIdentity};
+pub use identity::{sanitize_display_name, Identity, PublicIdentity};
 pub use suite::SuiteId;
 #[cfg(feature = "net")]
 pub use transport::{Initiator, PeerAuth, RecordType, Responder, Session};

@@ -24,6 +24,39 @@
 //! ciphers share the same `aead 0.5` STREAM construction, so the on-disk framing
 //! and the random-access [`decrypt_chunk`] math are identical apart from the
 //! nonce length.
+//!
+//! # STREAM key/nonce invariant (must hold for all suites)
+//!
+//! The STREAM construction derives each chunk's AEAD nonce as
+//! `stream_nonce || counter_be32 || last_flag` (the trailing 5 bytes are STREAM's;
+//! see [`STREAM_OVERHEAD`]). Its security therefore rests on the **same rule the
+//! bare AEAD has** — a `(key, nonce)` pair must never encrypt two different
+//! messages — lifted to the whole stream:
+//!
+//! * **One STREAM per fresh `(key, stream_nonce)` domain.** A given
+//!   `(key, stream_nonce)` prefix must be used to encrypt **exactly one** stream,
+//!   ever. Reusing it for a second stream reuses the per-chunk `(key, full_nonce)`
+//!   pairs across the two streams and breaks confidentiality — catastrophically so
+//!   for AES-256-GCM, where a single nonce reuse leaks the GHASH authentication
+//!   key. FileSec upholds this by drawing a **fresh CSPRNG `stream_nonce` per
+//!   stream** (v1 container data and every v2 blob) under a **fresh random content
+//!   key per vault**, so no `(key, stream_nonce)` prefix is ever reused.
+//! * **The BE32 counter is monotonic and unique within a stream.** STREAM assigns
+//!   chunk `i` the counter `i`, so within one stream no per-chunk nonce repeats.
+//!   The counter is 32-bit, capping a single stream at `2^32` chunks; at the
+//!   16 MiB [`MAX_CHUNK_SIZE`] ceiling that is far more than any real file, and the
+//!   64 KiB default is what FileSec actually writes.
+//! * **Exactly one last chunk, and it is authenticated as last.** The final chunk
+//!   sets `last_flag = 1`; all others set `0`. Because the flag is part of the
+//!   nonce, truncating the stream (making an earlier `next` chunk the final one),
+//!   reordering chunks, duplicating a chunk, or flipping which chunk is "last" all
+//!   change the nonce a chunk is opened under and surface as [`Error::Auth`]
+//!   before any affected plaintext is emitted.
+//!
+//! These properties are regression-tested in this module (`mod tests`): nonce
+//! lengths, per-index counter round-trips via [`decrypt_chunk_with`], wrong-index
+//! and wrong-last-flag rejection, and whole-stream truncation / reorder /
+//! duplication rejection.
 
 use std::io::{Read, Write};
 
@@ -578,12 +611,189 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::secret::random_vec;
+    use proptest::prelude::*;
 
     fn key_and_nonce(alg: AeadAlg) -> (SymKey, Vec<u8>) {
         (
             SymKey::random().unwrap(),
             random_vec(alg.stream_nonce_len()).unwrap(),
         )
+    }
+
+    /// Every AEAD suite the build actually ships. The STREAM invariants below must
+    /// hold identically for each.
+    fn algs() -> Vec<AeadAlg> {
+        #[allow(unused_mut)]
+        let mut v = vec![AeadAlg::XChaCha20Poly1305];
+        #[cfg(feature = "pqc")]
+        v.push(AeadAlg::Aes256Gcm);
+        v
+    }
+
+    fn encrypt_to_vec(
+        alg: AeadAlg,
+        key: &SymKey,
+        nonce: &[u8],
+        aad: &[u8],
+        pt: &[u8],
+        chunk: usize,
+    ) -> Vec<u8> {
+        let mut ct = Vec::new();
+        encrypt_stream_with(alg, key, nonce, aad, pt, &mut ct, chunk).unwrap();
+        ct
+    }
+
+    /// Split a STREAM ciphertext into its per-chunk ciphertext slices, given the
+    /// plaintext length and chunk size that produced it. Mirrors the encoder's
+    /// framing exactly: `max(1, ceil(n/chunk))` chunks, each `pt_len + TAG_LEN`,
+    /// with only the final chunk shorter than a full `chunk`.
+    fn ct_chunks(ct: &[u8], plaintext_len: usize, chunk_size: usize) -> Vec<Vec<u8>> {
+        let num = if plaintext_len == 0 {
+            1
+        } else {
+            plaintext_len.div_ceil(chunk_size)
+        };
+        let mut out = Vec::with_capacity(num);
+        let mut off = 0;
+        for i in 0..num {
+            let pt_len = if i + 1 < num {
+                chunk_size
+            } else {
+                plaintext_len - (num - 1) * chunk_size
+            };
+            let enc_len = pt_len + TAG_LEN;
+            out.push(ct[off..off + enc_len].to_vec());
+            off += enc_len;
+        }
+        assert_eq!(off, ct.len(), "framing accounted for the whole ciphertext");
+        out
+    }
+
+    #[test]
+    fn stream_nonce_len_is_overhead_less_than_one_shot() {
+        // The STREAM prefix is exactly the one-shot nonce minus STREAM's 5 reserved
+        // bytes (BE32 counter + last-flag), for every suite.
+        for alg in algs() {
+            assert_eq!(alg.stream_nonce_len(), alg.nonce_len() - STREAM_OVERHEAD);
+        }
+        assert_eq!(AeadAlg::XChaCha20Poly1305.nonce_len(), NONCE_LEN);
+        assert_eq!(
+            AeadAlg::XChaCha20Poly1305.stream_nonce_len(),
+            STREAM_NONCE_LEN
+        );
+        #[cfg(feature = "pqc")]
+        {
+            assert_eq!(AeadAlg::Aes256Gcm.nonce_len(), 12);
+            assert_eq!(AeadAlg::Aes256Gcm.stream_nonce_len(), 7);
+        }
+    }
+
+    #[test]
+    fn decrypt_chunk_rejects_wrong_index_and_last_flag() {
+        for alg in algs() {
+            let (key, nonce) = key_and_nonce(alg);
+            let aad = b"header-aad";
+            // 40 bytes at a 16-byte chunk => three chunks (16, 16, 8).
+            let data = vec![0xABu8; 40];
+            let ct = encrypt_to_vec(alg, &key, &nonce, aad, &data, 16);
+            let chunks = ct_chunks(&ct, data.len(), 16);
+            assert_eq!(chunks.len(), 3);
+            let dc = |i: u32, last: bool, c: &[u8]| {
+                decrypt_chunk_with(alg, &key, &nonce, aad, i, last, c)
+            };
+            // Correct (index, last) pairs open cleanly.
+            assert!(dc(0, false, &chunks[0]).is_ok());
+            assert!(dc(1, false, &chunks[1]).is_ok());
+            assert!(dc(2, true, &chunks[2]).is_ok());
+            // Wrong counter for a genuine chunk: the nonce differs -> Auth.
+            assert!(matches!(dc(1, false, &chunks[0]), Err(Error::Auth)));
+            // A middle chunk opened as "last": last-flag is in the nonce -> Auth.
+            assert!(matches!(dc(1, true, &chunks[1]), Err(Error::Auth)));
+            // The last chunk opened as non-last -> Auth.
+            assert!(matches!(dc(2, false, &chunks[2]), Err(Error::Auth)));
+        }
+    }
+
+    #[test]
+    fn truncated_stream_is_rejected() {
+        for alg in algs() {
+            let (key, nonce) = key_and_nonce(alg);
+            let aad = b"aad";
+            let data = vec![7u8; 40];
+            let ct = encrypt_to_vec(alg, &key, &nonce, aad, &data, 16);
+            let chunks = ct_chunks(&ct, data.len(), 16);
+            // Drop the real final chunk. The previous chunk was sealed as a
+            // *non-last* chunk, so decrypting it as the new end (decrypt_last)
+            // fails: truncation of the whole stream is detectable.
+            let truncated: Vec<u8> = chunks[..chunks.len() - 1].concat();
+            let mut out = Vec::new();
+            let r = decrypt_stream_with(alg, &key, &nonce, aad, &truncated[..], &mut out, 16);
+            assert!(matches!(r, Err(Error::Auth)));
+        }
+    }
+
+    #[test]
+    fn reordered_chunks_are_rejected() {
+        for alg in algs() {
+            let (key, nonce) = key_and_nonce(alg);
+            let aad = b"aad";
+            let data = vec![3u8; 40];
+            let ct = encrypt_to_vec(alg, &key, &nonce, aad, &data, 16);
+            let chunks = ct_chunks(&ct, data.len(), 16);
+            // Swap the two full chunks (identical length, so framing still parses):
+            // each now decrypts under the other's counter -> Auth on the first.
+            let reordered: Vec<u8> =
+                [chunks[1].clone(), chunks[0].clone(), chunks[2].clone()].concat();
+            let mut out = Vec::new();
+            let r = decrypt_stream_with(alg, &key, &nonce, aad, &reordered[..], &mut out, 16);
+            assert!(matches!(r, Err(Error::Auth)));
+            assert!(out.is_empty(), "no plaintext emitted before the failure");
+        }
+    }
+
+    #[test]
+    fn duplicated_chunk_is_rejected() {
+        for alg in algs() {
+            let (key, nonce) = key_and_nonce(alg);
+            let aad = b"aad";
+            let data = vec![5u8; 40];
+            let ct = encrypt_to_vec(alg, &key, &nonce, aad, &data, 16);
+            let chunks = ct_chunks(&ct, data.len(), 16);
+            // Replay chunk 0 in chunk 1's slot: at counter 1 it decrypts under the
+            // wrong nonce -> Auth (a replayed chunk cannot be spliced in).
+            let duped: Vec<u8> = [chunks[0].clone(), chunks[0].clone(), chunks[2].clone()].concat();
+            let mut out = Vec::new();
+            let r = decrypt_stream_with(alg, &key, &nonce, aad, &duped[..], &mut out, 16);
+            assert!(matches!(r, Err(Error::Auth)));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Random-access [`decrypt_chunk_with`] reproduces every chunk of a stream,
+        /// in order, for any plaintext length and chunk size — proving the BE32
+        /// counter derivation matches the streaming encoder exactly.
+        #[test]
+        fn decrypt_chunk_reproduces_each_stream_chunk(
+            data in proptest::collection::vec(any::<u8>(), 0..400usize),
+            chunk in 1usize..48,
+        ) {
+            for alg in algs() {
+                let (key, nonce) = key_and_nonce(alg);
+                let aad = b"aad";
+                let ct = encrypt_to_vec(alg, &key, &nonce, aad, &data, chunk);
+                let chunks = ct_chunks(&ct, data.len(), chunk);
+                let last = chunks.len() - 1;
+                let mut reassembled = Vec::new();
+                for (i, c) in chunks.iter().enumerate() {
+                    let pt = decrypt_chunk_with(alg, &key, &nonce, aad, i as u32, i == last, c)
+                        .unwrap();
+                    reassembled.extend_from_slice(&pt);
+                }
+                prop_assert_eq!(&reassembled, &data);
+            }
+        }
     }
 
     #[test]

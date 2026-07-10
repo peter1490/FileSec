@@ -1,0 +1,6 @@
+# cargo-fuzz build + run artifacts (generated locally / in CI).
+/target
+/corpus
+/artifacts
+/coverage
+Cargo.lock

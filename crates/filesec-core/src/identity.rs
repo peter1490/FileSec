@@ -16,6 +16,84 @@ use crate::{codec, util};
 const FPR_CONTEXT: &[u8] = b"FileSec identity fingerprint v1";
 const ARMOR_BEGIN: &str = "-----BEGIN FILESEC PUBLIC KEY-----";
 const ARMOR_END: &str = "-----END FILESEC PUBLIC KEY-----";
+
+/// Maximum length, in Unicode scalar values, of a display name after
+/// sanitization. Display names are advisory and human-scale; anything past this
+/// is truncated so an imported identity can neither overflow the UI nor bury a
+/// fingerprint under a wall of text.
+pub const MAX_DISPLAY_NAME_LEN: usize = 96;
+
+/// Placeholder shown when a display name is absent or sanitizes to nothing (e.g.
+/// a name made entirely of control/bidi characters).
+pub const UNNAMED_DISPLAY: &str = "(unnamed)";
+
+/// Whether `c` is an invisible or bidirectional-control character that has no
+/// place in a display name — these are the classic tools for *visual spoofing*
+/// (making `admin.txt` render as `txt.nimda`, or hiding text behind zero-width
+/// runs). They are dropped outright by [`sanitize_display_name`].
+fn is_spoofing_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}' | // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        '\u{202A}'..='\u{202E}' | // LRE, RLE, PDF, LRO, RLO (bidi overrides)
+        '\u{2060}'..='\u{2064}' | // word joiner + invisible math operators
+        '\u{2066}'..='\u{2069}' | // LRI, RLI, FSI, PDI (bidi isolates)
+        '\u{061C}' |              // Arabic letter mark
+        '\u{FEFF}') // BOM / zero-width no-break space
+}
+
+/// Reduce an untrusted display name to a safe, human-readable rendering (F13).
+///
+/// The result is suitable for showing next to a fingerprint without letting a
+/// crafted name spoof system text, other contacts, or file paths:
+///
+/// * **Bidi/invisible controls dropped.** Right-to-left overrides, isolates, and
+///   zero-width joiners — the characters used to reorder or hide text — are
+///   removed entirely.
+/// * **Control characters dropped.** C0/C1 controls and DEL cannot inject
+///   newlines, terminal escapes, or NULs into the UI.
+/// * **Whitespace normalized.** Every run of whitespace (including tabs, newlines,
+///   and Unicode spaces) collapses to a single ASCII space, and leading/trailing
+///   whitespace is trimmed.
+/// * **Length bounded.** Truncated to [`MAX_DISPLAY_NAME_LEN`] scalar values.
+///
+/// The fingerprint deliberately does not cover the name, so sanitizing for
+/// display never affects identity matching or verification.
+#[must_use]
+pub fn sanitize_display_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    // Deferred: a space is only emitted once a real character follows, so leading
+    // and trailing whitespace runs vanish and interior runs collapse to one space.
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if count >= MAX_DISPLAY_NAME_LEN {
+            break;
+        }
+        if is_spoofing_format_char(c) {
+            continue;
+        }
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if c.is_control() {
+            // Non-whitespace control (bell, DEL, C1, …): drop without a space so it
+            // can't be used to weld two tokens together.
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+            count += 1;
+            if count >= MAX_DISPLAY_NAME_LEN {
+                break;
+            }
+        }
+        pending_space = false;
+        out.push(c);
+        count += 1;
+    }
+    out
+}
 /// Upper bound on the raw text of a pasted/armored public key — and on the
 /// base64 body extracted from it — before any decode is attempted. A hybrid
 /// public identity is only a few KiB of CBOR (~5 KiB of base64); 128 KiB is far
@@ -82,6 +160,20 @@ impl PublicIdentity {
     #[must_use]
     pub fn is_hybrid_capable(&self) -> bool {
         self.mldsa_public.is_some() && self.mlkem_public.is_some()
+    }
+
+    /// The display name reduced to a safe rendering (F13), with a placeholder
+    /// substituted when the name is empty or sanitizes to nothing. Callers should
+    /// prefer this over the raw [`PublicIdentity::name`] anywhere a name is shown
+    /// to the user, since the raw name is attacker-controlled for imported keys.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        let safe = sanitize_display_name(&self.name);
+        if safe.is_empty() {
+            UNNAMED_DISPLAY.to_string()
+        } else {
+            safe
+        }
     }
 
     /// Full fingerprint as lowercase hex.
@@ -479,5 +571,64 @@ mod tests {
         let id = pubid();
         let body = data_encoding::BASE64.encode(&id.to_bytes().unwrap());
         assert_eq!(PublicIdentity::from_pasted(&body).unwrap(), id);
+    }
+
+    #[test]
+    fn sanitize_keeps_ordinary_names_intact() {
+        assert_eq!(sanitize_display_name("Alice"), "Alice");
+        assert_eq!(
+            sanitize_display_name("Alice Q. O'Brien"),
+            "Alice Q. O'Brien"
+        );
+        // Non-Latin scripts and emoji are legitimate and preserved.
+        assert_eq!(sanitize_display_name("张伟 🔐"), "张伟 🔐");
+    }
+
+    #[test]
+    fn sanitize_normalizes_whitespace() {
+        assert_eq!(sanitize_display_name("  Alice   Bob \t\n"), "Alice Bob");
+        assert_eq!(sanitize_display_name("line1\nline2"), "line1 line2");
+        // A non-breaking space is still whitespace and collapses like the rest.
+        assert_eq!(sanitize_display_name("A\u{00A0}B"), "A B");
+    }
+
+    #[test]
+    fn sanitize_drops_control_characters() {
+        assert_eq!(sanitize_display_name("Ali\u{0007}ce"), "Alice");
+        assert_eq!(sanitize_display_name("A\u{0000}B\u{007F}C"), "ABC");
+        // A bare NUL/DEL name reduces to nothing.
+        assert_eq!(sanitize_display_name("\u{0000}\u{007F}"), "");
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_and_invisible_spoofing_chars() {
+        // Right-to-left override — the classic filename spoof — is removed, so the
+        // visible order can no longer be reversed.
+        assert_eq!(
+            sanitize_display_name("photo\u{202E}gpj.exe"),
+            "photogpj.exe"
+        );
+        // Zero-width joiner/space and bidi isolates vanish entirely.
+        assert_eq!(sanitize_display_name("ad\u{200B}min"), "admin");
+        assert_eq!(sanitize_display_name("\u{2066}Alice\u{2069}"), "Alice");
+        assert_eq!(sanitize_display_name("A\u{200D}B"), "AB");
+    }
+
+    #[test]
+    fn sanitize_bounds_length() {
+        let long = "x".repeat(MAX_DISPLAY_NAME_LEN + 50);
+        let out = sanitize_display_name(&long);
+        assert_eq!(out.chars().count(), MAX_DISPLAY_NAME_LEN);
+    }
+
+    #[test]
+    fn display_name_falls_back_for_empty_or_stripped() {
+        let mut id = pubid();
+        id.name = String::new();
+        assert_eq!(id.display_name(), UNNAMED_DISPLAY);
+        id.name = "\u{202E}\u{200B}".to_string();
+        assert_eq!(id.display_name(), UNNAMED_DISPLAY);
+        id.name = "  Carol  ".to_string();
+        assert_eq!(id.display_name(), "Carol");
     }
 }

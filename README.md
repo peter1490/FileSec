@@ -224,6 +224,10 @@ protect against:
 The "A" in CIA here means tamper-evidence and the offline, no-single-point-of-
 failure transfer model — not anti-DoS or guaranteed delivery.
 
+See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the full, authoritative threat model:
+assets, the in-scope/out-of-scope adversary list, per-surface guarantees, and the
+known residual risks and accepted exceptions.
+
 ---
 
 ## Architecture

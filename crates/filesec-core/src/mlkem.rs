@@ -33,6 +33,9 @@ pub const SEED_LEN: usize = 64;
 pub const SHARED_LEN: usize = 32;
 
 /// Re-derive the decapsulation/encapsulation keypair from a stored seed.
+///
+/// Both intermediate copies of the seed — the fixed-size stack array and the
+/// library's `Array` wrapper — are wiped once the keypair is derived (F17).
 fn keypair_from_seed(
     seed: &[u8],
 ) -> Result<(
@@ -42,11 +45,12 @@ fn keypair_from_seed(
     if seed.len() != SEED_LEN {
         return Err(Error::BadKey("ml-kem seed length"));
     }
-    let mut arr = [0u8; SEED_LEN];
+    let mut arr = Zeroizing::new([0u8; SEED_LEN]);
     arr.copy_from_slice(seed);
-    let seed_arr = Array::from(arr);
-    arr.iter_mut().for_each(|b| *b = 0);
-    Ok(MlKem768::from_seed(&seed_arr))
+    let mut seed_arr = Array::from(*arr);
+    let kp = MlKem768::from_seed(&seed_arr);
+    seed_arr.iter_mut().for_each(|b| *b = 0);
+    Ok(kp)
 }
 
 /// Generate a fresh keypair, returning `(public_key_bytes, seed)`.
@@ -77,9 +81,12 @@ pub fn encapsulate(recipient_public: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; S
         .map_err(|_| Error::BadKey("ml-kem public key"))?;
     let m = Zeroizing::new(random_array::<32>()?);
     let (ct, shared) = ek.encapsulate_deterministic(&Array::from(*m));
-    let mut shared_arr = [0u8; SHARED_LEN];
+    // Copy the shared secret straight into a zeroizing buffer so the only stack
+    // copy is the one that wipes on drop — `[u8; 32]` is `Copy`, so moving a bare
+    // array into `Zeroizing` would leave an un-wiped duplicate behind (F17).
+    let mut shared_arr = Zeroizing::new([0u8; SHARED_LEN]);
     shared_arr.copy_from_slice(shared.as_slice());
-    Ok((ct.as_slice().to_vec(), Zeroizing::new(shared_arr)))
+    Ok((ct.as_slice().to_vec(), shared_arr))
 }
 
 /// Recipient side: decapsulate `ciphertext` with our stored `seed`, recovering
@@ -97,7 +104,9 @@ pub fn decapsulate(seed: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<[u8; SHAR
     let ct = Ciphertext::<MlKem768>::try_from(ciphertext)
         .map_err(|_| Error::BadKey("ml-kem ciphertext"))?;
     let shared = dk.decapsulate(&ct);
-    let mut arr = [0u8; SHARED_LEN];
+    // Copy straight into the zeroizing buffer (see `encapsulate`): a bare
+    // `[u8; 32]` moved into `Zeroizing` would leave an un-wiped `Copy` behind.
+    let mut arr = Zeroizing::new([0u8; SHARED_LEN]);
     arr.copy_from_slice(shared.as_slice());
-    Ok(Zeroizing::new(arr))
+    Ok(arr)
 }

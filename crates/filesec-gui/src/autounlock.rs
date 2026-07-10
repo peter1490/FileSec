@@ -60,8 +60,10 @@ pub const SUPPORTED: bool = cfg!(feature = "keyring");
 /// device/user — i.e. it does not sync or export to other machines. True on
 /// macOS (login keychain, non-syncing) and Windows (per-user Credential
 /// Manager); false on Linux, whose Secret Service offers no such guarantee.
-pub const DEVICE_BOUND: bool =
-    cfg!(all(feature = "keyring", any(target_os = "macos", target_os = "windows")));
+pub const DEVICE_BOUND: bool = cfg!(all(
+    feature = "keyring",
+    any(target_os = "macos", target_os = "windows")
+));
 
 /// A device-binding caveat to surface in the UI when auto-unlock is available but
 /// the platform keychain gives no device-binding/user-presence guarantee (the

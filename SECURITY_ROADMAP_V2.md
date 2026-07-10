@@ -606,6 +606,46 @@ Required tests:
 
 ### Stage 8: Crypto Hygiene And Long-Term Assurance
 
+**Implementation status (2026-07-10): complete.** F17: `SymKey` no longer derives
+`Clone` — the type documents the ban and a `compile_fail` doctest proves a stray
+`.clone()` on an owned key does not compile; the only two cloneable container
+readers (`VaultReader`, `VaultReaderV2`) now hold their content/manifest key
+behind an `Arc<SymKey>`, so a reader clone shares one key copy by refcount (the
+last drop zeroizes) instead of duplicating secret bytes, and a test-only
+`SymKey::duplicate_for_test` is the single explicit copy path. PQC seed handling
+in `mldsa`/`mlkem` now copies the shared secret straight into a `Zeroizing`
+buffer (a bare `[u8; 32]` moved into `Zeroizing` would leave an un-wiped `Copy`
+behind) and wipes both the stack seed and the library's fixed-size `B32`/`Array`
+seed wrappers after key derivation. F18: `aead.rs` gained an explicit
+"STREAM key/nonce invariant" section (one stream per fresh `(key, stream_nonce)`
+domain — enforced by a fresh CSPRNG nonce per stream under a fresh per-vault key —
+plus the monotonic BE32 counter and single authenticated last-chunk), backed by
+regression tests over every shipped suite: nonce-length relations, per-index
+counter round-trips via `decrypt_chunk_with`, wrong-index/wrong-last-flag
+rejection, and whole-stream truncation/reorder/duplication rejection, with a
+proptest that random-access decrypt reproduces every chunk of a random stream.
+F13: a `sanitize_display_name` helper (drop bidi/invisible spoofing characters and
+control characters, normalize whitespace, bound length) is applied where an
+untrusted name enters state — `ContactBook::upsert` sanitizes before storing and
+`from_bytes` re-sanitizes on load, so every in-memory contact name is display-safe
+— and `PublicIdentity::display_name()` renders untrusted pasted-key previews and
+the verify dialog; trust decisions stay gated on the safety number shown beside
+the fingerprint, and unknown senders are shown fingerprint-only. F19 strict path
+rejection (absolute/drive/traversal) was already landed in Stage 4 and is now also
+fuzzed. `cargo-fuzz` targets for the six highest-risk parsers — public-identity
+CBOR, pasted/armored keys, identity backup, manifest, the P2P `Hello` handshake,
+and path normalization — live in the detached `fuzz/` crate (its own workspace +
+lock, `exclude`d from the root so it never touches the MSRV-1.86 stable build or
+the supply-chain scan) and are smoke-run by a new `.github/workflows/fuzz.yml`
+(weekly + on PRs touching the core parsers). `THREAT_MODEL.md` at the repo root
+now states, authoritatively, what is protected, against whom, and what is out of
+scope. Intentional scoping consistent with the dependency-light, `unsafe`-free
+posture: further zeroization is bounded by what the PQC dependency API exposes,
+and the fuzz harness is nightly-only and kept out of the default toolchain. The
+Stage 8 tests (the `SymKey` compile-fail + duplicate-helper tests, the AEAD STREAM
+suite, and the display-name sanitizer + contacts upsert/load tests) are part of
+the workspace suite; the fuzz targets type-check against the real core API.
+
 Objective:
 
 Reduce secret-copy surface, lock down subtle cryptographic invariants, and add ongoing assurance mechanisms.

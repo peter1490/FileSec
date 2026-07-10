@@ -22,6 +22,7 @@
 use std::collections::BTreeSet;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
@@ -1003,7 +1004,10 @@ pub fn import_vault_from_path(path: &Path, identity: &Identity) -> Result<Import
 pub struct VaultReader {
     path: PathBuf,
     manifest: Manifest,
-    cek: SymKey,
+    // `Arc` so cloning a reader (the store clones one to apply a mutation off to
+    // the side) shares the single content-key copy by refcount instead of
+    // duplicating the secret bytes (F17). The last `Arc` drop zeroizes the key.
+    cek: Arc<SymKey>,
     header_bytes: Vec<u8>,
     data_stream_nonce: Vec<u8>,
     data_chunk_size: u64,
@@ -1814,7 +1818,7 @@ fn open_reader_inner(
     let reader = VaultReader {
         path: path.to_path_buf(),
         manifest,
-        cek,
+        cek: Arc::new(cek),
         header_bytes,
         data_stream_nonce: header.data_stream_nonce,
         data_chunk_size: chunk,

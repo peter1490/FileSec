@@ -2313,12 +2313,12 @@ impl App {
             };
             // A full-entropy device token — never the passphrase — is what lands
             // in the keychain.
-            let token = match filesec_core::secret::random_secret(
-                filesec_core::keystore::DEVICE_TOKEN_LEN,
-            ) {
-                Ok(t) => t,
-                Err(_) => return JobReport::err("Secure random generation failed."),
-            };
+            let token =
+                match filesec_core::secret::random_secret(filesec_core::keystore::DEVICE_TOKEN_LEN)
+                {
+                    Ok(t) => t,
+                    Err(_) => return JobReport::err("Secure random generation failed."),
+                };
             if let Err(e) = ks.set_device_token(pass.as_bytes(), &token) {
                 return JobReport::err(e.to_string());
             }
@@ -3838,11 +3838,7 @@ impl App {
         };
         if let State::Unlocked(s) = &mut self.state {
             if let Some(c) = s.contacts.find(&fpr) {
-                let name = if c.identity.name.is_empty() {
-                    "(unnamed)".to_string()
-                } else {
-                    c.identity.name.clone()
-                };
+                let name = c.identity.display_name();
                 s.verify = Some(VerifyForm {
                     fpr_hex,
                     name,
@@ -4186,11 +4182,9 @@ fn import_contact_job(
     mut contacts: ContactBook,
     pubid: PublicIdentity,
 ) -> JobReport {
-    let name = if pubid.name.is_empty() {
-        "(unnamed)".to_string()
-    } else {
-        pubid.name.clone()
-    };
+    // Sanitized rendering of the imported (attacker-controlled) name for the
+    // status message; the same sanitization is what `upsert` persists.
+    let name = pubid.display_name();
     let outcome = contacts.upsert(pubid, now_unix());
     let msg = match outcome {
         UpsertOutcome::Added => {
@@ -7062,11 +7056,9 @@ fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
         Some(p) => p,
         None => return,
     };
-    let name = if preview.pubid.name.is_empty() {
-        "(unnamed)".to_string()
-    } else {
-        preview.pubid.name.clone()
-    };
+    // The pasted key is untrusted: render its name only through the sanitizer so a
+    // bidi/zero-width spoof can't disguise it as another contact or as system text.
+    let name = preview.pubid.display_name();
     let is_self = matches!(preview.status, PreviewStatus::SelfKey);
     let (close, ()) = theme::modal(ctx, "Add contact?", |ui| {
         egui::Grid::new("preview_grid")
@@ -8453,12 +8445,18 @@ mod ui_smoke {
     #[test]
     fn security_key_wording_says_alternative_not_two_factor() {
         let d = PASSKEY_ALT_UNLOCK_DESC.to_lowercase();
-        assert!(d.contains("alternative"), "must call it an alternative unlock");
+        assert!(
+            d.contains("alternative"),
+            "must call it an alternative unlock"
+        );
         assert!(
             d.contains("not a second factor"),
             "must explicitly disclaim two-factor framing"
         );
-        assert!(!d.contains("in addition to"), "must not imply layering on the passphrase");
+        assert!(
+            !d.contains("in addition to"),
+            "must not imply layering on the passphrase"
+        );
         assert!(
             !d.contains("two-factor") && !d.contains("two factor"),
             "must not call itself two-factor authentication"

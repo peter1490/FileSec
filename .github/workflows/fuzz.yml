@@ -1,0 +1,76 @@
+name: Fuzz
+
+# Smoke-fuzzes the highest-risk parsers (Stage 8). Weekly on a schedule, on demand
+# via workflow_dispatch, and a short pass on PRs that touch the core parsers or the
+# fuzz harness. Each target runs for a bounded time budget and fails the job if
+# libFuzzer finds a crash — the harness itself is the regression gate.
+#
+# Supply-chain note: third-party Actions are pinned by commit SHA (version in a
+# trailing comment) and cargo-fuzz is pinned by version, matching the rest of CI.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds to fuzz each target
+        default: '120'
+  pull_request:
+    paths:
+      - 'fuzz/**'
+      - 'crates/filesec-core/**'
+      - '.github/workflows/fuzz.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - identity_from_bytes
+          - identity_from_pasted
+          - identity_backup
+          - manifest
+          - transport_hello
+          - normalize_path
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # filesec-core is dependency-light and pure Rust, so only OpenSSL headers
+      # are needed for the transitive build on Linux.
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+
+      # cargo-fuzz requires nightly for the AddressSanitizer instrumentation.
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz (pinned)
+        run: cargo install cargo-fuzz --version 0.12.0 --locked
+
+      # A PR pass is a quick smoke; scheduled/dispatch runs go longer.
+      - name: Smoke-run ${{ matrix.target }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            DURATION=30
+          else
+            DURATION="${{ github.event.inputs.duration || '120' }}"
+          fi
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="$DURATION" -rss_limit_mb=4096 -timeout=15

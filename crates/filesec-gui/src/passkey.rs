@@ -184,8 +184,8 @@ mod hardware {
         challenge: &[u8],
         pin: Option<&'a str>,
     ) -> MakeCredentialArgs<'a> {
-        let mut builder =
-            MakeCredentialArgsBuilder::new(rp_id, challenge).extensions(&[McExt::HmacSecret(Some(true))]);
+        let mut builder = MakeCredentialArgsBuilder::new(rp_id, challenge)
+            .extensions(&[McExt::HmacSecret(Some(true))]);
         if let Some(p) = pin {
             builder = builder.pin(p);
         }

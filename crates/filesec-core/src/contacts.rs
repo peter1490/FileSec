@@ -81,7 +81,15 @@ impl ContactBook {
     /// existing trust level (re-importing a key never silently re-trusts it,
     /// and never silently downgrades a verified contact). Returns an
     /// [`UpsertOutcome`] describing what changed so callers can warn the user.
-    pub fn upsert(&mut self, identity: PublicIdentity, now: i64) -> UpsertOutcome {
+    ///
+    /// The incoming display name is **sanitized before it is stored** (F13):
+    /// imported identities carry attacker-controlled names, so bidi/invisible
+    /// controls are stripped and whitespace normalized here, at the single point
+    /// where an untrusted name enters persistent state. Every later read of
+    /// `contact.identity.name` is therefore already safe to display, and rename
+    /// detection compares the sanitized forms.
+    pub fn upsert(&mut self, mut identity: PublicIdentity, now: i64) -> UpsertOutcome {
+        identity.name = crate::identity::sanitize_display_name(&identity.name);
         let fpr = identity.fingerprint();
         if let Some(existing) = self.contacts.iter_mut().find(|c| c.fingerprint() == fpr) {
             let old = existing.identity.name.clone();
@@ -148,7 +156,49 @@ impl ContactBook {
     }
 
     /// Parse from CBOR bytes.
+    ///
+    /// Contact display names are re-sanitized on load (F13) so a book written
+    /// before display-name sanitization existed still yields safe names in memory;
+    /// sanitization is idempotent, so books written by the current code are
+    /// unchanged. Every in-memory `ContactBook` therefore holds display-safe names.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        codec::from_slice(bytes)
+        let mut book: Self = codec::from_slice(bytes)?;
+        for c in &mut book.contacts {
+            c.identity.name = crate::identity::sanitize_display_name(&c.identity.name);
+        }
+        Ok(book)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::identity::Identity;
+
+    #[test]
+    fn upsert_sanitizes_the_stored_display_name() {
+        let mut id = Identity::generate("Mallory", 0).unwrap().public();
+        // A bidi-override + zero-width spoof in the imported name.
+        id.name = "photo\u{202E}gpj.exe\u{200B}".to_string();
+        let mut book = ContactBook::default();
+        assert_eq!(book.upsert(id.clone(), 1), UpsertOutcome::Added);
+        // The persisted contact name is already safe — no bidi/invisible chars.
+        assert_eq!(book.contacts[0].identity.name, "photogpj.exe");
+        // Re-importing the same hostile name is a no-op (compares sanitized forms).
+        assert_eq!(book.upsert(id, 2), UpsertOutcome::Unchanged);
+    }
+
+    #[test]
+    fn upsert_rename_compares_sanitized_names() {
+        let base = Identity::generate("Alice", 0).unwrap();
+        let mut a = base.public();
+        a.name = "Alice".to_string();
+        let mut book = ContactBook::default();
+        book.upsert(a, 1);
+        // A "rename" that only adds a stripped bidi control is not a real change.
+        let mut b = base.public();
+        b.name = "Alice\u{202E}".to_string();
+        assert_eq!(book.upsert(b, 2), UpsertOutcome::Unchanged);
     }
 }

@@ -34,6 +34,7 @@
 
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -226,7 +227,9 @@ pub struct VaultReaderV2 {
     suite: SuiteId,
     /// Exact on-disk header bytes — the AAD for the manifest and every blob.
     header_bytes: Vec<u8>,
-    manifest_key: SymKey,
+    // `Arc` so a reader clone shares one manifest-key copy by refcount rather
+    // than duplicating the secret bytes (F17); zeroized on the last `Arc` drop.
+    manifest_key: Arc<SymKey>,
     manifest: ManifestV2,
     owner_fingerprint: [u8; 32],
     state: Option<StateMetadata>,
@@ -344,7 +347,7 @@ impl VaultReaderV2 {
             dir: dir.to_path_buf(),
             suite,
             header_bytes,
-            manifest_key,
+            manifest_key: Arc::new(manifest_key),
             manifest,
             owner_fingerprint: identity.fingerprint(),
             state: None,
@@ -393,7 +396,7 @@ impl VaultReaderV2 {
             dir: dir.to_path_buf(),
             suite,
             header_bytes,
-            manifest_key,
+            manifest_key: Arc::new(manifest_key),
             manifest,
             owner_fingerprint: identity.fingerprint(),
             state: Some(envelope.state),
@@ -437,7 +440,7 @@ impl VaultReaderV2 {
             dir: dir.to_path_buf(),
             suite,
             header_bytes,
-            manifest_key,
+            manifest_key: Arc::new(manifest_key),
             manifest,
             owner_fingerprint: identity.fingerprint(),
             state: None,

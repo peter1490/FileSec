@@ -1,0 +1,79 @@
+# cargo-fuzz targets for FileSec's highest-risk untrusted-input parsers (Stage 8,
+# F13/F16/F19 + general parser hardening). This crate is DETACHED from the main
+# workspace (see the `[workspace]` table at the bottom and `exclude = ["fuzz"]` in
+# the root manifest): it is nightly-only (libfuzzer-sys) and must never enter the
+# MSRV-1.86 stable build or the supply-chain scan.
+#
+# Run one target (nightly + `cargo install cargo-fuzz`):
+#   cargo +nightly fuzz run identity_from_bytes
+# Short smoke run of a target (what CI does):
+#   cargo +nightly fuzz run identity_from_bytes -- -max_total_time=30
+[package]
+name = "filesec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.86"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# `net` + `pqc` so the transport handshake parser and the hybrid identity/backup
+# fields are all reachable from the fuzz targets.
+[dependencies.filesec-core]
+path = "../crates/filesec-core"
+features = ["net", "pqc"]
+
+[profile.release]
+debug = 1
+
+# One binary per target. `test`/`doc`/`bench` are off: these are fuzz entry
+# points, not ordinary Rust tests.
+[[bin]]
+name = "identity_from_bytes"
+path = "fuzz_targets/identity_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity_from_pasted"
+path = "fuzz_targets/identity_from_pasted.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity_backup"
+path = "fuzz_targets/identity_backup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_hello"
+path = "fuzz_targets/transport_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalize_path"
+path = "fuzz_targets/normalize_path.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace so root `cargo build`/`test`/`deny` never see
+# this crate or libfuzzer-sys.
+[workspace]
