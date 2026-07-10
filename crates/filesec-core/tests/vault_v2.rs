@@ -413,6 +413,59 @@ fn export_omits_the_trash_subtree() {
     cleanup(&dir);
 }
 
+/// Every non-directory path found under `dir`, recursively (test-local walk).
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk_files(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn v2_extract_to_leaves_no_partial_plaintext_on_tamper() {
+    let id = ident("Alice");
+    let dir = tmp_dir("extract-tamper.fsv2");
+    let v = build_sample(&dir, &id, SuiteId::Classic);
+    drop(v);
+
+    // Corrupt big.bin's blob so its BLAKE3 no longer matches on decrypt.
+    let blob = largest_blob(&dir);
+    let mut bytes = std::fs::read(&blob).unwrap();
+    let i = bytes.len() / 2;
+    bytes[i] ^= 0x01;
+    std::fs::write(&blob, &bytes).unwrap();
+
+    let v = VaultReaderV2::open(&dir, &id).unwrap();
+    let dest = tmp_dir("extract-tamper-out");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    // Extraction fails on the corrupted file...
+    assert!(v.extract_to(&dest).is_err());
+    // ...leaving no partial plaintext for it and no scratch temp anywhere.
+    assert!(
+        !dest.join("data/big.bin").exists(),
+        "partial plaintext leaked for the tampered file"
+    );
+    assert!(
+        !walk_files(&dest)
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".fstmp")),
+        "leaked hardened-writer temp file under {}",
+        dest.display()
+    );
+
+    cleanup(&dir);
+    cleanup(&dest);
+}
+
 #[cfg(feature = "pqc")]
 #[test]
 fn v2_hybrid_suite_roundtrips_at_rest() {

@@ -2803,25 +2803,14 @@ impl App {
         self.spawn_job(ctx, "Decrypting…", move || {
             let mut failed = 0usize;
             for path in &paths {
-                // Paths are normalized (never absolute, never `..`), so joining is
-                // confined to `dest`.
-                let out_path = dest.join(path);
-                if let Some(parent) = out_path.parent() {
-                    if std::fs::create_dir_all(parent).is_err() {
-                        failed += 1;
-                        continue;
-                    }
-                }
-                let out = match std::fs::File::create(&out_path) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        failed += 1;
-                        continue;
-                    }
-                };
-                let mut out = std::io::BufWriter::new(out);
-                if reader.read_entry_to_writer(path, &mut out).is_err()
-                    || std::io::Write::flush(&mut out).is_err()
+                // Each file streams through the hardened writer: parents are made
+                // without following planted symlinks, the plaintext is verified as
+                // it decrypts, and only a complete verified file is renamed into
+                // place — a failure leaves no partial plaintext under `dest`.
+                if crate::store::extract_file_hardened(&dest, path, |w| {
+                    reader.read_entry_to_writer(path, w)
+                })
+                .is_err()
                 {
                     failed += 1;
                 }
@@ -3109,33 +3098,21 @@ impl App {
                 if is_trashed(&path) {
                     continue;
                 }
-                // Vault paths are normalized (never absolute, never `..`), so the
-                // join stays confined to `dest`.
-                let out_path = dest.join(&path);
+                // Hardened writes: symlink-rejecting parent creation, and per-file
+                // authenticate-then-atomically-rename so no partial plaintext lands
+                // under `dest`.
                 match kind {
                     EntryKind::Dir => {
-                        if std::fs::create_dir_all(&out_path).is_err() {
+                        if crate::store::extract_dir_hardened(&dest, &path).is_err() {
                             failed += 1;
                         }
                     }
                     EntryKind::File => {
                         files += 1;
-                        if let Some(parent) = out_path.parent() {
-                            if std::fs::create_dir_all(parent).is_err() {
-                                failed += 1;
-                                continue;
-                            }
-                        }
-                        let out = match std::fs::File::create(&out_path) {
-                            Ok(f) => f,
-                            Err(_) => {
-                                failed += 1;
-                                continue;
-                            }
-                        };
-                        let mut out = std::io::BufWriter::new(out);
-                        if reader.read_entry_to_writer(&path, &mut out).is_err()
-                            || std::io::Write::flush(&mut out).is_err()
+                        if crate::store::extract_file_hardened(&dest, &path, |w| {
+                            reader.read_entry_to_writer(&path, w)
+                        })
+                        .is_err()
                         {
                             failed += 1;
                         }
@@ -3189,17 +3166,19 @@ impl App {
             None => return,
         };
         self.spawn_job(ctx, "Decrypting file…", move || {
-            // Stream this file's chunks straight to disk: peak memory is one
-            // chunk, not the whole file.
-            let out = match std::fs::File::create(&target) {
-                Ok(f) => f,
+            // Stream this file's chunks into a private temp beside the chosen
+            // destination (peak memory is one chunk), verifying as it decrypts,
+            // then atomically rename into place. A decryption/authentication
+            // failure leaves no partial plaintext, and an existing symlink at the
+            // chosen path is refused rather than written through.
+            let mut out = match filesec_core::safe_io::SafeFileWriter::create(&target) {
+                Ok(w) => w,
                 Err(e) => return JobReport::err(e.to_string()),
             };
-            let mut out = std::io::BufWriter::new(out);
             if let Err(e) = reader.read_entry_to_writer(&path, &mut out) {
                 return JobReport::err(e.to_string());
             }
-            match std::io::Write::flush(&mut out) {
+            match out.commit() {
                 Ok(()) => JobReport::ok(Outcome::Noop, format!("Saved to {}", target.display())),
                 Err(e) => JobReport::err(e.to_string()),
             }

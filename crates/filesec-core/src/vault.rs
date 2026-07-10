@@ -176,16 +176,34 @@ impl Vault {
 /// Normalize and validate an untrusted relative path.
 ///
 /// Returns a clean POSIX path with single `/` separators and no leading slash.
-/// Rejects absolute paths, empty paths, `.`/`..` components, NUL/control bytes,
-/// backslashes (to defeat Windows-style traversal), and pathologically deep or
-/// long paths. This is the single chokepoint that makes a malicious container
-/// unable to escape its extraction directory.
+/// Rejects empty paths, `.`/`..` components, NUL/control bytes, and
+/// pathologically deep or long paths.
+///
+/// Absolute inputs are **rejected outright** rather than silently rewritten to
+/// relative form (F19): a leading `/`, a leading `\` or `\\` UNC prefix, and a
+/// Windows drive prefix (`C:\`, `C:/`, or drive-relative `C:foo`) all error
+/// instead of being stripped down to a relative path. Already-valid relative
+/// paths — including ones that merely use `\` as a mid-path separator or contain
+/// redundant `.`/`//` — are still normalized for backward compatibility. This is
+/// the single chokepoint that keeps a malicious container from escaping its
+/// extraction directory or naming an absolute destination.
 pub fn normalize_path(path: &str) -> Result<String> {
     if path.is_empty() || path.len() > MAX_PATH_LEN {
         return Err(Error::Vault("invalid path length".into()));
     }
     // Treat both separators as separators so neither OS can be tricked.
     let unified = path.replace('\\', "/");
+    // A leading separator (Unix absolute `/x`, Windows `\x`, or a `\\host` UNC
+    // share, both now `/...`) is absolute — refuse it rather than stripping it.
+    if unified.starts_with('/') {
+        return Err(Error::Vault("absolute paths are not allowed".into()));
+    }
+    // A Windows drive prefix (`C:` as the first two bytes) is absolute or
+    // drive-relative; either way it must not be treated as a plain relative path.
+    let bytes = unified.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(Error::Vault("drive-letter paths are not allowed".into()));
+    }
     let mut components: Vec<&str> = Vec::new();
     for comp in unified.split('/') {
         match comp {

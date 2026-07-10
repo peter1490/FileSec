@@ -71,6 +71,13 @@ pub enum Error {
     #[error("legacy state requires explicit recovery: {0}")]
     LegacyState(&'static str),
 
+    /// A hardened filesystem write refused to proceed: the destination or one of
+    /// its parent components is a symlink, an extraction path escaped its root, or
+    /// a path component collided with a non-directory. Sensitive plaintext is
+    /// never written through such a path.
+    #[error("unsafe filesystem path: {0}")]
+    UnsafePath(&'static str),
+
     /// A filesystem operation failed.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

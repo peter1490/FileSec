@@ -244,6 +244,41 @@ Required tests:
 
 ### Stage 4: Filesystem And Extraction Hardening
 
+**Implementation status (2026-07-10): complete.** Sensitive writes now go through
+one shared helper — the new `filesec-core::safe_io` module. `SafeFileWriter`
+streams into a private temp created with `create_new` (`O_EXCL`, so it never
+opens or follows an existing file/symlink) at mode `0600` on Unix, in the *same*
+directory as the destination, then flushes, fsyncs, re-checks the target for a
+symlink, and atomically renames into place (with a best-effort directory fsync);
+a writer dropped without an explicit `commit` — including on any decrypt/auth
+failure — unlinks the temp, so a failed extraction leaves neither partial
+plaintext nor a scratch file, and a symlink planted at the destination is
+refused rather than written through. `create_dirs_no_symlink` builds parent
+directories one component at a time (private `0700`), refusing to descend through
+any existing symlink. Both `VaultReader::extract_to` (v1) and
+`VaultReaderV2::extract_to` (v2) route every file through this path; their
+streaming decrypt already authenticates each byte (per-chunk AEAD + a full-file
+BLAKE3 check), so a tampered container aborts before the rename. On the GUI side
+`extract_vault`, the identity-backup export (`write_private_export`, now atomic
+and symlink-refusing), both batch-extract loops, and the single "Save file…"
+path all use the safe writer (via new `extract_file_hardened` /
+`extract_dir_hardened` store helpers); the network receive path opens its
+pre-created `0600` temp instead of re-creating it. F19: `normalize_path` now
+rejects absolute inputs (leading `/`, leading `\`, `\\` UNC) and Windows
+drive-letter prefixes (`C:\`, `C:/`, drive-relative `C:foo`) outright instead of
+silently rewriting them to relative form; already-valid relative paths (redundant
+`.`/`//`, `\` used only as a mid-path separator) still normalize. Permissions are
+set at creation, not after writing. A fully race-free `openat(O_NOFOLLOW)`
+component walk is intentionally not added (it would need a `libc` dependency this
+dependency-light, MSRV-pinned build avoids); `create_new`'s `O_EXCL` semantics
+plus the `symlink_metadata` parent checks close the common local-tampering
+window, and the residual TOCTOU race falls inside the already out-of-scope
+local-filesystem-attacker model. The Stage 4 safe-writer unit tests (atomic
+overwrite, drop cleanup, symlinked-target and symlinked-parent rejection, Unix
+`0600`/`0700` permissions, sibling-directory idempotence), the v1/v2 extraction
+tamper-cleanup tests, the container symlinked-destination rejection test, and the
+`normalize_path` absolute/drive-rejection cases are part of the workspace suite.
+
 Objective:
 
 Ensure plaintext and sensitive metadata are written only through hardened, private, atomic filesystem paths, and that failed verification never leaves partial plaintext behind.

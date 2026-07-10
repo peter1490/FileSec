@@ -1109,6 +1109,15 @@ impl VaultReader {
     /// Decrypt every file to `dest` on the real filesystem, **streaming** each
     /// file chunk-by-chunk straight to disk. Peak memory is a single chunk — not
     /// the size of the largest file, and never the whole vault.
+    ///
+    /// Each file is written through [`crate::safe_io::SafeFileWriter`]: a private
+    /// temp is created, the plaintext is authenticated as it streams (per-chunk
+    /// AEAD plus a full-file BLAKE3 check inside [`Self::decrypt_entry_to_writer`]),
+    /// and only a successfully authenticated file is atomically renamed into
+    /// place. A verification failure aborts before the rename, so a tampered
+    /// container never leaves partial plaintext at the destination. Parent
+    /// directories are created without descending through attacker-planted
+    /// symlinks, and an existing symlink at a target path is refused.
     pub fn extract_to(&self, dest: &Path) -> Result<()> {
         let mut file = fs_err::File::open(&self.path)?;
         for entry in &self.manifest.entries {
@@ -1116,15 +1125,15 @@ impl VaultReader {
             let target = dest.join(&norm);
             match entry.kind {
                 EntryKind::Dir => {
-                    fs_err::create_dir_all(&target)?;
+                    crate::safe_io::create_dirs_no_symlink(dest, &target)?;
                 }
                 EntryKind::File => {
                     if let Some(parent) = target.parent() {
-                        fs_err::create_dir_all(parent)?;
+                        crate::safe_io::create_dirs_no_symlink(dest, parent)?;
                     }
-                    let mut out = BufWriter::new(fs_err::File::create(&target)?);
+                    let mut out = crate::safe_io::SafeFileWriter::create(&target)?;
                     self.decrypt_entry_to_writer(&mut file, entry, &mut out)?;
-                    out.flush()?;
+                    out.commit()?;
                 }
             }
         }

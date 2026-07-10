@@ -261,7 +261,15 @@ fn receive_into(
     emitter: &Emitter,
     cmd_rx: &Receiver<NetCommand>,
 ) -> Result<(), String> {
-    let mut file = std::fs::File::create(temp).map_err(|e| e.to_string())?;
+    // `temp` was just created private (0600) by `create_private_checkout_file`
+    // in the app-owned checkout dir. Open *that* file for writing rather than
+    // re-`create`-ing it, so a vanished temp is an error instead of a silently
+    // re-created, loosely-permissioned one.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(temp)
+        .map_err(|e| e.to_string())?;
     let mut received: u64 = 0;
     loop {
         match cmd_rx.try_recv() {

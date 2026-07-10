@@ -687,13 +687,133 @@ fn lazy_open_detects_data_tampering_on_read() {
 
 #[test]
 fn path_normalization_blocks_traversal() {
+    // Already-valid relative paths are normalized (redundant `.`/`//`, and `\`
+    // used only as a mid-path separator) for backward compatibility.
     assert_eq!(normalize_path("a/b/c").unwrap(), "a/b/c");
     assert_eq!(normalize_path("./a//b/").unwrap(), "a/b");
     assert_eq!(normalize_path("a\\b\\c").unwrap(), "a/b/c");
-    assert_eq!(normalize_path("/abs/path").unwrap(), "abs/path");
 
     assert!(normalize_path("").is_err());
     assert!(normalize_path("../etc/passwd").is_err());
     assert!(normalize_path("a/../../b").is_err());
     assert!(normalize_path("a/\0/b").is_err());
+
+    // F19: absolute inputs are rejected outright, not silently made relative.
+    assert!(normalize_path("/abs/path").is_err()); // Unix absolute
+    assert!(normalize_path("\\abs\\path").is_err()); // Windows-rooted
+    assert!(normalize_path("\\\\server\\share").is_err()); // UNC
+    assert!(normalize_path("C:\\Windows").is_err()); // drive absolute
+    assert!(normalize_path("c:/windows").is_err()); // drive absolute (fwd slash)
+    assert!(normalize_path("C:file").is_err()); // drive-relative
+                                                // A colon that is not a drive prefix stays a legal relative path on Unix.
+    assert_eq!(normalize_path("a/b:c").unwrap(), "a/b:c");
+}
+
+/// Recursively assert no hardened-writer temp files (`*.fstmp`) survive under
+/// `dir`, so a failed extraction never leaks a partial-plaintext scratch file.
+fn assert_no_temp_files(dir: &std::path::Path) {
+    for entry in walkdir_flat(dir) {
+        let name = entry.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert!(
+            !name.ends_with(".fstmp"),
+            "leaked temp file: {}",
+            entry.display()
+        );
+    }
+}
+
+/// Minimal recursive file walk (avoids a test-only dependency).
+fn walkdir_flat(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walkdir_flat(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn extract_to_leaves_no_partial_plaintext_on_tamper() {
+    let alice = ident("Alice");
+    let path = tmp_path("extract-tamper.fsec");
+    format::export_vault_to_path(
+        &sample_vault(),
+        &alice,
+        &[alice.public()],
+        &ExportOptions::default(),
+        &path,
+    )
+    .unwrap();
+
+    // Corrupt a chunk of the large multi-chunk file (before the signature).
+    let mut bytes = std::fs::read(&path).unwrap();
+    let idx = bytes.len() - 100;
+    bytes[idx] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let reader = format::open_vault_from_path(&path, &alice).unwrap();
+    let dest = tmp_path("extract-tamper-out");
+    std::fs::create_dir_all(&dest).unwrap();
+
+    // Extraction fails on the corrupted file...
+    assert!(reader.extract_to(&dest).is_err());
+    // ...and the corrupted file is NOT left partially written at its destination.
+    assert!(
+        !dest.join("data/big.bin").exists(),
+        "partial plaintext leaked for the tampered file"
+    );
+    // ...and no scratch temp file survives anywhere under the destination.
+    assert_no_temp_files(&dest);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_to_refuses_symlinked_destination_file() {
+    let alice = ident("Alice");
+    let mut v = Vault::new("One File", 1);
+    v.add_file("readme.txt", b"real vault contents".to_vec(), None, None)
+        .unwrap();
+    let path = tmp_path("extract-symlink.fsec");
+    format::export_vault_to_path(
+        &v,
+        &alice,
+        &[alice.public()],
+        &ExportOptions::default(),
+        &path,
+    )
+    .unwrap();
+
+    let dest = tmp_path("extract-symlink-out");
+    std::fs::create_dir_all(&dest).unwrap();
+    // An attacker plants a symlink where a file is about to be extracted.
+    let outside = tmp_path("extract-symlink-victim.txt");
+    std::fs::write(&outside, b"must not be overwritten").unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("readme.txt")).unwrap();
+
+    // Extraction refuses to write through the planted symlink...
+    assert!(reader_extract_fails(&path, &alice, &dest));
+    // ...and the symlink target is untouched.
+    assert_eq!(std::fs::read(&outside).unwrap(), b"must not be overwritten");
+    assert_no_temp_files(&dest);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[cfg(unix)]
+fn reader_extract_fails(path: &std::path::Path, id: &Identity, dest: &std::path::Path) -> bool {
+    format::open_vault_from_path(path, id)
+        .unwrap()
+        .extract_to(dest)
+        .is_err()
 }

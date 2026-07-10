@@ -9,6 +9,7 @@
 //! * [`suite`] — the algorithm-suite identifier and dispatch.
 //! * [`identity`], [`keystore`], [`contacts`] — key/identity management.
 //! * [`envelope`], [`manifest`], [`vault`], [`format`] — the `.fsec` container.
+//! * [`safe_io`] — hardened, atomic, symlink-rejecting writes for plaintext.
 //!
 //! See the workspace plan for the format specification and threat model.
 
@@ -34,6 +35,7 @@ pub mod manifest;
 pub mod mldsa;
 #[cfg(feature = "pqc")]
 pub mod mlkem;
+pub mod safe_io;
 pub mod secret;
 pub mod sign;
 pub mod state;

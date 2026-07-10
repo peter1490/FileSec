@@ -586,20 +586,27 @@ impl VaultReaderV2 {
 
     /// Decrypt every file to `dest` on the real filesystem, streaming each file
     /// chunk-by-chunk (peak memory is one chunk).
+    ///
+    /// Each file is written through [`crate::safe_io::SafeFileWriter`]:
+    /// [`Self::read_entry_to_writer`] authenticates the plaintext (per-chunk AEAD
+    /// plus a full-file BLAKE3 check) as it streams into a private temp, and only
+    /// a verified file is atomically renamed into place — so a tampered blob never
+    /// leaves partial plaintext behind. Parent directories are created without
+    /// descending through planted symlinks, and a symlinked target is refused.
     pub fn extract_to(&self, dest: &Path) -> Result<()> {
         for e in &self.manifest.entries {
             let target = dest.join(normalize_path(&e.path)?);
             match e.kind {
                 EntryKind::Dir => {
-                    fs_err::create_dir_all(&target)?;
+                    crate::safe_io::create_dirs_no_symlink(dest, &target)?;
                 }
                 EntryKind::File => {
                     if let Some(parent) = target.parent() {
-                        fs_err::create_dir_all(parent)?;
+                        crate::safe_io::create_dirs_no_symlink(dest, parent)?;
                     }
-                    let mut out = std::io::BufWriter::new(fs_err::File::create(&target)?);
+                    let mut out = crate::safe_io::SafeFileWriter::create(&target)?;
                     self.read_entry_to_writer(&e.path, &mut out)?;
-                    out.flush()?;
+                    out.commit()?;
                 }
             }
         }

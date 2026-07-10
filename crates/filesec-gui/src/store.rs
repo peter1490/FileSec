@@ -1240,13 +1240,17 @@ fn keystore_is_v3(path: &Path) -> bool {
 
 /// Write `contents` to a user-chosen `path` with owner-only permissions (0600
 /// where the OS supports it) from the outset, so an exported secret (e.g. an
-/// identity backup) never briefly exists with loose permissions. Truncates any
-/// existing file at `path`.
+/// identity backup) never briefly exists with loose permissions.
+///
+/// Routed through [`filesec_core::safe_io::SafeFileWriter`], so the write is
+/// atomic (a private temp is fsync'd and renamed into place — a crash leaves the
+/// old file or the new one, never a half-written secret) and refuses to write
+/// through a symlink planted at `path`.
 pub fn write_private_export(path: &Path, contents: &[u8]) -> StoreResult<()> {
     use std::io::Write;
-    let mut f = open_private_create(path)?;
-    f.write_all(contents).map_err(err)?;
-    f.flush().map_err(err)?;
+    let mut w = filesec_core::safe_io::SafeFileWriter::create(path).map_err(err)?;
+    w.write_all(contents).map_err(err)?;
+    w.commit().map_err(err)?;
     Ok(())
 }
 
@@ -1288,25 +1292,53 @@ fn random_hex_from<const N: usize>(
 
 /// Write a decrypted vault's contents into `dest` on the real filesystem.
 ///
-/// Every entry path is already normalized (relative, no `..`), so joining it
-/// under `dest` cannot escape the destination directory.
+/// Each path is re-validated with [`normalize_path`] (rejecting absolute or
+/// traversal paths) and written through [`extract_file_hardened`], so a malicious
+/// vault can neither escape `dest` nor make FileSec write plaintext through a
+/// symlink planted inside it; a write that fails leaves no partial file.
 pub fn extract_vault(vault: &Vault, dest: &Path) -> StoreResult<()> {
     use filesec_core::manifest::EntryKind;
     for e in vault.entries() {
-        let target = dest.join(&e.path);
         match e.kind {
-            EntryKind::Dir => {
-                std::fs::create_dir_all(&target).map_err(err)?;
-            }
-            EntryKind::File => {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(err)?;
-                }
-                std::fs::write(&target, &e.content).map_err(err)?;
-            }
+            EntryKind::Dir => extract_dir_hardened(dest, &e.path)?,
+            EntryKind::File => extract_file_hardened(dest, &e.path, |w| {
+                use std::io::Write;
+                w.write_all(&e.content)
+                    .map_err(filesec_core::error::Error::from)
+            })?,
         }
     }
     Ok(())
+}
+
+/// Decrypt/write one vault entry to `root`/`rel` through the hardened
+/// [`filesec_core::safe_io::SafeFileWriter`]: `rel` is re-validated as a relative
+/// path, parent directories are created without following planted symlinks, a
+/// symlinked target is refused, and `fill` streams the plaintext into a private
+/// temp that is fsync'd and atomically renamed into place only on success. If
+/// `fill` errors (e.g. authentication failed), the temp is discarded and nothing
+/// lands at the target.
+pub fn extract_file_hardened<F>(root: &Path, rel: &str, fill: F) -> StoreResult<()>
+where
+    F: FnOnce(&mut filesec_core::safe_io::SafeFileWriter) -> filesec_core::error::Result<()>,
+{
+    use filesec_core::safe_io::{create_dirs_no_symlink, SafeFileWriter};
+    let norm = filesec_core::vault::normalize_path(rel).map_err(err)?;
+    let target = root.join(&norm);
+    if let Some(parent) = target.parent() {
+        create_dirs_no_symlink(root, parent).map_err(err)?;
+    }
+    let mut w = SafeFileWriter::create(&target).map_err(err)?;
+    fill(&mut w).map_err(err)?;
+    w.commit().map_err(err)?;
+    Ok(())
+}
+
+/// Create a (possibly nested) directory subtree for `rel` under `root` through the
+/// symlink-rejecting helper. `rel` is re-validated as a relative path first.
+pub fn extract_dir_hardened(root: &Path, rel: &str) -> StoreResult<()> {
+    let norm = filesec_core::vault::normalize_path(rel).map_err(err)?;
+    filesec_core::safe_io::create_dirs_no_symlink(root, &root.join(norm)).map_err(err)
 }
 
 /// Best-effort: restore owner write permission on a file that was marked
