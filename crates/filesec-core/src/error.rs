@@ -56,6 +56,21 @@ pub enum Error {
     #[error("key derivation parameters rejected: {0}")]
     KdfParams(&'static str),
 
+    /// An authenticated state object is older than the locally anchored
+    /// high-water mark. The caller should quarantine it rather than opening it.
+    #[error("rollback detected for {0}: the stored state is older than the trusted anchor")]
+    RollbackDetected(String),
+
+    /// An authenticated state object conflicts with the trusted state at the
+    /// same epoch, changes identity/object binding, or breaks the hash chain.
+    #[error("state-anchor mismatch for {0}: the stored state conflicts with trusted history")]
+    StateMismatch(String),
+
+    /// A valid pre-anchor state format was encountered on a normal open. Legacy
+    /// state is accepted only by an explicit recovery/migration entry point.
+    #[error("legacy state requires explicit recovery: {0}")]
+    LegacyState(&'static str),
+
     /// A filesystem operation failed.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

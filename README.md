@@ -137,11 +137,13 @@ touches** (the `hmac-secret` value is only returned by an assertion, so creating
 the credential and deriving its secret are two user-presence steps); unlocking is
 a single touch.
 
-Backward compatible: a keystore with no passkeys stays in the original on-disk
-format byte-for-byte (so a build without this feature still opens it). The first
-enrollment migrates it to the keyslot format. Keystore writes are atomic
-(temp + fsync + rename), so enrolling/removing a key can never half-write it.
-Upgrading to post-quantum re-seals a fresh keystore, so re-enroll any keys after.
+Every new keystore, including a passphrase-only one, uses the signed,
+rollback-protected v3 state frame. Older v1/v2 keystores remain recoverable: the
+unlock screen clearly marks the one-time migration, requires the passphrase as
+explicit confirmation, and immediately rewraps the keystore. Keystore writes are
+atomic (temp + fsync + rename), so enrolling/removing a key can never half-write
+it. Upgrading to post-quantum re-seals a fresh keystore, so re-enroll any keys
+after.
 
 > The passkey backend talks to the key over USB HID via `ctap-hid-fido2`, which
 > vendors the C `hidapi` library — it is **only** compiled with
@@ -167,6 +169,33 @@ The signed installer builds enable this feature; the default `cargo` build leave
 it (and its secret-store dependency) out entirely. The backend crate is
 target-gated so each OS pulls only its own (no `zbus` on macOS/Windows). See
 [`crates/filesec-gui/src/autounlock.rs`](crates/filesec-gui/src/autounlock.rs).
+
+#### Rollback-resistant local state
+
+The keystore, contact book, vault registry, and each local v2 vault manifest
+carry a monotonically increasing epoch plus predecessor/current state hashes.
+Their authenticated binding includes the owning identity fingerprint, object
+type and id, suite id, epoch, and both hashes. Keystore state is additionally
+signed by the identity; contacts/registry live inside authenticated self-encrypted
+containers; v2 manifest state is bound into its manifest AEAD.
+
+FileSec stores the latest accepted high-water anchors in the OS secure store
+when the `keyring` feature/backend is available. An older valid state, a
+different hash at the same epoch, or a broken successor chain is rejected and
+moved into the data directory's `quarantine/` folder instead of opening. Legacy
+state is never migrated silently: the unlock screen presents a clearly marked
+one-time recovery action, verifies the legacy keystore passphrase and local-v1
+vault signatures, and immediately re-anchors the recovered state.
+
+Without a usable OS secure store, FileSec uses a private `.state-anchors` file
+inside the data directory and shows a persistent degraded-mode warning under
+*My Identity*. This still detects restoring an individual old state file, but a
+whole-directory restore can roll back the fallback anchor too. In that mode,
+keep an independent current backup; inspect anything in `quarantine/` before
+using the explicit recovery APIs (`recover_legacy_keystore`,
+`recover_legacy_contacts`, `recover_legacy_registry`, and
+`recover_legacy_vault`). Never fix a rollback warning by copying an old anchor
+file over the current one.
 
 ### Threat model — what is *not* protected
 
@@ -215,11 +244,12 @@ trailer   : Ed25519 signature over BLAKE3(everything above)
             (hybrid suite 0x0101 appends an ML-DSA-65 signature; both required)
 ```
 
-The same format is used both for transport (export to others) and for the local
-at-rest store: vaults, the contact book, and the vault registry are each stored
-as a container encrypted to your own identity, so they are confidential on disk.
-Only the keystore differs — it is sealed with your Argon2id-derived passphrase
-key, since it bootstraps everything else.
+The contact book and vault registry are stored as containers encrypted to your
+own identity. Local vaults use the v2 directory-of-independent-blobs format so a
+single edit rewrites only one blob plus its manifest. Only the keystore differs
+— it is sealed with your Argon2id-derived passphrase key, since it bootstraps
+everything else. All four state families use the rollback anchors described
+above.
 
 **Lazy opening.** Opening a vault decrypts only the small, authenticated manifest
 (the folder tree and per-entry metadata) — *not* the file data — so opening a

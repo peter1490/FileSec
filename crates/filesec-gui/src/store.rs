@@ -7,7 +7,9 @@
 //! supports it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use filesec_core::contacts::ContactBook;
@@ -16,6 +18,7 @@ use filesec_core::format_v2::VaultReaderV2;
 use filesec_core::identity::Identity;
 use filesec_core::keystore::KeystoreFile;
 use filesec_core::manifest::EntryKind;
+use filesec_core::state::{StateAnchor, StateMetadata, StateObjectType};
 use filesec_core::util::now_unix;
 use filesec_core::vault::Vault;
 use filesec_core::SuiteId;
@@ -50,6 +53,41 @@ const CONTACTS_BLOB: &str = "contacts";
 const MAX_KEYSTORE_FILE_LEN: u64 = 16 * 1024 * 1024;
 const MAX_SELF_BLOB_CONTAINER_LEN: u64 = 64 * 1024 * 1024;
 const MAX_SELF_BLOB_PLAINTEXT_LEN: u64 = 16 * 1024 * 1024;
+const PROTECTED_STATE_VERSION: u16 = 1;
+const ANCHORS_VERSION: u16 = 1;
+const ANCHORS_FILE: &str = ".state-anchors";
+const ANCHORS_BACKEND_FILE: &str = ".state-anchor-backend";
+const QUARANTINE_DIR: &str = "quarantine";
+
+/// Quality of the independent high-water anchor backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorProtection {
+    /// Anchors are held by the platform keychain/credential manager.
+    SecureStorage,
+    /// Anchors are stored as a private local file and can be rolled back along
+    /// with the data directory. Object-only restores remain detectable, but a
+    /// whole-directory restore requires careful manual recovery.
+    DegradedFile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorBackend {
+    SecureStorage,
+    DegradedFile,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AnchorSet {
+    version: u16,
+    anchors: Vec<StateAnchor>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProtectedState<T> {
+    version: u16,
+    state: StateMetadata,
+    payload: T,
+}
 
 /// GUI-layer result type: errors are user-facing strings.
 pub type StoreResult<T> = Result<T, String>;
@@ -104,6 +142,9 @@ pub struct Store {
     data_dir: PathBuf,
     vaults_dir: PathBuf,
     checkout_dir: PathBuf,
+    anchor_backend: AnchorBackend,
+    anchor_account: String,
+    anchor_lock: Mutex<()>,
 }
 
 impl Store {
@@ -131,16 +172,45 @@ impl Store {
         harden_dir(&data_dir);
         harden_dir(&vaults_dir);
         harden_dir(&checkout_dir);
+        let anchor_account = std::fs::canonicalize(&data_dir)
+            .unwrap_or_else(|_| data_dir.clone())
+            .display()
+            .to_string();
+        let anchor_backend = select_anchor_backend(&data_dir, &anchor_account)?;
         Ok(Self {
             data_dir,
             vaults_dir,
             checkout_dir,
+            anchor_backend,
+            anchor_account,
+            anchor_lock: Mutex::new(()),
         })
     }
 
     /// The application data directory (shown in the UI).
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Whether high-water anchors are protected by OS secure storage or by the
+    /// explicitly degraded local-file fallback.
+    #[must_use]
+    pub fn anchor_protection(&self) -> AnchorProtection {
+        match self.anchor_backend {
+            AnchorBackend::SecureStorage => AnchorProtection::SecureStorage,
+            AnchorBackend::DegradedFile => AnchorProtection::DegradedFile,
+        }
+    }
+
+    /// Persistent warning shown by the GUI when secure anchor storage is not
+    /// available. The documented recovery path is to inspect quarantined state,
+    /// restore the intended newest copy, and call the explicit `recover_legacy_*`
+    /// or `reanchor_*` API rather than copying an old anchor file over the store.
+    #[must_use]
+    pub fn rollback_protection_warning(&self) -> Option<&'static str> {
+        (self.anchor_backend == AnchorBackend::DegradedFile).then_some(
+            "Rollback protection is in degraded mode: this system has no usable OS secure storage, so high-water anchors are kept in the FileSec data directory. Restoring the whole directory can also restore its anchors; keep an independent current backup and use the explicit recovery flow for quarantined state.",
+        )
     }
 
     fn keystore_path(&self) -> PathBuf {
@@ -161,6 +231,150 @@ impl Store {
         self.vaults_dir.join(format!("{id}.fsv2"))
     }
 
+    fn anchors_path(&self) -> PathBuf {
+        self.data_dir.join(ANCHORS_FILE)
+    }
+
+    fn load_anchor_set_locked(&self) -> StoreResult<AnchorSet> {
+        let bytes = match self.anchor_backend {
+            AnchorBackend::SecureStorage => {
+                crate::autounlock::load_state_anchors(&self.anchor_account)
+                    .map_err(err)?
+                    .unwrap_or_default()
+            }
+            AnchorBackend::DegradedFile => {
+                let path = self.anchors_path();
+                if path.exists() {
+                    read_bounded_file(&path, 4 * 1024 * 1024, "state anchor file")?
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+        if bytes.is_empty() {
+            return Ok(AnchorSet {
+                version: ANCHORS_VERSION,
+                anchors: Vec::new(),
+            });
+        }
+        let set: AnchorSet = filesec_core::codec::from_slice(&bytes).map_err(err)?;
+        if set.version != ANCHORS_VERSION {
+            return Err("unsupported state anchor format".into());
+        }
+        Ok(set)
+    }
+
+    fn save_anchor_set_locked(&self, set: &AnchorSet) -> StoreResult<()> {
+        let bytes = filesec_core::codec::to_vec(set).map_err(err)?;
+        match self.anchor_backend {
+            AnchorBackend::SecureStorage => {
+                crate::autounlock::save_state_anchors(&self.anchor_account, &bytes).map_err(err)
+            }
+            AnchorBackend::DegradedFile => {
+                let final_path = self.anchors_path();
+                let tmp = self.data_dir.join(".state-anchors.tmp");
+                write_private_atomic(&tmp, &final_path, &bytes)
+            }
+        }
+    }
+
+    fn current_anchor(
+        &self,
+        identity_fingerprint: [u8; 32],
+        object_type: StateObjectType,
+        object_id: &str,
+    ) -> StoreResult<Option<StateAnchor>> {
+        let _guard = self
+            .anchor_lock
+            .lock()
+            .map_err(|_| "state anchor lock is unavailable".to_string())?;
+        let set = self.load_anchor_set_locked()?;
+        let any = set
+            .anchors
+            .iter()
+            .find(|a| a.object_type == object_type && a.object_id == object_id);
+        match any {
+            Some(anchor) if anchor.identity_fingerprint != identity_fingerprint => Err(format!(
+                "state-anchor mismatch for {object_type} {object_id}: it belongs to a different identity"
+            )),
+            Some(anchor) => Ok(Some(anchor.clone())),
+            None => Ok(None),
+        }
+    }
+
+    fn accept_state(&self, state: &StateMetadata, suspect_path: &Path) -> StoreResult<()> {
+        let result = (|| {
+            let _guard = self
+                .anchor_lock
+                .lock()
+                .map_err(|_| "state anchor lock is unavailable".to_string())?;
+            let mut set = self.load_anchor_set_locked()?;
+            let position = set
+                .anchors
+                .iter()
+                .position(|a| a.object_type == state.object_type && a.object_id == state.object_id);
+            let should_update = match position {
+                Some(i) => set.anchors[i].check_candidate(state).map_err(err)?,
+                None => true,
+            };
+            if should_update {
+                let anchor = StateAnchor::from_metadata(state);
+                if let Some(i) = position {
+                    set.anchors[i] = anchor;
+                } else {
+                    set.anchors.push(anchor);
+                }
+                self.save_anchor_set_locked(&set)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() && suspect_path.exists() {
+            let _ = self.quarantine(suspect_path);
+        }
+        result
+    }
+
+    fn check_state_transition(&self, state: &StateMetadata) -> StoreResult<()> {
+        let _guard = self
+            .anchor_lock
+            .lock()
+            .map_err(|_| "state anchor lock is unavailable".to_string())?;
+        let set = self.load_anchor_set_locked()?;
+        if let Some(anchor) = set
+            .anchors
+            .iter()
+            .find(|a| a.object_type == state.object_type && a.object_id == state.object_id)
+        {
+            anchor.check_candidate(state).map_err(err)?;
+        }
+        Ok(())
+    }
+
+    fn commit_state(&self, state: &StateMetadata) -> StoreResult<()> {
+        // No quarantine on save: the authenticated candidate is in memory and
+        // the caller still controls the write path. `accept_state` is reserved
+        // for suspect bytes loaded from disk.
+        self.accept_state(state, Path::new(""))
+    }
+
+    fn quarantine(&self, path: &Path) -> StoreResult<PathBuf> {
+        let dir = self.data_dir.join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        harden_dir(&dir);
+        let leaf = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+        let suffix = random_hex::<8>()?;
+        let target = dir.join(format!("{leaf}.rollback-{suffix}"));
+        std::fs::rename(path, &target).map_err(err)?;
+        Ok(target)
+    }
+
+    fn commit_vault_reader(&self, reader: &VaultReaderV2) -> StoreResult<()> {
+        let state = reader
+            .state_metadata()
+            .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+        self.commit_state(state)
+    }
+
     /// Whether an identity has already been created.
     pub fn keystore_exists(&self) -> bool {
         self.keystore_path().exists()
@@ -174,11 +388,16 @@ impl Store {
     /// (enrolling/removing a passkey), a crash mid-write must never leave a
     /// half-written file — a half-written keystore would be permanent lockout.
     pub fn save_keystore(&self, ks: &KeystoreFile) -> StoreResult<()> {
+        let state = ks.state_metadata().ok_or_else(|| {
+            "legacy keystore must be recovered before it can be saved".to_string()
+        })?;
+        self.check_state_transition(state)?;
         let bytes = ks.to_bytes().map_err(err)?;
         let final_path = self.keystore_path();
         let tmp = self.data_dir.join("keystore.fsk.tmp");
         write_private_atomic(&tmp, &final_path, &bytes)?;
         harden_file(&final_path);
+        self.commit_state(state)?;
         Ok(())
     }
 
@@ -189,7 +408,27 @@ impl Store {
             MAX_KEYSTORE_FILE_LEN,
             "keystore file",
         )?;
-        KeystoreFile::from_bytes(&bytes).map_err(err)
+        let ks = KeystoreFile::from_bytes(&bytes).map_err(err)?;
+        let state = ks
+            .state_metadata()
+            .ok_or_else(|| "keystore has no rollback-protection metadata".to_string())?;
+        self.accept_state(state, &self.keystore_path())?;
+        Ok(ks)
+    }
+
+    /// Explicit one-time recovery for a valid pre-anchor keystore. The supplied
+    /// passphrase authenticates the legacy state; success immediately replaces
+    /// it with a signed epoch-1 v3 keystore and establishes its high-water
+    /// anchor. Normal [`Self::load_keystore`] never performs this implicitly.
+    pub fn recover_legacy_keystore(&self, passphrase: &[u8]) -> StoreResult<KeystoreFile> {
+        let bytes = read_bounded_file(
+            &self.keystore_path(),
+            MAX_KEYSTORE_FILE_LEN,
+            "keystore file",
+        )?;
+        let ks = KeystoreFile::recover_legacy(&bytes, passphrase).map_err(err)?;
+        self.save_keystore(&ks)?;
+        Ok(ks)
     }
 
     /// Save an arbitrary blob as a single-file container encrypted to self.
@@ -220,7 +459,7 @@ impl Store {
         identity: &Identity,
         path: &Path,
         name: &str,
-    ) -> StoreResult<Option<Vec<u8>>> {
+    ) -> StoreResult<Option<(Vec<u8>, SuiteId)>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -235,58 +474,183 @@ impl Store {
             return Err("stored metadata blob is too large".to_string());
         }
         let bytes = reader.read_entry(name).map_err(err)?;
-        Ok(Some(bytes.to_vec()))
+        Ok(Some((bytes.to_vec(), reader.suite())))
+    }
+
+    fn save_protected_blob<T: Serialize>(
+        &self,
+        identity: &Identity,
+        path: &Path,
+        entry_name: &str,
+        object_type: StateObjectType,
+        object_id: &str,
+        payload: &T,
+    ) -> StoreResult<()> {
+        let payload_bytes = filesec_core::codec::to_vec(payload).map_err(err)?;
+        let previous = self.current_anchor(identity.fingerprint(), object_type, object_id)?;
+        let state = StateMetadata::next(
+            identity.fingerprint(),
+            object_type,
+            object_id,
+            self_suite(identity).to_u16(),
+            previous.as_ref(),
+            &payload_bytes,
+        )
+        .map_err(err)?;
+        let record = ProtectedState {
+            version: PROTECTED_STATE_VERSION,
+            state: state.clone(),
+            payload,
+        };
+        let bytes = filesec_core::codec::to_vec(&record).map_err(err)?;
+        self.save_blob(identity, path, entry_name, &bytes)?;
+        self.commit_state(&state)
+    }
+
+    fn load_protected_blob<T: DeserializeOwned + Serialize>(
+        &self,
+        identity: &Identity,
+        path: &Path,
+        entry_name: &str,
+        object_type: StateObjectType,
+        object_id: &str,
+    ) -> StoreResult<Option<T>> {
+        let Some((bytes, suite)) = self.load_blob(identity, path, entry_name)? else {
+            return Ok(None);
+        };
+        let record: ProtectedState<T> = match filesec_core::codec::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(_) => {
+                if filesec_core::codec::from_slice::<T>(&bytes).is_ok() {
+                    return Err(format!(
+                        "legacy {object_type} state requires explicit recovery"
+                    ));
+                }
+                return Err(format!("malformed protected {object_type} state"));
+            }
+        };
+        if record.version != PROTECTED_STATE_VERSION
+            || record.state.identity_fingerprint != identity.fingerprint()
+            || record.state.object_type != object_type
+            || record.state.object_id != object_id
+            || record.state.suite_id != suite.to_u16()
+        {
+            let _ = self.quarantine(path);
+            return Err(format!(
+                "state-anchor mismatch for {object_type} {object_id}"
+            ));
+        }
+        let payload_bytes = filesec_core::codec::to_vec(&record.payload).map_err(err)?;
+        if let Err(e) = record.state.verify_payload(&payload_bytes) {
+            let _ = self.quarantine(path);
+            return Err(err(e));
+        }
+        self.accept_state(&record.state, path)?;
+        Ok(Some(record.payload))
     }
 
     /// Load the contact book (empty if none yet).
     pub fn load_contacts(&self, identity: &Identity) -> StoreResult<ContactBook> {
-        match self.load_blob(identity, &self.contacts_path(), CONTACTS_BLOB)? {
-            Some(bytes) => ContactBook::from_bytes(&bytes).map_err(err),
-            None => Ok(ContactBook::default()),
-        }
+        Ok(self
+            .load_protected_blob(
+                identity,
+                &self.contacts_path(),
+                CONTACTS_BLOB,
+                StateObjectType::Contacts,
+                "contacts",
+            )?
+            .unwrap_or_default())
     }
 
     /// Persist the contact book.
     pub fn save_contacts(&self, identity: &Identity, book: &ContactBook) -> StoreResult<()> {
-        let bytes = book.to_bytes().map_err(err)?;
-        self.save_blob(identity, &self.contacts_path(), CONTACTS_BLOB, &bytes)
+        self.save_protected_blob(
+            identity,
+            &self.contacts_path(),
+            CONTACTS_BLOB,
+            StateObjectType::Contacts,
+            "contacts",
+            book,
+        )
     }
 
     /// Load the vault registry (empty if none yet).
     pub fn load_registry(&self, identity: &Identity) -> StoreResult<Registry> {
-        match self.load_blob(identity, &self.index_path(), REGISTRY_BLOB)? {
-            Some(bytes) => filesec_core::codec::from_slice(&bytes).map_err(err),
-            None => Ok(Registry::default()),
-        }
+        Ok(self
+            .load_protected_blob(
+                identity,
+                &self.index_path(),
+                REGISTRY_BLOB,
+                StateObjectType::Registry,
+                "registry",
+            )?
+            .unwrap_or_default())
     }
 
     /// Persist the vault registry.
     pub fn save_registry(&self, identity: &Identity, registry: &Registry) -> StoreResult<()> {
-        let bytes = filesec_core::codec::to_vec(registry).map_err(err)?;
-        self.save_blob(identity, &self.index_path(), REGISTRY_BLOB, &bytes)
+        self.save_protected_blob(
+            identity,
+            &self.index_path(),
+            REGISTRY_BLOB,
+            StateObjectType::Registry,
+            "registry",
+            registry,
+        )
+    }
+
+    /// Explicitly authenticate and migrate a legacy contact book, immediately
+    /// writing it back as epoch-1 rollback-protected state.
+    pub fn recover_legacy_contacts(&self, identity: &Identity) -> StoreResult<ContactBook> {
+        let book = match self.load_blob(identity, &self.contacts_path(), CONTACTS_BLOB)? {
+            Some((bytes, _)) => ContactBook::from_bytes(&bytes).map_err(err)?,
+            None => ContactBook::default(),
+        };
+        self.save_contacts(identity, &book)?;
+        Ok(book)
+    }
+
+    /// Explicitly authenticate and migrate a legacy vault registry, immediately
+    /// writing it back as epoch-1 rollback-protected state.
+    pub fn recover_legacy_registry(&self, identity: &Identity) -> StoreResult<Registry> {
+        let registry = match self.load_blob(identity, &self.index_path(), REGISTRY_BLOB)? {
+            Some((bytes, _)) => filesec_core::codec::from_slice(&bytes).map_err(err)?,
+            None => Registry::default(),
+        };
+        self.save_registry(identity, &registry)?;
+        Ok(registry)
     }
 
     /// Persist a (typically new) vault to its local v2 store directory, encrypted
     /// to the identity itself under the identity's at-rest suite.
     pub fn save_vault(&self, identity: &Identity, id: &str, vault: &Vault) -> StoreResult<()> {
         let dir = self.vault_dir_v2(id);
-        // Start from a clean directory: vault ids are random so this is normally a
-        // no-op, but it makes an overwrite well-defined (no stale blobs linger).
-        let _ = std::fs::remove_dir_all(&dir);
-        VaultReaderV2::from_vault(&dir, identity, self_suite(identity), vault).map_err(err)?;
+        if dir.exists() {
+            return Err("vault already exists; use the rollback-aware mutation APIs".into());
+        }
+        let reader = VaultReaderV2::from_vault_with_object_id(
+            &dir,
+            identity,
+            self_suite(identity),
+            vault,
+            id,
+        )
+        .map_err(err)?;
+        let state = reader
+            .state_metadata()
+            .ok_or_else(|| "new vault has no rollback-protection metadata".to_string())?;
+        self.commit_state(state)?;
         Ok(())
     }
 
     /// Load a vault fully into memory (used by tests and any caller needing the
-    /// whole plaintext). Opens the vault — migrating a legacy v1 container to v2
-    /// if needed — and decrypts every file.
+    /// whole plaintext). Legacy state must first pass the explicit recovery flow.
     pub fn load_vault(&self, identity: &Identity, id: &str) -> StoreResult<Vault> {
         self.open_vault(identity, id)?.to_vault().map_err(err)
     }
 
-    /// Lazily open a vault (metadata only; file contents decrypt on demand). A
-    /// legacy v1 `.fsec` container is transparently migrated to the v2 directory
-    /// format on first open (crash-safe; see [`Self::migrate_vault_v1_to_v2`]).
+    /// Lazily open a rollback-protected vault (metadata only; file contents
+    /// decrypt on demand). Legacy state returns a recovery-required error.
     pub fn open_vault(&self, identity: &Identity, id: &str) -> StoreResult<VaultReaderV2> {
         let v2 = self.vault_dir_v2(id);
         if v2.exists() {
@@ -296,16 +660,26 @@ impl Store {
             if v1.exists() {
                 let _ = secure_wipe(&v1);
             }
-            return VaultReaderV2::open(&v2, identity).map_err(err);
+            let reader = VaultReaderV2::open(&v2, identity).map_err(err)?;
+            let state = reader
+                .state_metadata()
+                .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+            if state.object_id != id {
+                let _ = self.quarantine(&v2);
+                return Err("vault object id does not match its registry/path id".into());
+            }
+            self.accept_state(state, &v2)?;
+            return Ok(reader);
         }
         if self.vault_path(id).exists() {
-            self.migrate_vault_v1_to_v2(identity, id)?;
-            return VaultReaderV2::open(&v2, identity).map_err(err);
+            return Err(
+                "legacy local vault requires explicit recovery before it can be opened".to_string(),
+            );
         }
         Err(format!("vault not found: {id}"))
     }
 
-    /// Crash-safe lazy migration of a legacy v1 `.fsec` vault to the v2 directory
+    /// Crash-safe explicit migration of a legacy v1 `.fsec` vault to the v2 directory
     /// format. The fully-written `<id>.fsv2.partial` dir is renamed to `<id>.fsv2`
     /// (the atomic commit point) before the old `.fsec` is wiped, so a crash
     /// before the rename keeps the v1 file intact (and the stray `.partial` is
@@ -316,19 +690,87 @@ impl Store {
         let final_dir = self.vault_dir_v2(id);
         let partial = self.vaults_dir.join(format!("{id}.fsv2.partial"));
         let _ = std::fs::remove_dir_all(&partial);
-        let reader = format::open_vault_from_path(&v1, identity).map_err(err)?;
-        if let Err(e) =
-            VaultReaderV2::from_reader_v1(&partial, identity, self_suite(identity), &reader)
-        {
-            let _ = std::fs::remove_dir_all(&partial);
-            return Err(err(e));
+        let (reader, sender) = format::verify_and_open(&v1, identity).map_err(err)?;
+        if sender.fingerprint != identity.fingerprint() {
+            return Err("legacy local vault was not signed by this identity".into());
         }
+        let migrated = match VaultReaderV2::from_reader_v1_with_object_id(
+            &partial,
+            identity,
+            self_suite(identity),
+            &reader,
+            id,
+        ) {
+            Ok(reader) => reader,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&partial);
+                return Err(err(e));
+            }
+        };
+        let state = migrated
+            .state_metadata()
+            .cloned()
+            .ok_or_else(|| "migrated vault has no rollback-protection metadata".to_string())?;
+        drop(migrated);
         std::fs::rename(&partial, &final_dir).map_err(err)?;
         if let Ok(d) = std::fs::File::open(&self.vaults_dir) {
             let _ = d.sync_all();
         }
         let _ = secure_wipe(&v1);
+        self.commit_state(&state)?;
         Ok(())
+    }
+
+    /// Explicit one-time recovery for a legacy local vault. A legacy v2 raw
+    /// manifest is authenticated and re-enveloped in place; a signed local v1
+    /// container is verified and transcoded to a protected v2 directory.
+    pub fn recover_legacy_vault(
+        &self,
+        identity: &Identity,
+        id: &str,
+    ) -> StoreResult<VaultReaderV2> {
+        let v2 = self.vault_dir_v2(id);
+        if v2.exists() {
+            let legacy = match VaultReaderV2::recover_legacy(&v2, identity) {
+                Ok(reader) => reader,
+                Err(filesec_core::Error::Format(
+                    "vault manifest is already rollback protected",
+                )) => VaultReaderV2::open(&v2, identity).map_err(err)?,
+                Err(e) => return Err(err(e)),
+            };
+            let vault = legacy.to_vault().map_err(err)?;
+            drop(legacy);
+            let partial = self.vaults_dir.join(format!("{id}.fsv2.partial"));
+            let old = self.vaults_dir.join(format!("{id}.fsv2.old"));
+            let _ = std::fs::remove_dir_all(&partial);
+            let _ = std::fs::remove_dir_all(&old);
+            let reader = VaultReaderV2::from_vault_with_object_id(
+                &partial,
+                identity,
+                self_suite(identity),
+                &vault,
+                id,
+            )
+            .map_err(err)?;
+            let state = reader
+                .state_metadata()
+                .cloned()
+                .ok_or_else(|| "recovered vault has no rollback-protection metadata".to_string())?;
+            drop(reader);
+            std::fs::rename(&v2, &old).map_err(err)?;
+            if let Err(e) = std::fs::rename(&partial, &v2) {
+                let _ = std::fs::rename(&old, &v2);
+                return Err(err(e));
+            }
+            wipe_vault_dir(&old);
+            self.commit_state(&state)?;
+            return self.open_vault(identity, id);
+        }
+        if self.vault_path(id).exists() {
+            self.migrate_vault_v1_to_v2(identity, id)?;
+            return self.open_vault(identity, id);
+        }
+        Err(format!("vault not found: {id}"))
     }
 
     /// Best-effort cleanup, on unlock, of interrupted vault-migration scratch
@@ -371,11 +813,13 @@ impl Store {
         let mut writer = reader.clone();
         for d in added_dirs {
             writer.mkdir(d).map_err(err)?;
+            self.commit_vault_reader(&writer)?;
         }
         for f in added {
             writer
                 .put_file(&f.vault_path, &f.source, f.mtime, f.mode)
                 .map_err(err)?;
+            self.commit_vault_reader(&writer)?;
         }
         Ok(())
     }
@@ -393,6 +837,7 @@ impl Store {
         let mut writer = reader.clone();
         for p in remove {
             writer.remove_path(p).map_err(err)?;
+            self.commit_vault_reader(&writer)?;
         }
         Ok(())
     }
@@ -412,6 +857,7 @@ impl Store {
         let mut writer = reader.clone();
         for (from, to) in pairs {
             writer.rename(from, to).map_err(err)?;
+            self.commit_vault_reader(&writer)?;
         }
         Ok(())
     }
@@ -432,6 +878,7 @@ impl Store {
         writer
             .put_file_bytes(vault_path, bytes, mtime, None)
             .map_err(err)?;
+        self.commit_vault_reader(&writer)?;
         Ok(())
     }
 
@@ -455,6 +902,7 @@ impl Store {
         writer
             .put_file(vault_path, new_source, mtime, mode)
             .map_err(err)?;
+        self.commit_vault_reader(&writer)?;
         Ok(())
     }
 
@@ -469,11 +917,20 @@ impl Store {
     ) -> StoreResult<()> {
         let dir = self.vault_dir_v2(id);
         let _ = std::fs::remove_dir_all(&dir);
-        if let Err(e) = VaultReaderV2::from_reader_v1(&dir, identity, self_suite(identity), reader)
-        {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(err(e));
-        }
+        let imported = match VaultReaderV2::from_reader_v1_with_object_id(
+            &dir,
+            identity,
+            self_suite(identity),
+            reader,
+            id,
+        ) {
+            Ok(reader) => reader,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(err(e));
+            }
+        };
+        self.commit_vault_reader(&imported)?;
         Ok(())
     }
 
@@ -595,12 +1052,21 @@ impl Store {
     /// classical vault here; hardening to the hybrid suite is what re-establishes
     /// confidentiality from the old fingerprint.)
     #[cfg(feature = "pqc")]
-    fn reencrypt_v2_vaults(&self, opener: &Identity, suite: SuiteId) -> StoreResult<()> {
+    fn reencrypt_v2_vaults(
+        &self,
+        opener: &Identity,
+        recipient: &Identity,
+        suite: SuiteId,
+    ) -> StoreResult<()> {
         for dir in self.v2_vault_dirs() {
             let current = VaultReaderV2::open(&dir, opener).map_err(err)?;
             if current.suite() == suite {
                 continue;
             }
+            let object_id = current
+                .state_metadata()
+                .map(|state| state.object_id.clone())
+                .ok_or_else(|| "vault has no rollback metadata".to_string())?;
             let vault = current.to_vault().map_err(err)?;
             drop(current);
             let mut partial = dir.clone().into_os_string();
@@ -610,15 +1076,48 @@ impl Store {
             old.push(".old");
             let old = PathBuf::from(old);
             let _ = std::fs::remove_dir_all(&partial);
-            if let Err(e) = VaultReaderV2::from_vault(&partial, opener, suite, &vault) {
-                let _ = std::fs::remove_dir_all(&partial);
-                return Err(err(e));
-            }
+            let replacement = match VaultReaderV2::from_vault_with_object_id(
+                &partial, recipient, suite, &vault, &object_id,
+            ) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&partial);
+                    return Err(err(e));
+                }
+            };
+            let state = replacement
+                .state_metadata()
+                .cloned()
+                .ok_or_else(|| "re-keyed vault has no rollback metadata".to_string())?;
+            drop(replacement);
             std::fs::rename(&dir, &old).map_err(err)?;
             std::fs::rename(&partial, &dir).map_err(err)?;
             let _ = std::fs::remove_dir_all(&old);
+            self.commit_state(&state)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "pqc")]
+    fn authorize_identity_anchor_migration(
+        &self,
+        old: &Identity,
+        new: &Identity,
+    ) -> StoreResult<()> {
+        // The PQ upgrade is an identity continuation only when both classical
+        // long-term keys are byte-for-byte unchanged. This prevents this narrow
+        // recovery hook from clearing another identity's high-water history.
+        if old.sign_public() != new.sign_public() || old.kem_public() != new.kem_public() {
+            return Err("identity migration changed the classical identity keys".into());
+        }
+        let _guard = self
+            .anchor_lock
+            .lock()
+            .map_err(|_| "state anchor lock is unavailable".to_string())?;
+        let mut set = self.load_anchor_set_locked()?;
+        set.anchors
+            .retain(|anchor| anchor.identity_fingerprint != old.fingerprint());
+        self.save_anchor_set_locked(&set)
     }
 
     /// Migrate a classical identity to a hybrid (post-quantum) one, re-encrypting
@@ -655,6 +1154,8 @@ impl Store {
             return Err("this identity is already post-quantum".to_string());
         }
         let new = old.upgraded_to_hybrid().map_err(err)?;
+        let contacts = self.load_contacts(old)?;
+        let registry = self.load_registry(old)?;
 
         // 1. Bridge: classical suite, addressed to both identities.
         let bridge = [old.public(), new.public()];
@@ -664,9 +1165,13 @@ impl Store {
         };
         self.reencrypt_all(old, &bridge, &classic)?;
 
-        // 2. Commit: the keystore now holds the hybrid identity.
+        // 2. Commit: explicitly transition the anchor namespace, then put the
+        // keystore and metadata under the continued hybrid identity.
+        self.authorize_identity_anchor_migration(old, &new)?;
         let ks = KeystoreFile::create(&new, passphrase, kdf).map_err(err)?;
         self.save_keystore(&ks)?;
+        self.save_contacts(&new, &contacts)?;
+        self.save_registry(&new, &registry)?;
 
         // 3. Harden: hybrid suite, addressed to the new identity only.
         let new_only = [new.public()];
@@ -677,10 +1182,60 @@ impl Store {
         self.reencrypt_all(&new, &new_only, &hybrid)?;
         // v2 vault directories aren't `.fsec` files, so `reencrypt_all` skipped
         // them; re-key each to the new hybrid suite (addressed to `new`).
-        self.reencrypt_v2_vaults(&new, SuiteId::Hybrid)?;
+        self.reencrypt_v2_vaults(old, &new, SuiteId::Hybrid)?;
 
         Ok(new)
     }
+}
+
+fn select_anchor_backend(data_dir: &Path, account: &str) -> StoreResult<AnchorBackend> {
+    let marker = data_dir.join(ANCHORS_BACKEND_FILE);
+    let remembered = std::fs::read_to_string(&marker).ok();
+    let (backend, secure_anchor_exists) = match remembered.as_deref().map(str::trim) {
+        Some("secure-v1") => {
+            // A store that established secure anchors must fail closed if the
+            // platform keychain later becomes unavailable. Silently switching to
+            // a new empty file anchor would make every rollback look like genesis.
+            let exists = crate::autounlock::load_state_anchors(account)
+                .map_err(err)?
+                .is_some();
+            (AnchorBackend::SecureStorage, Some(exists))
+        }
+        Some("degraded-v1") => (AnchorBackend::DegradedFile, None),
+        Some(_) => return Err("unsupported state anchor backend marker".into()),
+        None => match crate::autounlock::load_state_anchors(account) {
+            Ok(anchors) => (AnchorBackend::SecureStorage, Some(anchors.is_some())),
+            Err(_) => (AnchorBackend::DegradedFile, None),
+        },
+    };
+    if backend == AnchorBackend::SecureStorage
+        && secure_anchor_exists == Some(false)
+        && keystore_is_v3(&data_dir.join(KEYSTORE_FILE))
+    {
+        return Err(
+            "rollback-protection anchors are missing from OS secure storage; refusing to trust existing v3 state"
+                .into(),
+        );
+    }
+    if remembered.is_none() {
+        let value = match backend {
+            AnchorBackend::SecureStorage => b"secure-v1\n".as_slice(),
+            AnchorBackend::DegradedFile => b"degraded-v1\n".as_slice(),
+        };
+        let tmp = data_dir.join(".state-anchor-backend.tmp");
+        write_private_atomic(&tmp, &marker, value)?;
+    }
+    Ok(backend)
+}
+
+fn keystore_is_v3(path: &Path) -> bool {
+    use std::io::Read;
+    let mut prefix = [0u8; 6];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_ok()
+        && &prefix[..4] == b"FSK\x1a"
+        && u16::from_be_bytes([prefix[4], prefix[5]]) == 3
 }
 
 /// Write `contents` to a user-chosen `path` with owner-only permissions (0600
@@ -970,6 +1525,68 @@ mod tests {
             .load_registry(&identity)
             .unwrap_err()
             .contains("too large"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_contacts_and_registry_require_explicit_recovery() {
+        let dir = tmp("legacy-metadata");
+        let store = Store::at(&dir).unwrap();
+        let identity = Identity::generate("Alice", 0).unwrap();
+        let mut contacts = ContactBook::default();
+        contacts.upsert(Identity::generate("Bob", 0).unwrap().public(), 1);
+        store
+            .save_blob(
+                &identity,
+                &store.contacts_path(),
+                CONTACTS_BLOB,
+                &contacts.to_bytes().unwrap(),
+            )
+            .unwrap();
+        let mut registry = Registry::default();
+        registry.upsert(VaultMeta {
+            id: "legacy".into(),
+            name: "Legacy".into(),
+            created_at: 1,
+            modified_at: 1,
+            file_count: 0,
+            total_size: 0,
+        });
+        store
+            .save_blob(
+                &identity,
+                &store.index_path(),
+                REGISTRY_BLOB,
+                &filesec_core::codec::to_vec(&registry).unwrap(),
+            )
+            .unwrap();
+
+        assert!(store
+            .load_contacts(&identity)
+            .unwrap_err()
+            .contains("legacy"));
+        assert!(store
+            .load_registry(&identity)
+            .unwrap_err()
+            .contains("legacy"));
+        assert_eq!(
+            store
+                .recover_legacy_contacts(&identity)
+                .unwrap()
+                .contacts
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .recover_legacy_registry(&identity)
+                .unwrap()
+                .vaults
+                .len(),
+            1
+        );
+        assert_eq!(store.load_contacts(&identity).unwrap().contacts.len(), 1);
+        assert_eq!(store.load_registry(&identity).unwrap().vaults.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

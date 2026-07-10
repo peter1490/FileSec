@@ -133,6 +133,9 @@ struct Unlock {
     /// Whether a passphrase is saved in the OS keychain for this data dir, so the
     /// unlock screen can offer "unlock with saved passphrase (this device)".
     has_saved: bool,
+    /// A valid pre-anchor keystore was found. The UI changes the normal unlock
+    /// action into an explicit one-time recovery/upgrade confirmation.
+    legacy_recovery: bool,
     error: Option<String>,
 }
 
@@ -140,14 +143,20 @@ impl Unlock {
     /// Build the unlock screen state, noting whether the keystore has passkeys
     /// and whether a passphrase is saved in the OS keychain for this device.
     fn for_store(store: &Store) -> Self {
+        let recovery_pending = store.data_dir().join(".legacy-recovery-pending").exists();
+        let (has_passkeys, legacy_recovery) = match store.load_keystore() {
+            Ok(keystore) => (keystore.has_passkeys(), recovery_pending),
+            Err(error) if error.contains("legacy state requires explicit recovery") => {
+                (false, true)
+            }
+            Err(_) => (false, false),
+        };
         Self {
             pass: String::new(),
             pin: String::new(),
-            has_passkeys: store
-                .load_keystore()
-                .map(|k| k.has_passkeys())
-                .unwrap_or(false),
+            has_passkeys,
             has_saved: autounlock::is_saved(&store.data_dir().display().to_string()),
+            legacy_recovery,
             error: None,
         }
     }
@@ -410,6 +419,7 @@ struct Session {
     /// The open "export identity backup" dialog, if any.
     export_identity: Option<ExportIdentityForm>,
     data_dir: String,
+    rollback_warning: Option<String>,
     /// Direct network-transfer state (the `net` feature).
     #[cfg(feature = "net")]
     transfer: TransferState,
@@ -423,6 +433,7 @@ impl Session {
         passkeys: Vec<PasskeyInfo>,
         auto_unlock: bool,
         data_dir: String,
+        rollback_warning: Option<String>,
     ) -> Self {
         Self {
             identity,
@@ -462,6 +473,7 @@ impl Session {
             auto_unlock_form: None,
             export_identity: None,
             data_dir,
+            rollback_warning,
             #[cfg(feature = "net")]
             transfer: TransferState::default(),
         }
@@ -778,6 +790,7 @@ struct SessionInit {
     /// Whether a passphrase is saved in the OS keychain for this data dir.
     auto_unlock: bool,
     data_dir: String,
+    rollback_warning: Option<String>,
 }
 
 /// Result of importing a `.fsec` container (sender trust is resolved on the UI
@@ -1168,6 +1181,7 @@ impl App {
                     passkeys,
                     auto_unlock,
                     data_dir,
+                    rollback_warning,
                 } = *init;
                 self.state = State::Unlocked(Box::new(Session::new(
                     Arc::new(identity),
@@ -1176,6 +1190,7 @@ impl App {
                     passkeys,
                     auto_unlock,
                     data_dir,
+                    rollback_warning,
                 )));
             }
             Outcome::FirstRunFailed(msg) => {
@@ -1804,6 +1819,7 @@ impl App {
                     // A brand-new identity has nothing saved in the keychain yet.
                     auto_unlock: false,
                     data_dir,
+                    rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
                 "Identity created. Your keys are protected by your passphrase.",
             )
@@ -1811,11 +1827,14 @@ impl App {
     }
 
     fn spawn_unlock(&mut self, ctx: &egui::Context) {
-        let pass = match &mut self.state {
+        let (pass, legacy_recovery) = match &mut self.state {
             State::Unlock(u) => {
                 u.error = None;
                 // Wiped after the worker uses it (see `spawn_create_identity`).
-                Zeroizing::new(std::mem::take(&mut u.pass))
+                (
+                    Zeroizing::new(std::mem::take(&mut u.pass)),
+                    u.legacy_recovery,
+                )
             }
             _ => return,
         };
@@ -1823,8 +1842,27 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        self.spawn_job(ctx, "Unlocking…", move || {
-            let ks = match store.load_keystore() {
+        let label = if legacy_recovery {
+            "Recovering and upgrading local state…"
+        } else {
+            "Unlocking…"
+        };
+        self.spawn_job(ctx, label, move || {
+            let recovery_marker = store.data_dir().join(".legacy-recovery-pending");
+            if legacy_recovery {
+                let _ = std::fs::write(&recovery_marker, b"FileSec legacy recovery v1\n");
+            }
+            let ks = match if legacy_recovery {
+                match store.load_keystore() {
+                    Ok(keystore) => Ok(keystore),
+                    Err(e) if e.contains("legacy state requires explicit recovery") => {
+                        store.recover_legacy_keystore(pass.as_bytes())
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                store.load_keystore()
+            } {
                 Ok(k) => k,
                 Err(e) => {
                     return JobReport {
@@ -1842,14 +1880,82 @@ impl App {
                     }
                 }
             };
-            let contacts = store.load_contacts(&identity).unwrap_or_default();
-            let registry = store.load_registry(&identity).unwrap_or_default();
+            let contacts = match store.load_contacts(&identity) {
+                Ok(contacts) => contacts,
+                Err(e) if legacy_recovery && e.contains("legacy") => {
+                    match store.recover_legacy_contacts(&identity) {
+                        Ok(contacts) => contacts,
+                        Err(e) => {
+                            return JobReport {
+                                outcome: Outcome::UnlockFailed(e),
+                                toast: None,
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
+            let registry = match store.load_registry(&identity) {
+                Ok(registry) => registry,
+                Err(e) if legacy_recovery && e.contains("legacy") => {
+                    match store.recover_legacy_registry(&identity) {
+                        Ok(registry) => registry,
+                        Err(e) => {
+                            return JobReport {
+                                outcome: Outcome::UnlockFailed(e),
+                                toast: None,
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
+            if legacy_recovery {
+                for meta in &registry.vaults {
+                    match store.open_vault(&identity, &meta.id) {
+                        Ok(_) => {}
+                        Err(e) if e.contains("legacy") => {
+                            if let Err(e) = store.recover_legacy_vault(&identity, &meta.id) {
+                                return JobReport {
+                                    outcome: Outcome::UnlockFailed(format!(
+                                        "Could not recover vault \"{}\": {e}",
+                                        meta.name
+                                    )),
+                                    toast: None,
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            return JobReport {
+                                outcome: Outcome::UnlockFailed(format!(
+                                    "Could not validate vault \"{}\": {e}",
+                                    meta.name
+                                )),
+                                toast: None,
+                            }
+                        }
+                    }
+                }
+            }
             let passkeys = ks.passkey_slots();
             let data_dir = store.data_dir().display().to_string();
             // Securely wipe any checkout temp files orphaned by a prior crash,
             // plus any vault-migration scratch dirs left behind by a crash.
             store.clean_checkout_dir();
             store.clean_partial_dirs();
+            if legacy_recovery {
+                let _ = std::fs::remove_file(&recovery_marker);
+            }
             JobReport::ok(
                 Outcome::Unlocked(Box::new(SessionInit {
                     identity,
@@ -1858,8 +1964,13 @@ impl App {
                     passkeys,
                     auto_unlock: autounlock::is_saved(&data_dir),
                     data_dir,
+                    rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
-                "Unlocked.",
+                if legacy_recovery {
+                    "Legacy local state recovered and upgraded with rollback protection."
+                } else {
+                    "Unlocked."
+                },
             )
         });
     }
@@ -1921,8 +2032,24 @@ impl App {
                 };
                 match ks.unlock_with_passkey(i, &secret) {
                     Ok(identity) => {
-                        let contacts = store.load_contacts(&identity).unwrap_or_default();
-                        let registry = store.load_registry(&identity).unwrap_or_default();
+                        let contacts = match store.load_contacts(&identity) {
+                            Ok(contacts) => contacts,
+                            Err(e) => {
+                                return JobReport {
+                                    outcome: Outcome::UnlockFailed(e),
+                                    toast: None,
+                                }
+                            }
+                        };
+                        let registry = match store.load_registry(&identity) {
+                            Ok(registry) => registry,
+                            Err(e) => {
+                                return JobReport {
+                                    outcome: Outcome::UnlockFailed(e),
+                                    toast: None,
+                                }
+                            }
+                        };
                         let passkeys = ks.passkey_slots();
                         let data_dir = store.data_dir().display().to_string();
                         store.clean_checkout_dir();
@@ -1935,6 +2062,9 @@ impl App {
                                 passkeys,
                                 auto_unlock: autounlock::is_saved(&data_dir),
                                 data_dir,
+                                rollback_warning: store
+                                    .rollback_protection_warning()
+                                    .map(str::to_string),
                             })),
                             "Unlocked with your security key.",
                         );
@@ -2022,12 +2152,16 @@ impl App {
             Some(s) => s,
             None => return,
         };
+        let identity = match self.ident_arc() {
+            Some(identity) => identity,
+            None => return,
+        };
         self.spawn_job(ctx, "Removing security key…", move || {
             let mut ks = match store.load_keystore() {
                 Ok(k) => k,
                 Err(e) => return JobReport::err(e),
             };
-            if let Err(e) = ks.remove_passkey(index) {
+            if let Err(e) = ks.remove_passkey(index, &identity) {
                 return JobReport::err(e.to_string());
             }
             if let Err(e) = store.save_keystore(&ks) {
@@ -2095,8 +2229,24 @@ impl App {
                     };
                 }
             };
-            let contacts = store.load_contacts(&identity).unwrap_or_default();
-            let registry = store.load_registry(&identity).unwrap_or_default();
+            let contacts = match store.load_contacts(&identity) {
+                Ok(contacts) => contacts,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
+            let registry = match store.load_registry(&identity) {
+                Ok(registry) => registry,
+                Err(e) => {
+                    return JobReport {
+                        outcome: Outcome::UnlockFailed(e),
+                        toast: None,
+                    }
+                }
+            };
             let passkeys = ks.passkey_slots();
             store.clean_checkout_dir();
             store.clean_partial_dirs();
@@ -2108,6 +2258,7 @@ impl App {
                     passkeys,
                     auto_unlock: true,
                     data_dir,
+                    rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
                 "Unlocked from this device.",
             )
@@ -3546,6 +3697,7 @@ impl App {
                     passkeys: Vec::new(),
                     auto_unlock: autounlock::is_saved(&data_dir),
                     data_dir,
+                    rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
                 "Upgraded to post-quantum. Your safety number changed — re-share your \
                  public key so contacts can re-verify it. Re-enroll any security keys.",
@@ -3937,6 +4089,7 @@ impl App {
                     passkeys: Vec::new(),
                     auto_unlock: false,
                     data_dir,
+                    rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
                 "Identity restored. It's now protected by your new passphrase on this device.",
             )
@@ -4924,23 +5077,37 @@ fn unlock_ui(u: &mut Unlock, ui: &mut egui::Ui, action: &mut Option<Action>) {
         ui.add_space(16.0);
 
         theme::card(ui, |ui| {
+            if u.legacy_recovery {
+                ui.label(
+                    RichText::new(
+                        "One-time security upgrade required. FileSec found authenticated local state from before rollback protection was introduced. Enter your passphrase and confirm recovery; the keystore, contacts, registry, and registered vaults will be re-anchored immediately.",
+                    )
+                    .color(c.warn),
+                );
+                ui.add_space(10.0);
+            }
             let resp = theme::text_input(ui, &mut u.pass, "Passphrase", true);
             let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
-            if theme::primary_button_full(ui, "Unlock").clicked() || submit {
+            let button = if u.legacy_recovery {
+                "Recover and upgrade local state"
+            } else {
+                "Unlock"
+            };
+            if theme::primary_button_full(ui, button).clicked() || submit {
                 *action = Some(Action::Unlock);
             }
 
             // Security-key (passkey) unlock, when one is enrolled and this build
             // supports the hardware.
-            if u.has_passkeys && passkey::SUPPORTED {
+            if !u.legacy_recovery && u.has_passkeys && passkey::SUPPORTED {
                 theme::divider_or(ui);
                 theme::text_input(ui, &mut u.pin, "Security-key PIN (if set)", true);
                 ui.add_space(6.0);
                 if theme::secondary_button_full(ui, "🔑  Unlock with security key").clicked() {
                     *action = Some(Action::UnlockWithPasskey);
                 }
-            } else if u.has_passkeys {
+            } else if !u.legacy_recovery && u.has_passkeys {
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(
@@ -4954,13 +5121,13 @@ fn unlock_ui(u: &mut Unlock, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
             // Saved-passphrase (OS keychain) unlock, when one is stored for this
             // device and this build can read it.
-            if u.has_saved && autounlock::SUPPORTED {
+            if !u.legacy_recovery && u.has_saved && autounlock::SUPPORTED {
                 theme::divider_or(ui);
                 if theme::secondary_button_full(ui, "🔓  Unlock with saved passphrase").clicked()
                 {
                     *action = Some(Action::UnlockWithKeyring);
                 }
-            } else if u.has_saved {
+            } else if !u.legacy_recovery && u.has_saved {
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(
@@ -6243,6 +6410,16 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                     .small(),
             );
         });
+
+        if let Some(warning) = &s.rollback_warning {
+            theme::banner(ui, cc.warn, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(theme::icon_text(theme::icon::WARNING, 16.0).color(cc.warn));
+                    ui.label(RichText::new(warning).color(cc.warn));
+                });
+            });
+            ui.add_space(8.0);
+        }
 
         // Identity backup: a portable, passphrase-encrypted copy of the private
         // keys, for restoring on another device or after a reinstall.
@@ -8193,6 +8370,7 @@ mod ui_smoke {
             Vec::new(),
             false,
             "/tmp/filesec-ui-test".to_string(),
+            None,
         )
     }
 
@@ -8372,6 +8550,7 @@ mod ui_smoke {
             Vec::new(),
             false,
             dir.display().to_string(),
+            None,
         );
         s.open = Some(OpenVault {
             id: vid.clone(),

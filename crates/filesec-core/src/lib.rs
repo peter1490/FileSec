@@ -36,6 +36,7 @@ pub mod mldsa;
 pub mod mlkem;
 pub mod secret;
 pub mod sign;
+pub mod state;
 pub mod suite;
 #[cfg(feature = "net")]
 pub mod transport;

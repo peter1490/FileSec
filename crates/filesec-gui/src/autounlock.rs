@@ -27,6 +27,9 @@ use zeroize::Zeroizing;
 /// Service name FileSec registers under in the OS keychain. Stable, so a saved
 /// secret is found again on the next launch.
 pub const SERVICE: &str = "dev.FileSec.FileSec";
+/// Separate keychain service for rollback high-water anchors. Anchors are
+/// non-secret but must be protected from local filesystem rollback/deletion.
+pub const ANCHOR_SERVICE: &str = "dev.FileSec.FileSec.StateAnchors";
 
 /// Whether this build was compiled with OS-keychain support (`keyring` feature).
 /// The UI uses this to show/enable the "remember on this device" controls.
@@ -65,7 +68,12 @@ pub fn is_saved(account: &str) -> bool {
 
 #[cfg(feature = "keyring")]
 fn entry(account: &str) -> Result<keyring::Entry, AutoUnlockError> {
-    keyring::Entry::new(SERVICE, account)
+    entry_for(SERVICE, account)
+}
+
+#[cfg(feature = "keyring")]
+fn entry_for(service: &str, account: &str) -> Result<keyring::Entry, AutoUnlockError> {
+    keyring::Entry::new(service, account)
         .map_err(|e| AutoUnlockError::new(format!("the OS keychain is unavailable: {e}")))
 }
 
@@ -103,6 +111,31 @@ pub fn clear(account: &str) -> Result<(), AutoUnlockError> {
     }
 }
 
+/// Load the serialized high-water anchor set from OS secure storage. `None`
+/// means this data directory has not established its first anchor yet.
+#[cfg(feature = "keyring")]
+pub fn load_state_anchors(account: &str) -> Result<Option<Vec<u8>>, AutoUnlockError> {
+    match entry_for(ANCHOR_SERVICE, account)?.get_secret() {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(AutoUnlockError::new(format!(
+            "could not read rollback anchors from the OS keychain: {e}"
+        ))),
+    }
+}
+
+/// Persist the serialized high-water anchor set in OS secure storage.
+#[cfg(feature = "keyring")]
+pub fn save_state_anchors(account: &str, bytes: &[u8]) -> Result<(), AutoUnlockError> {
+    entry_for(ANCHOR_SERVICE, account)?
+        .set_secret(bytes)
+        .map_err(|e| {
+            AutoUnlockError::new(format!(
+                "could not save rollback anchors to the OS keychain: {e}"
+            ))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Inert stubs when the `keyring` feature is off (the default build).
 // ---------------------------------------------------------------------------
@@ -123,5 +156,15 @@ pub fn load(_account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, AutoUnlockErro
 
 #[cfg(not(feature = "keyring"))]
 pub fn clear(_account: &str) -> Result<(), AutoUnlockError> {
+    Err(AutoUnlockError::new(NO_SUPPORT))
+}
+
+#[cfg(not(feature = "keyring"))]
+pub fn load_state_anchors(_account: &str) -> Result<Option<Vec<u8>>, AutoUnlockError> {
+    Err(AutoUnlockError::new(NO_SUPPORT))
+}
+
+#[cfg(not(feature = "keyring"))]
+pub fn save_state_anchors(_account: &str, _bytes: &[u8]) -> Result<(), AutoUnlockError> {
     Err(AutoUnlockError::new(NO_SUPPORT))
 }

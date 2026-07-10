@@ -44,6 +44,7 @@ use crate::format::{hash_path, ContainerPlan, ExportOptions, VaultReader};
 use crate::identity::{Identity, PublicIdentity};
 use crate::manifest::{Entry, EntryKind, Manifest};
 use crate::secret::{ct_eq, random_array, SymKey};
+use crate::state::{StateAnchor, StateMetadata, StateObjectType};
 use crate::suite::SuiteId;
 use crate::vault::{normalize_path, Vault};
 use crate::{aead, codec};
@@ -66,6 +67,10 @@ pub fn is_trashed(path: &str) -> bool {
 }
 /// Current at-rest directory format version.
 const FORMAT_VERSION_V2: u16 = 2;
+/// Version of the rollback-protected manifest envelope stored inside the v2
+/// directory format. The header remains v2 so existing blob AAD stays stable
+/// during explicit in-place recovery.
+const MANIFEST_ENVELOPE_VERSION: u16 = 3;
 /// Upper bound on the plaintext header / sealed manifest reads (untrusted-input guard).
 const MAX_HEADER_LEN: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_LEN: u64 = 512 * 1024 * 1024;
@@ -110,6 +115,17 @@ struct ManifestV2 {
     entries: Vec<EntryV2>,
 }
 
+/// Plaintext framing around the encrypted manifest. `state` is authenticated as
+/// AEAD associated data, while its current hash commits to the decrypted
+/// [`ManifestV2`] bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestEnvelopeV3 {
+    version: u16,
+    state: StateMetadata,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
 fn dir_entry(path: String) -> EntryV2 {
     EntryV2 {
         path,
@@ -150,6 +166,8 @@ pub struct VaultReaderV2 {
     header_bytes: Vec<u8>,
     manifest_key: SymKey,
     manifest: ManifestV2,
+    owner_fingerprint: [u8; 32],
+    state: Option<StateMetadata>,
     /// v1-shaped view of `manifest.entries` (kept in sync), so callers see the
     /// same [`Entry`] type a [`VaultReader`] exposes.
     view: Vec<Entry>,
@@ -172,6 +190,21 @@ fn view_of(manifest: &ManifestV2) -> Vec<Entry> {
         .collect()
 }
 
+fn vault_object_id(header_bytes: &[u8]) -> Result<String> {
+    let header: VaultHeaderV2 = codec::from_slice(header_bytes)?;
+    Ok(crate::util::hex(&header.vault_id))
+}
+
+fn manifest_aad(header_bytes: &[u8], state: &StateMetadata) -> Vec<u8> {
+    let state_aad = state.authenticated_data();
+    let mut aad = Vec::with_capacity(16 + header_bytes.len() + state_aad.len());
+    aad.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    aad.extend_from_slice(header_bytes);
+    aad.extend_from_slice(&(state_aad.len() as u64).to_le_bytes());
+    aad.extend_from_slice(&state_aad);
+    aad
+}
+
 impl VaultReaderV2 {
     /// Create a fresh, empty v2 vault directory.
     pub fn create(
@@ -180,6 +213,46 @@ impl VaultReaderV2 {
         suite: SuiteId,
         vault_name: &str,
         created_at: i64,
+    ) -> Result<Self> {
+        Self::create_inner(
+            dir,
+            identity,
+            suite,
+            vault_name,
+            created_at,
+            random_array::<16>()?,
+        )
+    }
+
+    /// Create a fresh vault whose authenticated object id is the exact
+    /// lowercase-hex `object_id` used by the local registry/path. This prevents a
+    /// different otherwise-valid vault directory from being substituted at that
+    /// path. Direct core users may use [`Self::create`] for a random id instead.
+    pub fn create_with_object_id(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        vault_name: &str,
+        created_at: i64,
+        object_id: &str,
+    ) -> Result<Self> {
+        let decoded = data_encoding::HEXLOWER
+            .decode(object_id.as_bytes())
+            .map_err(|_| Error::Format("vault object id must be lowercase hex"))?;
+        let vault_id: [u8; 16] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Format("vault object id must encode 16 bytes"))?;
+        Self::create_inner(dir, identity, suite, vault_name, created_at, vault_id)
+    }
+
+    fn create_inner(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        vault_name: &str,
+        created_at: i64,
+        vault_id: [u8; 16],
     ) -> Result<Self> {
         if !suite.is_supported() {
             return Err(Error::UnsupportedSuite(suite.to_u16()));
@@ -194,7 +267,7 @@ impl VaultReaderV2 {
         let header = VaultHeaderV2 {
             format_version: FORMAT_VERSION_V2,
             suite_id: suite.to_u16(),
-            vault_id: random_array::<16>()?,
+            vault_id,
             manifest_stanza,
         };
         let header_bytes = codec::to_vec(&header)?;
@@ -211,6 +284,8 @@ impl VaultReaderV2 {
             header_bytes,
             manifest_key,
             manifest,
+            owner_fingerprint: identity.fingerprint(),
+            state: None,
             view: Vec::new(),
         };
         me.reseal_manifest()?;
@@ -229,18 +304,26 @@ impl VaultReaderV2 {
         let manifest_key = envelope::unwrap_with_identity(&header.manifest_stanza, identity)?;
 
         let raw = read_bounded(&dir.join(MANIFEST_FILE), MAX_MANIFEST_LEN)?;
-        let nlen = suite.aead_alg().nonce_len();
-        if raw.len() < nlen {
-            return Err(Error::Format("truncated v2 manifest"));
+        let envelope: ManifestEnvelopeV3 =
+            codec::from_slice(&raw).map_err(|_| Error::LegacyState("v2 vault manifest"))?;
+        if envelope.version != MANIFEST_ENVELOPE_VERSION
+            || envelope.state.object_type != StateObjectType::VaultManifest
+            || envelope.state.object_id != crate::util::hex(&header.vault_id)
+            || envelope.state.suite_id != suite.to_u16()
+            || envelope.state.identity_fingerprint != identity.fingerprint()
+            || envelope.nonce.len() != suite.aead_alg().nonce_len()
+        {
+            return Err(Error::StateMismatch(envelope.state.label()));
         }
-        let (nonce, ct) = raw.split_at(nlen);
+        let aad = manifest_aad(&header_bytes, &envelope.state);
         let pt = Zeroizing::new(aead::open_with(
             suite.aead_alg(),
             &manifest_key,
-            nonce,
-            &header_bytes,
-            ct,
+            &envelope.nonce,
+            &aad,
+            &envelope.ciphertext,
         )?);
+        envelope.state.verify_payload(&pt)?;
         let manifest: ManifestV2 = codec::from_slice(&pt)?;
         let view = view_of(&manifest);
         Ok(Self {
@@ -249,8 +332,55 @@ impl VaultReaderV2 {
             header_bytes,
             manifest_key,
             manifest,
+            owner_fingerprint: identity.fingerprint(),
+            state: Some(envelope.state),
             view,
         })
+    }
+
+    /// Explicitly upgrade an authenticated legacy raw manifest to the
+    /// rollback-protected envelope, in place. Blob bytes and the v2 header remain
+    /// untouched, so their existing AEAD associated data remains valid.
+    pub fn recover_legacy(dir: &Path, identity: &Identity) -> Result<Self> {
+        let header_bytes = read_bounded(&dir.join(HEADER_FILE), MAX_HEADER_LEN)?;
+        let header: VaultHeaderV2 = codec::from_slice(&header_bytes)?;
+        if header.format_version != FORMAT_VERSION_V2 {
+            return Err(Error::Format("unsupported v2 format version"));
+        }
+        let suite = SuiteId::from_u16(header.suite_id)?;
+        let manifest_key = envelope::unwrap_with_identity(&header.manifest_stanza, identity)?;
+        let raw = read_bounded(&dir.join(MANIFEST_FILE), MAX_MANIFEST_LEN)?;
+        if codec::from_slice::<ManifestEnvelopeV3>(&raw).is_ok() {
+            return Err(Error::Format(
+                "vault manifest is already rollback protected",
+            ));
+        }
+        let nlen = suite.aead_alg().nonce_len();
+        if raw.len() < nlen {
+            return Err(Error::Format("truncated legacy v2 manifest"));
+        }
+        let (nonce, ciphertext) = raw.split_at(nlen);
+        let pt = Zeroizing::new(aead::open_with(
+            suite.aead_alg(),
+            &manifest_key,
+            nonce,
+            &header_bytes,
+            ciphertext,
+        )?);
+        let manifest: ManifestV2 = codec::from_slice(&pt)?;
+        let view = view_of(&manifest);
+        let mut reader = Self {
+            dir: dir.to_path_buf(),
+            suite,
+            header_bytes,
+            manifest_key,
+            manifest,
+            owner_fingerprint: identity.fingerprint(),
+            state: None,
+            view,
+        };
+        reader.reseal_manifest()?;
+        Ok(reader)
     }
 
     /// The vault's display name.
@@ -289,6 +419,12 @@ impl VaultReaderV2 {
     /// The vault's cryptographic suite.
     pub fn suite(&self) -> SuiteId {
         self.suite
+    }
+
+    /// Rollback-protection metadata for the currently opened manifest.
+    #[must_use]
+    pub fn state_metadata(&self) -> Option<&StateMetadata> {
+        self.state.as_ref()
     }
 
     fn blob_path(&self, file_id: &str) -> PathBuf {
@@ -446,18 +582,27 @@ impl VaultReaderV2 {
     /// then refresh the v1-shaped view. The single commit point of any mutation.
     fn reseal_manifest(&mut self) -> Result<()> {
         let pt = Zeroizing::new(codec::to_vec(&self.manifest)?);
-        let nonce = crate::secret::random_vec(self.suite.aead_alg().nonce_len())?;
-        let ct = aead::seal_with(
-            self.suite.aead_alg(),
-            &self.manifest_key,
-            &nonce,
-            &self.header_bytes,
+        let previous = self.state.as_ref().map(StateAnchor::from_metadata);
+        let object_id = vault_object_id(&self.header_bytes)?;
+        let state = StateMetadata::next(
+            self.owner_fingerprint,
+            StateObjectType::VaultManifest,
+            object_id,
+            self.suite.to_u16(),
+            previous.as_ref(),
             &pt,
         )?;
-        let mut buf = Vec::with_capacity(nonce.len() + ct.len());
-        buf.extend_from_slice(&nonce);
-        buf.extend_from_slice(&ct);
+        let nonce = crate::secret::random_vec(self.suite.aead_alg().nonce_len())?;
+        let aad = manifest_aad(&self.header_bytes, &state);
+        let ct = aead::seal_with(self.suite.aead_alg(), &self.manifest_key, &nonce, &aad, &pt)?;
+        let buf = codec::to_vec(&ManifestEnvelopeV3 {
+            version: MANIFEST_ENVELOPE_VERSION,
+            state: state.clone(),
+            nonce,
+            ciphertext: ct,
+        })?;
         write_atomic(&self.dir.join(MANIFEST_FILE), &buf)?;
+        self.state = Some(state);
         self.view = view_of(&self.manifest);
         Ok(())
     }
@@ -679,7 +824,39 @@ impl VaultReaderV2 {
         suite: SuiteId,
         reader: &VaultReader,
     ) -> Result<Self> {
-        let mut me = Self::create(dir, identity, suite, reader.name(), reader.created_at())?;
+        Self::from_reader_v1_inner(dir, identity, suite, reader, None)
+    }
+
+    /// Like [`Self::from_reader_v1`], but binds the new manifest to the local
+    /// registry/path `object_id`.
+    pub fn from_reader_v1_with_object_id(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        reader: &VaultReader,
+        object_id: &str,
+    ) -> Result<Self> {
+        Self::from_reader_v1_inner(dir, identity, suite, reader, Some(object_id))
+    }
+
+    fn from_reader_v1_inner(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        reader: &VaultReader,
+        object_id: Option<&str>,
+    ) -> Result<Self> {
+        let mut me = match object_id {
+            Some(object_id) => Self::create_with_object_id(
+                dir,
+                identity,
+                suite,
+                reader.name(),
+                reader.created_at(),
+                object_id,
+            )?,
+            None => Self::create(dir, identity, suite, reader.name(), reader.created_at())?,
+        };
         let mut plaintext = reader.plaintext_stream()?;
         let mut offset: u64 = 0;
         for e in reader.entries() {
@@ -728,7 +905,39 @@ impl VaultReaderV2 {
         suite: SuiteId,
         vault: &Vault,
     ) -> Result<Self> {
-        let mut me = Self::create(dir, identity, suite, &vault.name, vault.created_at)?;
+        Self::from_vault_inner(dir, identity, suite, vault, None)
+    }
+
+    /// Like [`Self::from_vault`], but binds the new manifest to the local
+    /// registry/path `object_id`.
+    pub fn from_vault_with_object_id(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        vault: &Vault,
+        object_id: &str,
+    ) -> Result<Self> {
+        Self::from_vault_inner(dir, identity, suite, vault, Some(object_id))
+    }
+
+    fn from_vault_inner(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        vault: &Vault,
+        object_id: Option<&str>,
+    ) -> Result<Self> {
+        let mut me = match object_id {
+            Some(object_id) => Self::create_with_object_id(
+                dir,
+                identity,
+                suite,
+                &vault.name,
+                vault.created_at,
+                object_id,
+            )?,
+            None => Self::create(dir, identity, suite, &vault.name, vault.created_at)?,
+        };
         for e in vault.entries() {
             match e.kind {
                 EntryKind::Dir => {
@@ -1139,6 +1348,39 @@ mod tests {
             read_bounded(&manifest, MAX_MANIFEST_LEN),
             Err(Error::Format("file too large"))
         ));
+        let _ = fs_err::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_raw_manifest_requires_explicit_recovery_and_is_reanchored() {
+        let dir = tmp("legacy-manifest");
+        let identity = Identity::generate("Legacy", 0).unwrap();
+        let reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "Legacy", 1).unwrap();
+
+        // Replace the v3 envelope with the historical nonce||ciphertext layout.
+        let plaintext = Zeroizing::new(codec::to_vec(&reader.manifest).unwrap());
+        let nonce = crate::secret::random_vec(reader.suite.aead_alg().nonce_len()).unwrap();
+        let ciphertext = aead::seal_with(
+            reader.suite.aead_alg(),
+            &reader.manifest_key,
+            &nonce,
+            &reader.header_bytes,
+            &plaintext,
+        )
+        .unwrap();
+        let mut legacy = nonce;
+        legacy.extend_from_slice(&ciphertext);
+        fs_err::write(dir.join(MANIFEST_FILE), legacy).unwrap();
+        drop(reader);
+
+        assert!(matches!(
+            VaultReaderV2::open(&dir, &identity),
+            Err(Error::LegacyState("v2 vault manifest"))
+        ));
+        let recovered = VaultReaderV2::recover_legacy(&dir, &identity).unwrap();
+        assert_eq!(recovered.state_metadata().unwrap().epoch, 1);
+        drop(recovered);
+        assert!(VaultReaderV2::open(&dir, &identity).is_ok());
         let _ = fs_err::remove_dir_all(&dir);
     }
 }

@@ -2,17 +2,19 @@
 //! private identity.
 //!
 //! The private keys are serialized to CBOR and sealed with XChaCha20-Poly1305.
-//! Two on-disk formats coexist, distinguished by a magic preamble:
+//! Three generations are recognized, distinguished by a magic preamble:
 //!
-//! * **v1** (legacy) — the secret bundle is sealed *directly* under a master key
-//!   derived from the passphrase via Argon2id. Bare CBOR, no framing. Every
-//!   keystore created without a passkey uses this format, byte-for-byte
-//!   unchanged, so older builds keep opening it.
-//! * **v2** — a key-wrapping layer ("keyslots", à la LUKS/age). The bundle is
+//! * **v1** (legacy) — bare CBOR with the secret bundle sealed directly under a
+//!   passphrase-derived master key.
+//! * **v2** (legacy) — a key-wrapping layer ("keyslots", à la LUKS/age). The bundle is
 //!   encrypted **once** under a random 32-byte data-encryption key (the DEK); the
 //!   DEK is then wrapped once per unlock method: always exactly one **passphrase**
 //!   slot, plus zero or more **passkey** slots (a FIDO2 `hmac-secret` output wraps
-//!   the DEK). A keystore is promoted v1→v2 the first time a passkey is enrolled.
+//!   the DEK).
+//! * **v3** (current) — the v2 keyslot body plus authenticated epoch/hash-chain
+//!   metadata and an Ed25519 identity signature over the whole state. New
+//!   passphrase-only keystores use v3 too. Valid v1/v2 state opens only through
+//!   the explicit recovery entry point and is immediately rewrapped as v3.
 //!
 //! The passphrase slot is a single field, not a list — so no operation can ever
 //! remove it. The passphrase is always a valid way in (your recovery path), even
@@ -31,12 +33,15 @@ use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::kdf::{self, KdfParams};
 use crate::secret::{SymKey, SYM_KEY_LEN};
+use crate::state::{StateAnchor, StateMetadata, StateObjectType};
 use crate::{aead, codec, kem, secret, sign};
 
 /// Legacy (v1) keystore format version.
 const VERSION_V1: u16 = 1;
 /// Keyslot (v2) keystore format version.
 const VERSION_V2: u16 = 2;
+/// Rollback-protected, signed keystore format version.
+const VERSION_V3: u16 = 3;
 /// Magic preamble identifying a framed v2 keystore. A v1 keystore is bare CBOR
 /// (a map, whose first byte is in the CBOR major-type-5 range, never `0x46`/`F`),
 /// so it can never begin with these bytes — the magic is an unambiguous
@@ -202,12 +207,21 @@ fn passphrase_wrap_aad(salt: &[u8], params: &KdfParams) -> Vec<u8> {
 /// AEAD associated data for a passkey slot's DEK wrap, binding the credential
 /// id, relying-party id, and hmac salt so a slot cannot be silently repointed at
 /// a different credential or salt.
-fn passkey_wrap_aad(credential_id: &[u8], rp_id: &str, hmac_salt: &[u8]) -> Vec<u8> {
+fn passkey_wrap_aad(
+    credential_id: &[u8],
+    rp_id: &str,
+    hmac_salt: &[u8],
+    metadata: Option<(&str, i64)>,
+) -> Vec<u8> {
     let mut h = blake3::Hasher::new();
     update_lp(&mut h, b"passkey");
     update_lp(&mut h, credential_id);
     update_lp(&mut h, rp_id.as_bytes());
     update_lp(&mut h, hmac_salt);
+    if let Some((label, added_at)) = metadata {
+        update_lp(&mut h, label.as_bytes());
+        update_lp(&mut h, &added_at.to_le_bytes());
+    }
     let mut aad = WRAP_AAD_V2.to_vec();
     aad.extend_from_slice(h.finalize().as_bytes());
     aad
@@ -266,6 +280,7 @@ struct KeystoreV1 {
 }
 
 impl KeystoreV1 {
+    #[allow(dead_code)] // retained solely for explicit legacy-recovery tests
     fn create(identity: &Identity, passphrase: &[u8], params: KdfParams) -> Result<Self> {
         let salt = secret::random_vec(SALT_LEN)?;
         let master = kdf::derive_master_key(passphrase, &salt, params)?;
@@ -446,6 +461,11 @@ struct PasskeySlot {
     hmac_salt: Vec<u8>,
     label: String,
     added_at: i64,
+    /// New slots bind their human label and timestamp into the wrapping AEAD.
+    /// Legacy v2 slots default to `false`; once explicitly recovered, the signed
+    /// v3 outer state authenticates their complete metadata instead.
+    #[serde(default)]
+    metadata_bound: bool,
     nonce: Vec<u8>,
     wrapped_dek: Vec<u8>,
 }
@@ -527,7 +547,10 @@ impl KeystoreV2 {
             .get(index)
             .ok_or(Error::Format("passkey slot index out of range"))?;
         let kek = kdf::derive_subkey(PASSKEY_KEK_CONTEXT, hmac_output);
-        let aad = passkey_wrap_aad(&slot.credential_id, &slot.rp_id, &slot.hmac_salt);
+        let metadata = slot
+            .metadata_bound
+            .then_some((slot.label.as_str(), slot.added_at));
+        let aad = passkey_wrap_aad(&slot.credential_id, &slot.rp_id, &slot.hmac_salt, metadata);
         let dek = unwrap_dek(&kek, &slot.nonce, &slot.wrapped_dek, &aad)?;
         decrypt_bundle(&dek, &self.bundle_nonce, &self.bundle_ct)
     }
@@ -539,6 +562,7 @@ impl KeystoreV2 {
             &enrollment.credential_id,
             &enrollment.rp_id,
             &enrollment.hmac_salt,
+            Some((&enrollment.label, enrollment.added_at)),
         );
         let (nonce, wrapped_dek) = wrap_dek(&kek, dek, &aad)?;
         self.passkeys.push(PasskeySlot {
@@ -547,6 +571,7 @@ impl KeystoreV2 {
             hmac_salt: enrollment.hmac_salt.to_vec(),
             label: enrollment.label,
             added_at: enrollment.added_at,
+            metadata_bound: true,
             nonce,
             wrapped_dek,
         });
@@ -558,10 +583,92 @@ impl KeystoreV2 {
 // Public façade
 // ---------------------------------------------------------------------------
 
-/// The active on-disk representation behind [`KeystoreFile`].
+/// Signed rollback-protected keystore. The Ed25519 signature authenticates the
+/// entire keyslot body through `state.current_state_hash` and binds it to the
+/// identity fingerprint, object id, epoch, predecessor hash, and suite.
+#[derive(Serialize, Deserialize)]
+struct KeystoreV3 {
+    version: u16,
+    state: StateMetadata,
+    public_identity: crate::identity::PublicIdentity,
+    body: KeystoreV2,
+    signature: Vec<u8>,
+}
+
+impl KeystoreV3 {
+    fn build(
+        body: KeystoreV2,
+        identity: &Identity,
+        previous: Option<&StateAnchor>,
+    ) -> Result<Self> {
+        let payload = codec::to_vec(&body)?;
+        let state = StateMetadata::next(
+            identity.fingerprint(),
+            StateObjectType::Keystore,
+            "identity-keystore",
+            0,
+            previous,
+            &payload,
+        )?;
+        let signature = identity.sign(&state.authenticated_data()).to_vec();
+        Ok(Self {
+            version: VERSION_V3,
+            state,
+            public_identity: identity.public(),
+            body,
+            signature,
+        })
+    }
+
+    fn verify(&self) -> Result<()> {
+        if self.version != VERSION_V3
+            || self.state.object_type != StateObjectType::Keystore
+            || self.state.object_id != "identity-keystore"
+            || self.state.suite_id != 0
+            || self.state.identity_fingerprint != self.public_identity.fingerprint()
+        {
+            return Err(Error::StateMismatch("keystore identity-keystore".into()));
+        }
+        let payload = codec::to_vec(&self.body)?;
+        self.state.verify_payload(&payload)?;
+        let signature: [u8; sign::SIGNATURE_LEN] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Format("bad keystore state signature length"))?;
+        sign::verify(
+            &self.public_identity.sign_public,
+            &self.state.authenticated_data(),
+            &signature,
+        )
+        .map_err(|_| Error::StateMismatch(self.state.label()))
+    }
+
+    fn advance(&mut self, identity: &Identity) -> Result<()> {
+        if identity.fingerprint() != self.state.identity_fingerprint {
+            return Err(Error::StateMismatch(self.state.label()));
+        }
+        let previous = StateAnchor::from_metadata(&self.state);
+        let payload = codec::to_vec(&self.body)?;
+        self.state = StateMetadata::next(
+            identity.fingerprint(),
+            StateObjectType::Keystore,
+            "identity-keystore",
+            0,
+            Some(&previous),
+            &payload,
+        )?;
+        self.signature = identity.sign(&self.state.authenticated_data()).to_vec();
+        Ok(())
+    }
+}
+
+/// The active representation behind [`KeystoreFile`]. Legacy variants exist
+/// only long enough for an explicit recovery call to authenticate and rewrap.
 enum Inner {
     V1(KeystoreV1),
     V2(KeystoreV2),
+    V3(Box<KeystoreV3>),
 }
 
 /// A FileSec keystore: the encrypted private identity, openable by passphrase
@@ -569,39 +676,84 @@ enum Inner {
 pub struct KeystoreFile(Inner);
 
 impl KeystoreFile {
-    /// Create a new (v1) keystore wrapping `identity` under `passphrase`. The
-    /// on-disk format is unchanged from before passkeys existed; enrolling a
-    /// passkey later promotes it to v2.
+    /// Create a new rollback-protected keystore wrapping `identity` under
+    /// `passphrase`. Even a passphrase-only keystore uses the signed v3 framing;
+    /// pre-anchor v1/v2 files are accepted only through [`Self::recover_legacy`].
     pub fn create(identity: &Identity, passphrase: &[u8], params: KdfParams) -> Result<Self> {
-        Ok(Self(Inner::V1(KeystoreV1::create(
-            identity, passphrase, params,
-        )?)))
+        let (body, _dek) = KeystoreV2::create_with_dek(identity, passphrase, params)?;
+        Ok(Self(Inner::V3(Box::new(KeystoreV3::build(
+            body, identity, None,
+        )?))))
     }
 
-    /// Serialize to bytes for storage on disk. A v1 keystore is bare CBOR; a v2
-    /// keystore is the magic preamble (`MAGIC` + version) followed by CBOR.
+    /// Serialize the current signed v3 frame for storage on disk.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         match &self.0 {
-            Inner::V1(v1) => codec::to_vec(v1),
-            Inner::V2(v2) => {
-                let body = codec::to_vec(v2)?;
+            Inner::V3(v3) => {
+                v3.verify()?;
+                let body = codec::to_vec(v3)?;
                 let mut out = Vec::with_capacity(MAGIC_V2.len() + 2 + body.len());
                 out.extend_from_slice(MAGIC_V2);
-                out.extend_from_slice(&VERSION_V2.to_be_bytes());
+                out.extend_from_slice(&VERSION_V3.to_be_bytes());
                 out.extend_from_slice(&body);
                 Ok(out)
             }
+            Inner::V1(_) | Inner::V2(_) => Err(Error::LegacyState("keystore")),
         }
     }
 
-    /// Parse keystore bytes (does not decrypt — call [`Self::unlock`] or
-    /// [`Self::unlock_with_passkey`]). Dispatches on the magic preamble: present
-    /// ⇒ framed v2; absent ⇒ legacy v1 bare CBOR.
+    /// Parse a signed v3 keystore (does not decrypt — call [`Self::unlock`] or
+    /// [`Self::unlock_with_passkey`]). Valid v1/v2 bytes return
+    /// [`Error::LegacyState`] and require [`Self::recover_legacy`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < MAGIC_V2.len() + 2 || &bytes[..MAGIC_V2.len()] != MAGIC_V2 {
+            // Parse enough to distinguish a valid legacy file from random input,
+            // but never return it from the normal open path.
+            let _ = Self::parse_legacy(bytes)?;
+            return Err(Error::LegacyState("keystore"));
+        }
+        let version = u16::from_be_bytes([bytes[MAGIC_V2.len()], bytes[MAGIC_V2.len() + 1]]);
+        if version != VERSION_V3 {
+            if version == VERSION_V2 {
+                let _ = Self::parse_legacy(bytes)?;
+                return Err(Error::LegacyState("keystore"));
+            }
+            return Err(Error::Format("unsupported keystore version"));
+        }
+        let v3: KeystoreV3 = codec::from_slice(&bytes[MAGIC_V2.len() + 2..])?;
+        v3.body.passphrase.kdf.validate_for_open()?;
+        v3.verify()?;
+        Ok(Self(Inner::V3(Box::new(v3))))
+    }
+
+    /// Explicitly authenticate and migrate a valid pre-anchor v1/v2 keystore.
+    /// The returned keystore is immediately signed at epoch 1 and serializes only
+    /// in the rollback-protected v3 format. A legacy v2 passkey list is retained.
+    pub fn recover_legacy(bytes: &[u8], passphrase: &[u8]) -> Result<Self> {
+        let legacy = Self::parse_legacy(bytes)?;
+        match legacy.0 {
+            Inner::V1(v1) => {
+                let identity = v1.unlock(passphrase)?;
+                let (body, _dek) = KeystoreV2::create_with_dek(&identity, passphrase, v1.kdf)?;
+                Ok(Self(Inner::V3(Box::new(KeystoreV3::build(
+                    body, &identity, None,
+                )?))))
+            }
+            Inner::V2(body) => {
+                let identity = body.unlock(passphrase)?;
+                Ok(Self(Inner::V3(Box::new(KeystoreV3::build(
+                    body, &identity, None,
+                )?))))
+            }
+            Inner::V3(_) => Err(Error::Format("keystore is already rollback protected")),
+        }
+    }
+
+    fn parse_legacy(bytes: &[u8]) -> Result<Self> {
         if bytes.len() >= MAGIC_V2.len() + 2 && &bytes[..MAGIC_V2.len()] == MAGIC_V2 {
             let version = u16::from_be_bytes([bytes[MAGIC_V2.len()], bytes[MAGIC_V2.len() + 1]]);
             if version != VERSION_V2 {
-                return Err(Error::Format("unsupported keystore version"));
+                return Err(Error::Format("unsupported legacy keystore version"));
             }
             let v2: KeystoreV2 = codec::from_slice(&bytes[MAGIC_V2.len() + 2..])?;
             if v2.version != VERSION_V2 {
@@ -625,6 +777,7 @@ impl KeystoreFile {
         match &self.0 {
             Inner::V1(v1) => v1.unlock(passphrase),
             Inner::V2(v2) => v2.unlock(passphrase),
+            Inner::V3(v3) => v3.body.unlock(passphrase),
         }
     }
 
@@ -632,6 +785,7 @@ impl KeystoreFile {
     #[must_use]
     pub fn has_passkeys(&self) -> bool {
         matches!(&self.0, Inner::V2(v2) if !v2.passkeys.is_empty())
+            || matches!(&self.0, Inner::V3(v3) if !v3.body.passkeys.is_empty())
     }
 
     /// The enrolled passkeys' public handles, in slot order. The index of each
@@ -650,29 +804,52 @@ impl KeystoreFile {
                     added_at: s.added_at,
                 })
                 .collect(),
+            Inner::V3(v3) => v3
+                .body
+                .passkeys
+                .iter()
+                .map(|s| PasskeyInfo {
+                    credential_id: s.credential_id.clone(),
+                    rp_id: s.rp_id.clone(),
+                    hmac_salt: s.hmac_salt.clone(),
+                    label: s.label.clone(),
+                    added_at: s.added_at,
+                })
+                .collect(),
             Inner::V1(_) => Vec::new(),
         }
     }
 
-    /// Enroll a passkey as an additional unlock method. Authorized by the
-    /// passphrase (which also recovers the DEK); the first enrollment promotes a
-    /// v1 keystore to v2. The passphrase slot is always retained.
+    /// Enroll a passkey as an additional unlock method. The passphrase recovers
+    /// the DEK and signing identity; the mutation advances and re-signs the v3
+    /// state. The passphrase slot is always retained.
     ///
     /// This only mutates the in-memory keystore — the caller must persist the
     /// result (atomically) for it to take effect.
     pub fn add_passkey(&mut self, passphrase: &[u8], enrollment: PasskeyEnrollment) -> Result<()> {
-        let dek = match &self.0 {
+        let (dek, signer) = match &self.0 {
             Inner::V1(v1) => {
                 // Verifies the passphrase and yields the identity to re-wrap.
                 let identity = v1.unlock(passphrase)?;
                 let (v2, dek) = KeystoreV2::create_with_dek(&identity, passphrase, v1.kdf)?;
                 self.0 = Inner::V2(v2);
-                dek
+                (dek, identity)
             }
-            Inner::V2(v2) => v2.unlock_dek_with_passphrase(passphrase)?,
+            Inner::V2(v2) => {
+                let identity = v2.unlock(passphrase)?;
+                (v2.unlock_dek_with_passphrase(passphrase)?, identity)
+            }
+            Inner::V3(v3) => (
+                v3.body.unlock_dek_with_passphrase(passphrase)?,
+                v3.body.unlock(passphrase)?,
+            ),
         };
         match &mut self.0 {
             Inner::V2(v2) => v2.add_passkey(&dek, enrollment),
+            Inner::V3(v3) => {
+                v3.body.add_passkey(&dek, enrollment)?;
+                v3.advance(&signer)
+            }
             // `add_passkey` always leaves `self` in the V2 state above.
             Inner::V1(_) => Err(Error::Format("keystore promotion failed")),
         }
@@ -682,12 +859,17 @@ impl KeystoreFile {
     /// There is deliberately no way to remove the passphrase slot.
     ///
     /// Mutates only the in-memory keystore — the caller must persist the result.
-    pub fn remove_passkey(&mut self, index: usize) -> Result<()> {
+    pub fn remove_passkey(&mut self, index: usize, identity: &Identity) -> Result<()> {
         match &mut self.0 {
             Inner::V2(v2) if index < v2.passkeys.len() => {
                 v2.passkeys.remove(index);
                 Ok(())
             }
+            Inner::V3(v3) if index < v3.body.passkeys.len() => {
+                v3.body.passkeys.remove(index);
+                v3.advance(identity)
+            }
+            Inner::V3(_) => Err(Error::Format("passkey slot index out of range")),
             Inner::V2(_) => Err(Error::Format("passkey slot index out of range")),
             Inner::V1(_) => Err(Error::Format("no passkeys are enrolled")),
         }
@@ -703,7 +885,19 @@ impl KeystoreFile {
     ) -> Result<Identity> {
         match &self.0 {
             Inner::V2(v2) => v2.unlock_with_passkey(slot_index, hmac_output.as_slice()),
+            Inner::V3(v3) => v3
+                .body
+                .unlock_with_passkey(slot_index, hmac_output.as_slice()),
             Inner::V1(_) => Err(Error::Format("no passkeys are enrolled")),
+        }
+    }
+
+    /// Authenticated state metadata used by the independent high-water anchor.
+    #[must_use]
+    pub fn state_metadata(&self) -> Option<&StateMetadata> {
+        match &self.0 {
+            Inner::V3(v3) => Some(&v3.state),
+            Inner::V1(_) | Inner::V2(_) => None,
         }
     }
 }
@@ -742,17 +936,17 @@ mod tests {
         let mut ks = KeystoreFile::create(&id, b"pw", params).unwrap();
         ks.add_passkey(b"pw", enroll(1, b"c0")).unwrap();
         let (n0, c0) = match &ks.0 {
-            Inner::V2(v2) => (v2.bundle_nonce.clone(), v2.bundle_ct.clone()),
-            Inner::V1(_) => panic!("expected v2 after enrollment"),
+            Inner::V3(v3) => (v3.body.bundle_nonce.clone(), v3.body.bundle_ct.clone()),
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3 after enrollment"),
         };
         ks.add_passkey(b"pw", enroll(2, b"c1")).unwrap();
         match &ks.0 {
-            Inner::V2(v2) => {
-                assert_eq!(v2.bundle_nonce, n0, "bundle nonce must not change");
-                assert_eq!(v2.bundle_ct, c0, "bundle ciphertext must not change");
-                assert_eq!(v2.passkeys.len(), 2);
+            Inner::V3(v3) => {
+                assert_eq!(v3.body.bundle_nonce, n0, "bundle nonce must not change");
+                assert_eq!(v3.body.bundle_ct, c0, "bundle ciphertext must not change");
+                assert_eq!(v3.body.passkeys.len(), 2);
             }
-            Inner::V1(_) => panic!("expected v2"),
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
         }
     }
 
@@ -777,8 +971,8 @@ mod tests {
         // Flip one byte of the stored credential id; the recomputed wrap AAD no
         // longer matches what wrapped the DEK.
         match &mut ks.0 {
-            Inner::V2(v2) => v2.passkeys[0].credential_id[0] ^= 0x01,
-            Inner::V1(_) => panic!("expected v2"),
+            Inner::V3(v3) => v3.body.passkeys[0].credential_id[0] ^= 0x01,
+            Inner::V1(_) | Inner::V2(_) => panic!("expected v3"),
         }
         assert!(ks.unlock_with_passkey(0, &secret).is_err());
         // The independent passphrase slot still opens it.
@@ -896,6 +1090,65 @@ mod tests {
             import_identity_armored(&armored, b"backup-pass"),
             Err(Error::KdfParams(_))
         ));
+    }
+
+    #[test]
+    fn legacy_keystore_requires_explicit_recovery_and_is_immediately_rewrapped() {
+        let identity = Identity::generate("Legacy", 42).unwrap();
+        let legacy = KeystoreV1::create(&identity, b"legacy passphrase", fast_params()).unwrap();
+        let bytes = codec::to_vec(&legacy).unwrap();
+        assert!(matches!(
+            KeystoreFile::from_bytes(&bytes),
+            Err(Error::LegacyState("keystore"))
+        ));
+
+        let recovered = KeystoreFile::recover_legacy(&bytes, b"legacy passphrase").unwrap();
+        assert_eq!(recovered.state_metadata().unwrap().epoch, 1);
+        assert!(recovered
+            .to_bytes()
+            .unwrap()
+            .starts_with(b"FSK\x1a\x00\x03"));
+        assert_eq!(
+            recovered
+                .unlock(b"legacy passphrase")
+                .unwrap()
+                .fingerprint(),
+            identity.fingerprint()
+        );
+    }
+
+    #[test]
+    fn recovered_v2_keystore_retains_passkeys_under_signed_state() {
+        let identity = Identity::generate("Legacy passkeys", 7).unwrap();
+        let (mut body, dek) = KeystoreV2::create_with_dek(&identity, b"pw", fast_params()).unwrap();
+        body.add_passkey(&dek, enroll(0x44, b"legacy-key")).unwrap();
+        // Recreate the historical metadata behavior for a genuine v2 slot.
+        body.passkeys[0].metadata_bound = false;
+        let slot = &body.passkeys[0];
+        let kek = kdf::derive_subkey(PASSKEY_KEK_CONTEXT, &[0x44; HMAC_SECRET_LEN]);
+        let aad = passkey_wrap_aad(&slot.credential_id, &slot.rp_id, &slot.hmac_salt, None);
+        let (nonce, wrapped_dek) = wrap_dek(&kek, &dek, &aad).unwrap();
+        body.passkeys[0].nonce = nonce;
+        body.passkeys[0].wrapped_dek = wrapped_dek;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC_V2);
+        bytes.extend_from_slice(&VERSION_V2.to_be_bytes());
+        bytes.extend_from_slice(&codec::to_vec(&body).unwrap());
+        assert!(matches!(
+            KeystoreFile::from_bytes(&bytes),
+            Err(Error::LegacyState("keystore"))
+        ));
+        let recovered = KeystoreFile::recover_legacy(&bytes, b"pw").unwrap();
+        assert_eq!(recovered.passkey_slots()[0].label, "k");
+        assert_eq!(
+            recovered
+                .unlock_with_passkey(0, &[0x44; HMAC_SECRET_LEN])
+                .unwrap()
+                .fingerprint(),
+            identity.fingerprint()
+        );
+        assert!(KeystoreFile::from_bytes(&recovered.to_bytes().unwrap()).is_ok());
     }
 
     /// A backup and a live keystore are distinct artifacts: neither parser accepts

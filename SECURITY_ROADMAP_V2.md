@@ -133,6 +133,13 @@ Required tests:
 
 ### Stage 2: Rollback-Resistant Local State
 
+**Implementation status (2026-07-10): complete.** Local state now uses the
+shared `StateMetadata`/`StateAnchor` model, OS-secure high-water storage with a
+warned file fallback, quarantine-on-rollback behavior, authenticated passkey
+metadata, and explicit one-time legacy recovery/rewrap entry points. The Stage 2
+rollback, same-epoch mismatch, and migration tests are part of the workspace
+suite.
+
 Objective:
 
 Upgrade local state from tamper-evident to rollback-resistant. A previously valid older keystore, contact book, registry, or vault manifest must not silently replace newer state.

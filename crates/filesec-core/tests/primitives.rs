@@ -182,13 +182,14 @@ fn enrollment(secret: u8, credential_id: &[u8], label: &str) -> PasskeyEnrollmen
 }
 
 #[test]
-fn v1_keystore_keeps_legacy_unframed_format() {
+fn passphrase_only_keystore_is_rollback_protected() {
     let id = Identity::generate("Alice", 1).unwrap();
     let ks = KeystoreFile::create(&id, b"pw correct", cheap_params()).unwrap();
     let bytes = ks.to_bytes().unwrap();
-    // A keystore with no passkeys stays in the legacy v1 format: no magic
-    // preamble, so a pre-passkey build still opens it byte-for-byte.
-    assert!(!bytes.starts_with(b"FSK\x1a"));
+    // New passphrase-only keystores use the signed v3 frame too; legacy v1/v2
+    // files are accepted only by the explicit recovery entry point.
+    assert!(bytes.starts_with(b"FSK\x1a\x00\x03"));
+    assert_eq!(ks.state_metadata().unwrap().epoch, 1);
     assert!(!ks.has_passkeys());
     assert!(ks.passkey_slots().is_empty());
     let opened = KeystoreFile::from_bytes(&bytes)
@@ -280,7 +281,7 @@ fn remove_passkey_keeps_passphrase_and_survivors() {
     ks.add_passkey(b"pw", enrollment(0x42, b"c1", "K1"))
         .unwrap();
 
-    ks.remove_passkey(0).unwrap();
+    ks.remove_passkey(0, &id).unwrap();
     let slots = ks.passkey_slots();
     assert_eq!(slots.len(), 1);
     assert_eq!(slots[0].label, "K1");
@@ -294,10 +295,10 @@ fn remove_passkey_keeps_passphrase_and_survivors() {
     assert_eq!(ks.unlock(b"pw").unwrap().fingerprint(), id.fingerprint());
 
     // Out-of-range removal errors, doesn't panic.
-    assert!(ks.remove_passkey(9).is_err());
+    assert!(ks.remove_passkey(9, &id).is_err());
 
     // Removing the last passkey leaves the passphrase as the only way in.
-    ks.remove_passkey(0).unwrap();
+    ks.remove_passkey(0, &id).unwrap();
     assert!(!ks.has_passkeys());
     assert_eq!(ks.unlock(b"pw").unwrap().fingerprint(), id.fingerprint());
 }

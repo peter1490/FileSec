@@ -1,15 +1,18 @@
 //! Integration tests for the GUI persistence layer (`store`), exercised
 //! without opening a window.
 
-use filesec_core::contacts::ContactBook;
+use filesec_core::contacts::{ContactBook, Trust};
 use filesec_core::identity::Identity;
 use filesec_core::kdf::KdfParams;
-use filesec_core::keystore::KeystoreFile;
+use filesec_core::keystore::{KeystoreFile, PasskeyEnrollment, HMAC_SECRET_LEN};
+use filesec_core::state::{StateAnchor, StateObjectType};
 use filesec_core::vault::Vault;
 use filesec_gui::store::{
     extract_vault, make_readonly, new_vault_id, secure_wipe, Registry, Store, VaultMeta,
 };
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 fn tmp() -> PathBuf {
     let suffix = filesec_core::util::hex(&filesec_core::secret::random_vec(8).unwrap());
@@ -21,6 +24,80 @@ fn fast_kdf() -> KdfParams {
         m_cost: 8 * 1024,
         t_cost: 1,
         p_cost: 1,
+    }
+}
+
+fn enrollment(secret: u8, credential_id: &[u8], label: &str) -> PasskeyEnrollment {
+    PasskeyEnrollment {
+        credential_id: credential_id.to_vec(),
+        rp_id: "filesec.local".into(),
+        hmac_salt: [secret ^ 0xa5; HMAC_SECRET_LEN],
+        label: label.into(),
+        added_at: 10,
+        hmac_output: Zeroizing::new([secret; HMAC_SECRET_LEN]),
+    }
+}
+
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in walkdir::WalkDir::new(source) {
+        let entry = entry.unwrap();
+        let relative = entry.path().strip_prefix(source).unwrap();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(target).unwrap();
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn quarantine_has(dir: &std::path::Path, prefix: &str) -> bool {
+    std::fs::read_dir(dir.join("quarantine"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+}
+
+#[derive(Serialize, Deserialize)]
+struct TestAnchorSet {
+    version: u16,
+    anchors: Vec<StateAnchor>,
+}
+
+fn corrupt_anchor_hash(dir: &std::path::Path, object_type: StateObjectType) {
+    let path = dir.join(".state-anchors");
+    let from_file = path.exists();
+    let anchor_account = std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string();
+    let bytes = if from_file {
+        std::fs::read(&path).unwrap()
+    } else {
+        filesec_gui::autounlock::load_state_anchors(&anchor_account)
+            .unwrap()
+            .expect("secure object anchors")
+    };
+    let mut set: TestAnchorSet = filesec_core::codec::from_slice(&bytes).unwrap();
+    let anchor = set
+        .anchors
+        .iter_mut()
+        .find(|anchor| anchor.object_type == object_type)
+        .expect("object anchor");
+    anchor.current_state_hash[0] ^= 1;
+    let bytes = filesec_core::codec::to_vec(&set).unwrap();
+    if from_file {
+        std::fs::write(path, bytes).unwrap();
+    } else {
+        filesec_gui::autounlock::save_state_anchors(&anchor_account, &bytes).unwrap();
     }
 }
 
@@ -97,6 +174,226 @@ fn full_persistence_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
     let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn keystore_rollback_is_rejected_and_quarantined() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let identity = Identity::generate("Alice", 0).unwrap();
+    let passphrase = b"correct horse battery staple";
+    let mut keystore = KeystoreFile::create(&identity, passphrase, fast_kdf()).unwrap();
+    store.save_keystore(&keystore).unwrap();
+
+    keystore
+        .add_passkey(passphrase, enrollment(0x31, b"key-a", "Key A"))
+        .unwrap();
+    store.save_keystore(&keystore).unwrap();
+    let old = std::fs::read(dir.join("keystore.fsk")).unwrap();
+
+    keystore.remove_passkey(0, &identity).unwrap();
+    store.save_keystore(&keystore).unwrap();
+    std::fs::write(dir.join("keystore.fsk"), old).unwrap();
+
+    let error = store.load_keystore().err().expect("rollback must fail");
+    assert!(error.contains("rollback detected"), "{error}");
+    assert!(!dir.join("keystore.fsk").exists());
+    assert!(quarantine_has(&dir, "keystore.fsk.rollback-"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn contact_trust_rollback_is_rejected_and_quarantined() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    let contact = Identity::generate("Contact", 0).unwrap();
+    let fingerprint = contact.fingerprint();
+    let mut book = ContactBook::default();
+    book.upsert(contact.public(), 1);
+    book.set_trust(&fingerprint, Trust::Verified, 2);
+    store.save_contacts(&owner, &book).unwrap();
+    let verified = std::fs::read(dir.join("contacts.fsec")).unwrap();
+
+    book.set_trust(&fingerprint, Trust::Unverified, 3);
+    store.save_contacts(&owner, &book).unwrap();
+    std::fs::write(dir.join("contacts.fsec"), verified).unwrap();
+
+    let error = store.load_contacts(&owner).expect_err("rollback must fail");
+    assert!(error.contains("rollback detected"), "{error}");
+    assert!(quarantine_has(&dir, "contacts.fsec.rollback-"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn registry_rollback_is_rejected_and_quarantined() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    let mut registry = Registry::default();
+    registry.upsert(VaultMeta {
+        id: "00112233445566778899aabbccddeeff".into(),
+        name: "Docs".into(),
+        created_at: 1,
+        modified_at: 2,
+        file_count: 1,
+        total_size: 5,
+    });
+    store.save_registry(&owner, &registry).unwrap();
+    let populated = std::fs::read(dir.join("index.fsec")).unwrap();
+
+    registry.remove("00112233445566778899aabbccddeeff");
+    store.save_registry(&owner, &registry).unwrap();
+    std::fs::write(dir.join("index.fsec"), populated).unwrap();
+
+    let error = store.load_registry(&owner).expect_err("rollback must fail");
+    assert!(error.contains("rollback detected"), "{error}");
+    assert!(quarantine_has(&dir, "index.fsec.rollback-"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vault_manifest_rollback_is_rejected_and_quarantined() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    let vault_id = new_vault_id().unwrap();
+    let mut vault = Vault::new("Docs", 1);
+    vault
+        .add_file("note.txt", b"old".to_vec(), None, None)
+        .unwrap();
+    store.save_vault(&owner, &vault_id, &vault).unwrap();
+
+    let vault_dir = dir.join("vaults").join(format!("{vault_id}.fsv2"));
+    let snapshot = tmp();
+    copy_tree(&vault_dir, &snapshot);
+
+    let reader = store.open_vault(&owner, &vault_id).unwrap();
+    store
+        .put_bytes_in_vault(&owner, &vault_id, &reader, "note.txt", b"new", Some(2))
+        .unwrap();
+    assert_eq!(
+        &*store
+            .open_vault(&owner, &vault_id)
+            .unwrap()
+            .read_entry("note.txt")
+            .unwrap(),
+        b"new"
+    );
+
+    std::fs::remove_dir_all(&vault_dir).unwrap();
+    copy_tree(&snapshot, &vault_dir);
+    let error = store
+        .open_vault(&owner, &vault_id)
+        .err()
+        .expect("rollback must fail");
+    assert!(error.contains("rollback detected"), "{error}");
+    assert!(quarantine_has(&dir, &format!("{vault_id}.fsv2.rollback-")));
+    let _ = std::fs::remove_dir_all(&snapshot);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_epoch_hash_mismatches_fail_for_every_anchored_object() {
+    // Keystore.
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    store
+        .save_keystore(&KeystoreFile::create(&owner, b"strong passphrase", fast_kdf()).unwrap())
+        .unwrap();
+    corrupt_anchor_hash(&dir, StateObjectType::Keystore);
+    let error = store.load_keystore().err().unwrap();
+    assert!(error.contains("state-anchor mismatch"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Contacts.
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    store
+        .save_contacts(&owner, &ContactBook::default())
+        .unwrap();
+    corrupt_anchor_hash(&dir, StateObjectType::Contacts);
+    let error = store.load_contacts(&owner).err().unwrap();
+    assert!(error.contains("state-anchor mismatch"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Registry.
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    store.save_registry(&owner, &Registry::default()).unwrap();
+    corrupt_anchor_hash(&dir, StateObjectType::Registry);
+    let error = store.load_registry(&owner).err().unwrap();
+    assert!(error.contains("state-anchor mismatch"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Vault manifest.
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let vault_id = new_vault_id().unwrap();
+    store
+        .save_vault(&owner, &vault_id, &Vault::new("Docs", 0))
+        .unwrap();
+    corrupt_anchor_hash(&dir, StateObjectType::VaultManifest);
+    let error = store.open_vault(&owner, &vault_id).err().unwrap();
+    assert!(error.contains("state-anchor mismatch"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_local_v1_vault_opens_only_through_explicit_recovery() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    let vault_id = new_vault_id().unwrap();
+    let mut vault = Vault::new("Legacy", 1);
+    vault
+        .add_file("legacy.txt", b"authenticated".to_vec(), None, None)
+        .unwrap();
+    let legacy_path = dir.join("vaults").join(format!("{vault_id}.fsec"));
+    filesec_core::format::export_vault_to_path(
+        &vault,
+        &owner,
+        &[owner.public()],
+        &filesec_core::ExportOptions::default(),
+        &legacy_path,
+    )
+    .unwrap();
+
+    let error = store.open_vault(&owner, &vault_id).err().unwrap();
+    assert!(error.contains("explicit recovery"), "{error}");
+    let recovered = store.recover_legacy_vault(&owner, &vault_id).unwrap();
+    assert_eq!(
+        &*recovered.read_entry("legacy.txt").unwrap(),
+        b"authenticated"
+    );
+    assert!(!legacy_path.exists());
+    assert!(dir.join("vaults").join(format!("{vault_id}.fsv2")).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn valid_vault_directory_cannot_be_substituted_at_another_vault_id() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    let first_id = new_vault_id().unwrap();
+    let second_id = new_vault_id().unwrap();
+    store
+        .save_vault(&owner, &first_id, &Vault::new("First", 1))
+        .unwrap();
+    store
+        .save_vault(&owner, &second_id, &Vault::new("Second", 2))
+        .unwrap();
+    let first_path = dir.join("vaults").join(format!("{first_id}.fsv2"));
+    let second_path = dir.join("vaults").join(format!("{second_id}.fsv2"));
+    std::fs::remove_dir_all(&first_path).unwrap();
+    std::fs::rename(&second_path, &first_path).unwrap();
+
+    let error = store.open_vault(&owner, &first_id).err().unwrap();
+    assert!(error.contains("object id"), "{error}");
+    assert!(quarantine_has(&dir, &format!("{first_id}.fsv2.rollback-")));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
