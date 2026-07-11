@@ -531,7 +531,8 @@ fn v2_rekey_exact_multiple_chunk() {
     let dir2 = tmp_dir("rekey-exact-dst.fsv2");
     let payload: Vec<u8> = (0..(64 * 1024 * 2)).map(|i| (i % 251) as u8).collect();
     let mut src = VaultReaderV2::create(&dir, &id, SuiteId::Classic, "E", 1).unwrap();
-    src.put_file_bytes("exact.bin", &payload, None, None).unwrap();
+    src.put_file_bytes("exact.bin", &payload, None, None)
+        .unwrap();
 
     let out = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src).unwrap();
     drop(out);
@@ -575,11 +576,7 @@ fn v2_rekey_preserves_mtime_mode() {
     drop(src);
 
     let v = VaultReaderV2::open(&dir2, &id).unwrap();
-    let e = v
-        .entries()
-        .iter()
-        .find(|e| e.path == "readme.txt")
-        .unwrap();
+    let e = v.entries().iter().find(|e| e.path == "readme.txt").unwrap();
     assert_eq!(e.mtime, Some(123));
     assert_eq!(e.mode, Some(0o644));
     cleanup(&dir);

@@ -1067,7 +1067,10 @@ impl VaultReaderV2 {
             return Err(Error::Format("bad chunk size"));
         }
         let key = SymKey::from_bytes(e.key.ok_or(Error::Format("missing blob key"))?);
-        let nonce = e.nonce.as_ref().ok_or(Error::Format("missing blob nonce"))?;
+        let nonce = e
+            .nonce
+            .as_ref()
+            .ok_or(Error::Format("missing blob nonce"))?;
         let file = BufReader::new(fs_err::File::open(self.blob_path(blob_id(e)?))?);
         Ok(EntryPlaintext::Blob(aead::StreamDecryptReader::new_with(
             self.suite.aead_alg(),
