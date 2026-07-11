@@ -231,7 +231,7 @@ fn apply(style: &mut egui::Style, c: &Colors) {
     v.error_fg_color = c.err;
     v.window_corner_radius = radius;
     v.menu_corner_radius = radius;
-    v.window_stroke = Stroke::new(1.0, c.border);
+    v.window_stroke = Stroke::new(1.0_f32, c.border);
     v.window_shadow = shadow(8, 24, 120);
     v.popup_shadow = shadow(6, 16, 100);
     v.interact_cursor = Some(egui::CursorIcon::PointingHand);
@@ -239,7 +239,7 @@ fn apply(style: &mut egui::Style, c: &Colors) {
         bg_fill: with_alpha(c.accent, 70),
         // Doubles as the focus ring around text inputs (egui draws this stroke
         // when a TextEdit has keyboard focus), so give it a touch more weight.
-        stroke: Stroke::new(1.5, c.accent),
+        stroke: Stroke::new(1.5_f32, c.accent),
     };
 
     let w = &mut v.widgets;
@@ -247,35 +247,35 @@ fn apply(style: &mut egui::Style, c: &Colors) {
     w.noninteractive.corner_radius = radius_sm;
     w.noninteractive.bg_fill = c.surface;
     w.noninteractive.weak_bg_fill = c.surface;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, c.border);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, c.text_muted);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, c.border);
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, c.text_muted);
     // Inactive: idle buttons / text edits.
     w.inactive.corner_radius = radius_sm;
     w.inactive.bg_fill = c.surface_hi;
     w.inactive.weak_bg_fill = c.surface_hi;
-    w.inactive.bg_stroke = Stroke::new(1.0, c.border);
-    w.inactive.fg_stroke = Stroke::new(1.0, c.text);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, c.border);
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, c.text);
     w.inactive.expansion = 0.0;
     // Hovered.
     w.hovered.corner_radius = radius_sm;
     w.hovered.bg_fill = c.surface_hi;
     w.hovered.weak_bg_fill = c.surface_hi;
-    w.hovered.bg_stroke = Stroke::new(1.0, c.accent);
-    w.hovered.fg_stroke = Stroke::new(1.0, c.text);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, c.accent);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, c.text);
     w.hovered.expansion = 1.0;
     // Active / pressed.
     w.active.corner_radius = radius_sm;
     w.active.bg_fill = with_alpha(c.accent, 64);
     w.active.weak_bg_fill = with_alpha(c.accent, 64);
-    w.active.bg_stroke = Stroke::new(1.0, c.accent);
-    w.active.fg_stroke = Stroke::new(1.0, c.text);
+    w.active.bg_stroke = Stroke::new(1.0_f32, c.accent);
+    w.active.fg_stroke = Stroke::new(1.0_f32, c.text);
     w.active.expansion = 1.0;
     // Open (combo boxes / menus).
     w.open.corner_radius = radius_sm;
     w.open.bg_fill = c.surface_hi;
     w.open.weak_bg_fill = c.surface_hi;
-    w.open.bg_stroke = Stroke::new(1.0, c.border);
-    w.open.fg_stroke = Stroke::new(1.0, c.text);
+    w.open.bg_stroke = Stroke::new(1.0_f32, c.border);
+    w.open.fg_stroke = Stroke::new(1.0_f32, c.text);
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +330,7 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let c = colors(ui);
     egui::Frame::NONE
         .fill(c.surface)
-        .stroke(egui::Stroke::new(1.0, c.border))
+        .stroke(egui::Stroke::new(1.0_f32, c.border))
         .corner_radius(egui::CornerRadius::same(RADIUS))
         .inner_margin(egui::Margin::same(12))
         .outer_margin(egui::Margin {
@@ -362,7 +362,7 @@ pub fn secondary_button(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Re
     ui.add(
         egui::Button::new(egui::RichText::new(label.into()).color(c.text))
             .fill(c.surface_hi)
-            .stroke(egui::Stroke::new(1.0, c.border))
+            .stroke(egui::Stroke::new(1.0_f32, c.border))
             .corner_radius(egui::CornerRadius::same(RADIUS_SM))
             .min_size(egui::vec2(0.0, 32.0)),
     )
@@ -407,7 +407,7 @@ pub fn secondary_button_full(ui: &mut egui::Ui, label: impl Into<String>) -> egu
         egui::vec2(w, 36.0),
         egui::Button::new(egui::RichText::new(label.into()).color(c.text))
             .fill(c.surface_hi)
-            .stroke(egui::Stroke::new(1.0, c.border))
+            .stroke(egui::Stroke::new(1.0_f32, c.border))
             .corner_radius(egui::CornerRadius::same(RADIUS_SM)),
     )
 }
@@ -478,7 +478,7 @@ pub fn badge(ui: &mut egui::Ui, text: impl Into<String>, kind: BadgeKind) -> egu
     };
     egui::Frame::NONE
         .fill(with_alpha(col, 38))
-        .stroke(egui::Stroke::new(1.0, with_alpha(col, 110)))
+        .stroke(egui::Stroke::new(1.0_f32, with_alpha(col, 110)))
         .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(8, 2))
         .show(ui, |ui| {
@@ -528,7 +528,7 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hover: &str) -> egui::Respons
 pub fn banner<R>(ui: &mut egui::Ui, accent: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::NONE
         .fill(with_alpha(accent, 28))
-        .stroke(egui::Stroke::new(1.0, with_alpha(accent, 90)))
+        .stroke(egui::Stroke::new(1.0_f32, with_alpha(accent, 90)))
         .corner_radius(egui::CornerRadius::same(RADIUS_SM))
         .inner_margin(egui::Margin::symmetric(12, 8))
         .outer_margin(egui::Margin {
@@ -563,7 +563,7 @@ pub fn modal<R>(
         .frame(
             egui::Frame::NONE
                 .fill(c.surface)
-                .stroke(egui::Stroke::new(1.0, c.border))
+                .stroke(egui::Stroke::new(1.0_f32, c.border))
                 .corner_radius(egui::CornerRadius::same(RADIUS))
                 .inner_margin(egui::Margin::same(18))
                 .shadow(shadow(8, 28, 140)),
@@ -593,7 +593,7 @@ pub fn toast(ctx: &egui::Context, msg: &str, error: bool) -> bool {
         .show(ctx, |ui| {
             egui::Frame::NONE
                 .fill(c.surface_hi)
-                .stroke(egui::Stroke::new(1.0, accent))
+                .stroke(egui::Stroke::new(1.0_f32, accent))
                 .corner_radius(egui::CornerRadius::same(RADIUS))
                 .inner_margin(egui::Margin::symmetric(14, 10))
                 .shadow(shadow(4, 16, 120))

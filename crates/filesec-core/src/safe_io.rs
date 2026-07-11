@@ -106,10 +106,7 @@ impl Write for SafeFileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match &mut self.file {
             Some(f) => f.write(buf),
-            None => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "safe writer already finished",
-            )),
+            None => Err(io::Error::other("safe writer already finished")),
         }
     }
 

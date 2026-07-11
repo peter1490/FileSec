@@ -5743,7 +5743,7 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         painter.rect_stroke(
             panel_rect.shrink(2.0),
             egui::CornerRadius::same(theme::RADIUS),
-            egui::Stroke::new(2.0, c.accent),
+            egui::Stroke::new(2.0_f32, c.accent),
             egui::StrokeKind::Inside,
         );
         let target = if cur.is_empty() {
@@ -5972,7 +5972,7 @@ fn text_editor_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
         .frame(
             egui::Frame::NONE
                 .fill(cc.surface)
-                .stroke(egui::Stroke::new(1.0, cc.border))
+                .stroke(egui::Stroke::new(1.0_f32, cc.border))
                 .corner_radius(egui::CornerRadius::same(theme::RADIUS))
                 .inner_margin(egui::Margin::same(16)),
         )
@@ -6134,7 +6134,7 @@ fn entry_row(
         ui.painter().rect_stroke(
             rect,
             egui::CornerRadius::same(theme::RADIUS_SM),
-            egui::Stroke::new(1.0, c.accent),
+            egui::Stroke::new(1.0_f32, c.accent),
             egui::StrokeKind::Inside,
         );
     }
