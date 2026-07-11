@@ -738,17 +738,18 @@ impl Store {
                 )) => VaultReaderV2::open(&v2, identity).map_err(err)?,
                 Err(e) => return Err(err(e)),
             };
-            let vault = legacy.to_vault().map_err(err)?;
-            drop(legacy);
             let partial = self.vaults_dir.join(format!("{id}.fsv2.partial"));
             let old = self.vaults_dir.join(format!("{id}.fsv2.old"));
             let _ = std::fs::remove_dir_all(&partial);
             let _ = std::fs::remove_dir_all(&old);
-            let reader = VaultReaderV2::from_vault_with_object_id(
+            // Stream the re-key blob-by-blob straight from the opened source, so a
+            // multi-GB vault never materializes in RAM (peak is a couple of chunks).
+            // `legacy` must stay alive across the build; drop it before moving `v2`.
+            let reader = VaultReaderV2::from_reader_v2_with_object_id(
                 &partial,
                 identity,
                 self_suite(identity),
-                &vault,
+                &legacy,
                 id,
             )
             .map_err(err)?;
@@ -757,6 +758,7 @@ impl Store {
                 .cloned()
                 .ok_or_else(|| "recovered vault has no rollback-protection metadata".to_string())?;
             drop(reader);
+            drop(legacy);
             std::fs::rename(&v2, &old).map_err(err)?;
             if let Err(e) = std::fs::rename(&partial, &v2) {
                 let _ = std::fs::rename(&old, &v2);
@@ -1067,8 +1069,6 @@ impl Store {
                 .state_metadata()
                 .map(|state| state.object_id.clone())
                 .ok_or_else(|| "vault has no rollback metadata".to_string())?;
-            let vault = current.to_vault().map_err(err)?;
-            drop(current);
             let mut partial = dir.clone().into_os_string();
             partial.push(".partial");
             let partial = PathBuf::from(partial);
@@ -1076,8 +1076,11 @@ impl Store {
             old.push(".old");
             let old = PathBuf::from(old);
             let _ = std::fs::remove_dir_all(&partial);
-            let replacement = match VaultReaderV2::from_vault_with_object_id(
-                &partial, recipient, suite, &vault, &object_id,
+            // Stream the re-key blob-by-blob straight from `current`, so a multi-GB
+            // vault never materializes in RAM (peak is a couple of chunks).
+            // `current` must stay alive across the build; drop it before moving `dir`.
+            let replacement = match VaultReaderV2::from_reader_v2_with_object_id(
+                &partial, recipient, suite, &current, &object_id,
             ) {
                 Ok(reader) => reader,
                 Err(e) => {
@@ -1090,6 +1093,7 @@ impl Store {
                 .cloned()
                 .ok_or_else(|| "re-keyed vault has no rollback metadata".to_string())?;
             drop(replacement);
+            drop(current);
             std::fs::rename(&dir, &old).map_err(err)?;
             std::fs::rename(&partial, &dir).map_err(err)?;
             let _ = std::fs::remove_dir_all(&old);

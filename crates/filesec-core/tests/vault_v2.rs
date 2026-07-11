@@ -486,3 +486,206 @@ fn v2_hybrid_suite_roundtrips_at_rest() {
     assert!(VaultReaderV2::open(&dir, &Identity::generate_hybrid("Bob", 0).unwrap()).is_err());
     cleanup(&dir);
 }
+
+// ---- streaming v2 -> v2 re-key (the memory-bounded recovery / upgrade path) ----
+
+#[test]
+fn v2_rekey_roundtrip_all_entries() {
+    let id = ident("Alice");
+    let dir = tmp_dir("rekey-src.fsv2");
+    let dir2 = tmp_dir("rekey-dst.fsv2");
+    let src = build_sample(&dir, &id, SuiteId::Classic);
+
+    // Stream the whole vault into a fresh directory without materializing it.
+    let out = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    let big = big_bytes();
+    let v = VaultReaderV2::open(&dir2, &id).unwrap();
+    assert_eq!(v.name(), "Test Vault");
+    assert_eq!(v.created_at(), 1000);
+    assert_eq!(v.file_count(), 4);
+    assert_eq!(&*v.read_entry("readme.txt").unwrap(), b"hello world");
+    assert_eq!(&*v.read_entry("docs/notes.md").unwrap(), b"# Notes\n");
+    assert_eq!(&*v.read_entry("empty.bin").unwrap(), b"");
+    assert_eq!(&*v.read_entry("data/big.bin").unwrap(), &big[..]);
+    for d in ["docs", "data", "emptydir"] {
+        assert!(
+            v.entries()
+                .iter()
+                .any(|e| e.path == d && e.kind == EntryKind::Dir),
+            "missing dir {d}"
+        );
+    }
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn v2_rekey_exact_multiple_chunk() {
+    // A file whose size is an exact multiple of the 64 KiB chunk exercises the
+    // last-chunk boundary (no trailing short chunk).
+    let id = ident("Alice");
+    let dir = tmp_dir("rekey-exact-src.fsv2");
+    let dir2 = tmp_dir("rekey-exact-dst.fsv2");
+    let payload: Vec<u8> = (0..(64 * 1024 * 2)).map(|i| (i % 251) as u8).collect();
+    let mut src = VaultReaderV2::create(&dir, &id, SuiteId::Classic, "E", 1).unwrap();
+    src.put_file_bytes("exact.bin", &payload, None, None).unwrap();
+
+    let out = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    let v = VaultReaderV2::open(&dir2, &id).unwrap();
+    assert_eq!(&*v.read_entry("exact.bin").unwrap(), &payload[..]);
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn v2_rekey_empty_vault() {
+    let id = ident("Alice");
+    let dir = tmp_dir("rekey-empty-src.fsv2");
+    let dir2 = tmp_dir("rekey-empty-dst.fsv2");
+    let src = VaultReaderV2::create(&dir, &id, SuiteId::Classic, "Empty", 5).unwrap();
+
+    let out = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    let v = VaultReaderV2::open(&dir2, &id).unwrap();
+    assert_eq!(v.file_count(), 0);
+    assert_eq!(v.name(), "Empty");
+    assert_eq!(v.created_at(), 5);
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn v2_rekey_preserves_mtime_mode() {
+    let id = ident("Alice");
+    let dir = tmp_dir("rekey-meta-src.fsv2");
+    let dir2 = tmp_dir("rekey-meta-dst.fsv2");
+    // build_sample puts readme.txt with mtime=123, mode=0o644.
+    let src = build_sample(&dir, &id, SuiteId::Classic);
+
+    let out = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    let v = VaultReaderV2::open(&dir2, &id).unwrap();
+    let e = v
+        .entries()
+        .iter()
+        .find(|e| e.path == "readme.txt")
+        .unwrap();
+    assert_eq!(e.mtime, Some(123));
+    assert_eq!(e.mode, Some(0o644));
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn v2_rekey_preserves_trash() {
+    use filesec_core::format_v2::is_trashed;
+
+    let id = ident("Alice");
+    let dir = tmp_dir("rekey-trash-src.fsv2");
+    let dir2 = tmp_dir("rekey-trash-dst.fsv2");
+    let mut src = build_sample(&dir, &id, SuiteId::Classic);
+    src.put_file_bytes(".trash/9-deadbeef/secret.txt", b"top secret", None, None)
+        .unwrap();
+
+    // A re-key is a faithful round-trip (unlike export), so the trashed file
+    // survives and stays readable.
+    let out = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    let v = VaultReaderV2::open(&dir2, &id).unwrap();
+    assert!(v.entries().iter().any(|e| is_trashed(&e.path)));
+    assert_eq!(
+        &*v.read_entry(".trash/9-deadbeef/secret.txt").unwrap(),
+        b"top secret"
+    );
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn v2_rekey_to_new_identity() {
+    let a = ident("Alice");
+    let b = ident("Bob");
+    let dir = tmp_dir("rekey-idA-src.fsv2");
+    let dir2 = tmp_dir("rekey-idB-dst.fsv2");
+    let src = build_sample(&dir, &a, SuiteId::Classic);
+
+    // Decryption uses the source's own already-unwrapped keys; only the new
+    // manifest key is wrapped for identity B.
+    let out = VaultReaderV2::from_reader_v2(&dir2, &b, SuiteId::Classic, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    assert!(VaultReaderV2::open(&dir2, &a).is_err());
+    let v = VaultReaderV2::open(&dir2, &b).unwrap();
+    assert_eq!(&*v.read_entry("data/big.bin").unwrap(), &big_bytes()[..]);
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[cfg(feature = "pqc")]
+#[test]
+fn v2_rekey_to_hybrid_suite() {
+    // A hybrid-capable identity holds a Classic vault, then re-keys it to the
+    // Hybrid suite — the streamed post-quantum harden step.
+    let alice = Identity::generate_hybrid("Alice", 0).unwrap();
+    let dir = tmp_dir("rekey-classic-src.fsv2");
+    let dir2 = tmp_dir("rekey-hybrid-dst.fsv2");
+    let mut src = VaultReaderV2::create(&dir, &alice, SuiteId::Classic, "H", 7).unwrap();
+    src.put_file_bytes("a.txt", b"hybrid at rest", None, None)
+        .unwrap();
+    src.put_file_bytes("big.bin", &big_bytes(), None, None)
+        .unwrap();
+
+    let out = VaultReaderV2::from_reader_v2(&dir2, &alice, SuiteId::Hybrid, &src).unwrap();
+    drop(out);
+    drop(src);
+
+    let v = VaultReaderV2::open(&dir2, &alice).unwrap();
+    assert_eq!(v.suite(), SuiteId::Hybrid);
+    assert_eq!(&*v.read_entry("a.txt").unwrap(), b"hybrid at rest");
+    assert_eq!(&*v.read_entry("big.bin").unwrap(), &big_bytes()[..]);
+    cleanup(&dir);
+    cleanup(&dir2);
+}
+
+#[test]
+fn v2_rekey_tamper_is_rejected() {
+    let id = ident("Alice");
+    let dir = tmp_dir("rekey-tamper-src.fsv2");
+    let dir2 = tmp_dir("rekey-tamper-dst.fsv2");
+    let v = build_sample(&dir, &id, SuiteId::Classic);
+    drop(v);
+
+    // Corrupt big.bin's blob so a chunk no longer authenticates.
+    let blob = largest_blob(&dir);
+    let mut bytes = std::fs::read(&blob).unwrap();
+    let i = bytes.len() / 2;
+    bytes[i] ^= 0x01;
+    std::fs::write(&blob, &bytes).unwrap();
+
+    // The streaming re-key pulls every source chunk through AEAD, so a corrupted
+    // blob aborts the build. Tampered blob content surfaces as an I/O error
+    // wrapping the auth failure (from StreamDecryptReader), not a bare `Auth`.
+    let src = VaultReaderV2::open(&dir, &id).unwrap();
+    let Err(e) = VaultReaderV2::from_reader_v2(&dir2, &id, SuiteId::Classic, &src) else {
+        panic!("re-key of a tampered vault unexpectedly succeeded");
+    };
+    assert!(
+        matches!(&e, filesec_core::Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData),
+        "expected Io(InvalidData) from tampered blob, got {e:?}"
+    );
+    cleanup(&dir);
+    cleanup(&dir2);
+}

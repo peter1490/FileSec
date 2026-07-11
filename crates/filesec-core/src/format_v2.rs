@@ -971,6 +971,114 @@ impl VaultReaderV2 {
         Ok(me)
     }
 
+    /// Build a fresh v2 vault at `dir` by **streaming** every file from an
+    /// already-opened, verified v2 vault `source` — the in-place re-key path used
+    /// by legacy recovery and the post-quantum upgrade. Each blob is decrypted and
+    /// re-encrypted one chunk at a time (peak memory is a couple of chunks per
+    /// file), so a multi-gigabyte vault is never materialized in RAM the way
+    /// [`Self::to_vault`] + [`Self::from_vault`] would. The whole manifest —
+    /// including the local [`TRASH_DIR`] subtree — is reproduced faithfully, so
+    /// this is a true round-trip, not an export. Reseals the manifest once at the
+    /// end.
+    pub fn from_reader_v2(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        source: &VaultReaderV2,
+    ) -> Result<Self> {
+        Self::from_reader_v2_inner(dir, identity, suite, source, None)
+    }
+
+    /// Like [`Self::from_reader_v2`], but binds the new manifest to the local
+    /// registry/path `object_id`.
+    pub fn from_reader_v2_with_object_id(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        source: &VaultReaderV2,
+        object_id: &str,
+    ) -> Result<Self> {
+        Self::from_reader_v2_inner(dir, identity, suite, source, Some(object_id))
+    }
+
+    fn from_reader_v2_inner(
+        dir: &Path,
+        identity: &Identity,
+        suite: SuiteId,
+        source: &VaultReaderV2,
+        object_id: Option<&str>,
+    ) -> Result<Self> {
+        let mut me = match object_id {
+            Some(object_id) => Self::create_with_object_id(
+                dir,
+                identity,
+                suite,
+                &source.manifest.vault_name,
+                source.manifest.created_at,
+                object_id,
+            )?,
+            None => Self::create(
+                dir,
+                identity,
+                suite,
+                &source.manifest.vault_name,
+                source.manifest.created_at,
+            )?,
+        };
+        // Each v2 blob is self-contained (its own key/nonce), so — unlike the v1
+        // importer — there are no data offsets or contiguity to track: just walk
+        // the manifest and re-stage each entry. Trash is included (a re-key is a
+        // faithful round-trip), matching `to_vault`/`materialize(|_| true)`.
+        for e in &source.manifest.entries {
+            match e.kind {
+                EntryKind::Dir => {
+                    if !me.manifest.entries.iter().any(|x| x.path == e.path) {
+                        me.ensure_dirs(&e.path);
+                        me.manifest.entries.push(dir_entry(e.path.clone()));
+                    }
+                }
+                EntryKind::File => {
+                    // Stream this one blob's plaintext straight into a fresh blob,
+                    // re-hashing as we go. Fresh vault, so this never overwrites
+                    // (no old blob to drop).
+                    let mut src = HashingReader::new(source.entry_plaintext(e)?);
+                    me.stage_file(e.path.clone(), e.blake3, e.size, &mut src, e.mtime, e.mode)?;
+                    // Defense in depth atop the per-chunk AEAD already verified as
+                    // the source was pulled.
+                    if !ct_eq(src.finalize().as_bytes(), &e.blake3) {
+                        return Err(Error::Auth);
+                    }
+                }
+            }
+        }
+        me.reseal_manifest()?;
+        Ok(me)
+    }
+
+    /// A pull-[`Read`] over one file entry's decrypted plaintext, streamed a chunk
+    /// at a time from its blob (peak memory is a couple of chunks). An empty file
+    /// opens no blob. Feeds [`Self::stage_file`] from [`Self::from_reader_v2_inner`]
+    /// without ever buffering the whole file.
+    fn entry_plaintext(&self, e: &EntryV2) -> Result<EntryPlaintext> {
+        if e.size == 0 {
+            return Ok(EntryPlaintext::Empty(std::io::empty()));
+        }
+        if e.chunk_size == 0 {
+            return Err(Error::Format("bad chunk size"));
+        }
+        let key = SymKey::from_bytes(e.key.ok_or(Error::Format("missing blob key"))?);
+        let nonce = e.nonce.as_ref().ok_or(Error::Format("missing blob nonce"))?;
+        let file = BufReader::new(fs_err::File::open(self.blob_path(blob_id(e)?))?);
+        Ok(EntryPlaintext::Blob(aead::StreamDecryptReader::new_with(
+            self.suite.aead_alg(),
+            &key,
+            nonce,
+            &self.header_bytes,
+            file,
+            e.chunk_size as usize,
+        )?))
+    }
+
     /// Build a fresh v2 vault at `dir` from an in-memory [`Vault`] (the create /
     /// save path); reseals the manifest once at the end.
     pub fn from_vault(
@@ -1298,6 +1406,24 @@ struct CurrentBlob {
     dec: aead::StreamDecryptReader<BufReader<fs_err::File>>,
     hasher: blake3::Hasher,
     expected: [u8; 32],
+}
+
+/// A pull-[`Read`] over a single v2 file entry's plaintext: either an empty file
+/// (no blob is opened) or a blob decrypted one chunk at a time. Lets
+/// [`VaultReaderV2::from_reader_v2_inner`] hand [`VaultReaderV2::stage_file`] one
+/// concrete reader per file without buffering the whole file.
+enum EntryPlaintext {
+    Empty(std::io::Empty),
+    Blob(aead::StreamDecryptReader<BufReader<fs_err::File>>),
+}
+
+impl Read for EntryPlaintext {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            EntryPlaintext::Empty(r) => r.read(buf),
+            EntryPlaintext::Blob(r) => r.read(buf),
+        }
+    }
 }
 
 /// A [`Read`] that yields a v2 vault's plaintext, concatenated in manifest order,
