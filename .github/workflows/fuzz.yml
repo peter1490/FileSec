@@ -53,16 +53,19 @@ jobs:
           sudo apt-get install -y --no-install-recommends libssl-dev
 
       # cargo-fuzz requires nightly for the AddressSanitizer instrumentation.
+      # Pinned to a dated nightly (not floating `nightly`) so the job is
+      # reproducible and doesn't silently break when a newer nightly tightens
+      # the language; bump this date deliberately, like any other pin.
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-01
 
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
         with:
           workspaces: fuzz
 
       - name: Install cargo-fuzz (pinned)
-        run: cargo install cargo-fuzz --version 0.12.0 --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
 
       # A PR pass is a quick smoke; scheduled/dispatch runs go longer.
       - name: Smoke-run ${{ matrix.target }}
