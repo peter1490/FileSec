@@ -60,7 +60,7 @@
 
     <Product
         Id='*'
-        Name='filesec-gui'
+        Name='FileSec'
         UpgradeCode='B853FCE9-C700-4FFF-9B6E-93F97F0B754F'
         Manufacturer='FileSec contributors'
         Language='1033'
@@ -83,11 +83,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='filesec-gui Installation'/>
+        <Property Id='DiskPrompt' Value='FileSec Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='filesec-gui'>
+                <Directory Id='APPLICATIONFOLDER' Name='FileSec'>
                     
                     <!--
                       Enabling the license sidecar file in the installer is a four step process:

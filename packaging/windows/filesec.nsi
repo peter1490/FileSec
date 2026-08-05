@@ -1,9 +1,14 @@
 ; NSIS installer for FileSec. The same script builds both the classical and the
 ; post-quantum installers; the variant is selected with /D defines, e.g.:
 ;
-;   makensis -NOCD /DAPP_NAME="FileSec" /DAPP_EXE="filesec.exe" /DAPP_VERSION="0.1.0" \
-;            /DSRC_EXE="target\release\filesec.exe" /DOUT_FILE="FileSec-0.1.0-setup.exe" \
+;   makensis -NOCD /DAPP_NAME="FileSec" /DAPP_EXE="filesec.exe" /DAPP_VERSION="0.4.3" \
+;            /DSRC_EXE="target\release\filesec.exe" \
+;            /DOUT_FILE="filesec-0.4.3-x86_64-pc-windows-msvc-setup.exe" \
 ;            /DREG_KEY="FileSec" packaging\windows\filesec.nsi
+;
+; APP_NAME must differ between the two variants ("FileSec" / "FileSec PQC"):
+; InstallDir and the Start Menu shortcut below are both derived from it, so
+; sharing a name makes one build overwrite the other's installation.
 ;
 ; Run from the repo root with -NOCD: without it makensis switches its working
 ; directory to the script's folder and the relative SRC_EXE / APP_ICON paths

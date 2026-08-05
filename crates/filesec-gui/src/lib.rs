@@ -9,8 +9,10 @@ pub mod autounlock;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod passkey;
+pub mod prefs;
 pub mod store;
 pub mod theme;
+pub mod wipe;
 
 /// Launch the desktop app with the given window title.
 ///
@@ -37,7 +39,11 @@ pub fn run(title: &str) -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             theme::install(&cc.egui_ctx);
-            Ok(Box::new(app::App::new()))
+            let app = app::App::new();
+            // Before the first frame, so the unlock screen already paints in the
+            // theme the user chose last time rather than flashing the system one.
+            app.apply_saved_theme(&cc.egui_ctx);
+            Ok(Box::new(app))
         }),
     )
 }

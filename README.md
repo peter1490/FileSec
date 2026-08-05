@@ -284,6 +284,15 @@ Data lives in the per-OS application directory (override with the
 
 Files are created with `0600`/`0700` permissions on Unix.
 
+Two files there are **not** encrypted, both by necessity and neither carrying
+anything confidential: `.state-anchors` (the degraded-mode rollback high-water
+marks, when no OS secure store is available) and `.prefs`, which holds the theme
+choice shown in Settings. The theme has to be applied to the very first frame —
+the unlock screen is painted before there is an identity to decrypt anything
+with — so an encrypted preference could not do its job. The most an attacker
+gains by rewriting `.prefs` is that the app opens in the wrong colour; anything
+security-relevant belongs in the keychain or the encrypted store instead.
+
 ---
 
 ## Build & run
@@ -477,6 +486,21 @@ vault, lock, or quit. Caveats of the close-detection: it fires when the
 already running the wipe waits until that whole app quits (the leave-the-vault
 backstop still covers it); on Linux there is no blocking launcher, so views are
 wiped on leaving the vault rather than on close.
+
+**Temp files carry no filenames.** Both flows name the temp `<random-hex>.<ext>`
+— never the name the file has in the vault. A filename outlives the bytes: it
+lands in the opening app's "Recent Items", in OS index caches, and in any backup
+that snapshots the directory, so writing it out would leak vault contents even
+after the file itself is shredded. Only a short, plain-ASCII extension survives,
+because the OS launchers need it to pick the right application; the real name is
+shown in FileSec's own banner while the file is open.
+
+**Wiping never blocks the UI.** Securely overwriting a multi-gigabyte temp takes
+a while, so it runs on a background shredder thread: leaving a vault, locking, or
+navigating away returns immediately. Quitting holds the window open behind a
+"Securing temporary files…" spinner until the queue drains (capped at five
+seconds — the next unlock's `checkout/` sweep is the backstop), so the app never
+appears frozen on the way out.
 
 **Trust-UX polish** (the verification workflow): adding a contact is now a
 preview-then-confirm step — paste an armored block *or* a bare base64 body (the

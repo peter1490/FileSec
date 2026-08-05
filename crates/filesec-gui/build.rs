@@ -38,6 +38,16 @@ const DPI_MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1"
 "#;
 
 fn main() {
+    // Record the target triple for the Settings page (`env!("FILESEC_TARGET")`).
+    // Cargo exposes TARGET to build scripts only — it is not otherwise visible
+    // to the crate being compiled. Emitted before the Windows-only early return
+    // below so every platform gets it, and re-evaluated per target so
+    // cross-compiles report the target rather than the host.
+    println!(
+        "cargo:rustc-env=FILESEC_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
+    );
+
     if std::env::var_os("CARGO_CFG_WINDOWS").is_none() {
         return;
     }

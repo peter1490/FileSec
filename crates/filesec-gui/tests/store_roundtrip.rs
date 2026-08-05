@@ -7,6 +7,7 @@ use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::{KeystoreFile, PasskeyEnrollment, DEVICE_TOKEN_LEN, HMAC_SECRET_LEN};
 use filesec_core::state::{StateAnchor, StateObjectType};
 use filesec_core::vault::Vault;
+use filesec_gui::prefs::{Prefs, ThemeChoice};
 use filesec_gui::store::{
     extract_vault, make_readonly, new_vault_id, secure_wipe, Registry, Store, VaultMeta,
 };
@@ -509,14 +510,20 @@ fn secure_wipe_handles_readonly_view_temp() {
 }
 
 #[test]
-fn create_private_checkout_file_is_hardened_and_keeps_extension() {
+fn create_private_checkout_file_is_hardened_and_keeps_only_the_extension() {
     let dir = tmp();
     let store = Store::at(&dir).unwrap();
     let path = store.create_private_checkout_file("notes.md").unwrap();
     assert!(path.exists());
     assert!(path.starts_with(store.checkout_dir()));
-    // Extension preserved so the OS opens it with the right application.
-    assert!(path.to_string_lossy().ends_with("notes.md"));
+    let name = path.file_name().unwrap().to_str().unwrap();
+    // Extension preserved so the OS opens it with the right application...
+    assert!(name.ends_with(".md"), "{name}");
+    // ...but the vault's own filename never touches the disk.
+    assert!(
+        !name.contains("notes"),
+        "temp name {name} leaks the filename"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -626,5 +633,107 @@ fn migrate_classical_store_to_post_quantum() {
         SuiteId::Hybrid
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// UI preferences — the one file the store keeps unencrypted, so the theme can be
+// applied to the first frame (before there is an identity to decrypt with).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn prefs_default_when_absent_and_survive_a_restart() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+
+    // Nothing written yet: follow the system, as every build before this did.
+    assert_eq!(store.load_prefs(), Prefs::default());
+    assert_eq!(store.load_prefs().theme, ThemeChoice::System);
+
+    store
+        .save_prefs(&Prefs {
+            theme: ThemeChoice::Dark,
+            ..Prefs::default()
+        })
+        .unwrap();
+
+    // A *fresh* Store proves this came off disk rather than out of memory.
+    let reopened = Store::at(&dir).unwrap();
+    assert_eq!(reopened.load_prefs().theme, ThemeChoice::Dark);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join(".prefs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "prefs file must be owner-only");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_theme_choice_survives_a_restart() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    for choice in ThemeChoice::ALL {
+        store
+            .save_prefs(&Prefs {
+                theme: choice,
+                ..Prefs::default()
+            })
+            .unwrap();
+        assert_eq!(
+            Store::at(&dir).unwrap().load_prefs().theme,
+            choice,
+            "{choice:?} did not survive"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn corrupt_or_future_prefs_fall_back_to_defaults() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+
+    // Not CBOR at all.
+    std::fs::write(dir.join(".prefs"), b"this is not cbor").unwrap();
+    assert_eq!(store.load_prefs(), Prefs::default());
+
+    // Valid CBOR, but written by a build whose format we cannot interpret.
+    let future = filesec_core::codec::to_vec(&Prefs {
+        version: 999,
+        theme: ThemeChoice::Dark,
+    })
+    .unwrap();
+    std::fs::write(dir.join(".prefs"), &future).unwrap();
+    assert_eq!(store.load_prefs(), Prefs::default());
+
+    // Empty file.
+    std::fs::write(dir.join(".prefs"), b"").unwrap();
+    assert_eq!(store.load_prefs(), Prefs::default());
+
+    // A preference that cannot be read must never block the app: the store is
+    // still fully usable afterwards.
+    store
+        .save_prefs(&Prefs {
+            theme: ThemeChoice::Light,
+            ..Prefs::default()
+        })
+        .unwrap();
+    assert_eq!(store.load_prefs().theme, ThemeChoice::Light);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversized_prefs_are_rejected_without_reading_them() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    std::fs::write(dir.join(".prefs"), vec![0u8; 128 * 1024]).unwrap();
+    assert_eq!(store.load_prefs(), Prefs::default());
     let _ = std::fs::remove_dir_all(&dir);
 }

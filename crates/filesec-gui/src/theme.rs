@@ -5,7 +5,9 @@
 //! against the same helpers. [`install`] is called once from
 //! [`crate::run`] with the eframe [`egui::Context`]; it registers the bundled
 //! fonts and installs a light and a dark [`egui::Style`], then leaves egui to
-//! follow the OS theme (overridable with the sidebar toggle).
+//! follow the OS theme. [`crate::run`] immediately applies the user's saved
+//! choice on top via [`apply_choice`], so the unlock screen already paints in
+//! the right theme.
 //!
 //! The widget helpers ([`card`], [`primary_button`], [`badge`], …) only *build*
 //! UI and return the same [`egui::Response`] the call sites already branch on, so
@@ -15,6 +17,8 @@
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32};
+
+use crate::prefs::ThemeChoice;
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -137,10 +141,37 @@ fn shadow(offset_y: i8, blur: u8, alpha: u8) -> egui::epaint::Shadow {
 /// Register bundled fonts and install the light/dark styles. Call once at startup.
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
-    // Follow the OS appearance by default; the sidebar toggle overrides this.
+    // Follow the OS appearance until told otherwise. `crate::run` applies the
+    // saved choice right after this, before the first frame.
     ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::System);
     ctx.set_style_of(egui::Theme::Dark, style_for(egui::Theme::Dark));
     ctx.set_style_of(egui::Theme::Light, style_for(egui::Theme::Light));
+}
+
+/// Apply a saved [`ThemeChoice`].
+///
+/// The only place [`ThemeChoice`] is mapped onto egui, so the persistence model
+/// in [`crate::prefs`] stays UI-free.
+pub fn apply_choice(ctx: &egui::Context, choice: ThemeChoice) {
+    ctx.set_theme(match choice {
+        ThemeChoice::System => egui::ThemePreference::System,
+        ThemeChoice::Light => egui::ThemePreference::Light,
+        ThemeChoice::Dark => egui::ThemePreference::Dark,
+    });
+}
+
+/// The choice currently in force.
+///
+/// egui's `Options` holds the live preference, so the Settings page reads it
+/// back from here rather than keeping a second copy on `App` that could drift
+/// out of sync with what is actually on screen.
+#[must_use]
+pub fn current_choice(ctx: &egui::Context) -> ThemeChoice {
+    match ctx.options(|o| o.theme_preference) {
+        egui::ThemePreference::System => ThemeChoice::System,
+        egui::ThemePreference::Light => ThemeChoice::Light,
+        egui::ThemePreference::Dark => ThemeChoice::Dark,
+    }
 }
 
 fn install_fonts(ctx: &egui::Context) {

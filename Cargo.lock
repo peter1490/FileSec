@@ -1570,7 +1570,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filesec-core"
-version = "0.2.0"
+version = "0.4.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "filesec-gui"
-version = "0.2.0"
+version = "0.4.3"
 dependencies = [
  "ctap-hid-fido2",
  "directories",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "filesec-pqc"
-version = "0.2.0"
+version = "0.4.3"
 dependencies = [
  "eframe",
  "filesec-gui",

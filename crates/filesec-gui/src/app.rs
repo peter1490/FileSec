@@ -29,9 +29,11 @@ use filesec_core::SuiteId;
 
 use crate::autounlock;
 use crate::passkey;
+use crate::prefs::ThemeChoice;
 use crate::store::{new_vault_id, write_private_export, Registry, Store, StoreResult, VaultMeta};
 
 use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
+use crate::wipe::{WipeHandle, Wiper};
 
 const MIN_PASSPHRASE_CHARS: usize = 12;
 const MIN_PASSPHRASE_SCORE: u32 = 7;
@@ -73,7 +75,25 @@ pub struct App {
     /// try to auto-unlock with it on first launch. Cleared after the attempt is
     /// fired, and never set after a manual lock (locking signals intent to stop).
     auto_unlock_pending: bool,
+    /// Background shredder for plaintext temp files. Lives here rather than on
+    /// [`Session`] because locking or closing a vault drops the session while its
+    /// wipes are still running.
+    wiper: Wiper,
+    /// Set once the user asks to close the window and there are still temps to
+    /// shred; see [`App::poll_exit_wipe`].
+    exit_wipe: Option<ExitWipe>,
 }
+
+/// A close request being held open while the wiper drains.
+struct ExitWipe {
+    /// egui-clock time (seconds) after which we stop waiting and close anyway.
+    deadline: f64,
+}
+
+/// How long a quit will wait for the shredder before giving up and closing.
+/// Anything left behind is swept by `Store::clean_checkout_dir` on the next
+/// unlock, so the cap trades a narrow exposure window for never hanging the app.
+const EXIT_WIPE_GRACE: f64 = 5.0;
 
 struct Toast {
     msg: String,
@@ -251,6 +271,9 @@ enum Nav {
     Identity,
     #[cfg(feature = "net")]
     Transfer,
+    /// Reached from the sidebar gear rather than a nav row, so it sits last and
+    /// keeps the `cfg` attribute attached only to `Transfer`.
+    Settings,
 }
 
 /// Sort order for the in-vault file browser. Directories always sort before
@@ -608,6 +631,14 @@ enum Action {
     Unlock,
     Lock,
     Nav(Nav),
+    /// Switch the appearance and remember it for next launch.
+    SetTheme(ThemeChoice),
+    /// Copy the data-directory path shown on the Settings page.
+    CopyDataDir,
+    /// Open the data directory in the OS file manager.
+    RevealDataDir,
+    /// Copy a one-line build summary for bug reports.
+    CopyBuildInfo,
     ToggleNewVault(bool),
     CreateVault,
     OpenVault(String),
@@ -905,6 +936,8 @@ impl App {
                     toast: None,
                     job: None,
                     auto_unlock_pending,
+                    wiper: Wiper::new(),
+                    exit_wipe: None,
                 }
             }
             Err(e) => App {
@@ -913,8 +946,28 @@ impl App {
                 toast: None,
                 job: None,
                 auto_unlock_pending: false,
+                wiper: Wiper::new(),
+                exit_wipe: None,
             },
         }
+    }
+
+    /// Apply the theme saved in the data directory.
+    ///
+    /// Separate from [`App::new`] because the preference lives on the egui
+    /// [`egui::Context`], which `new` has no access to. [`crate::run`] calls this
+    /// straight after [`theme::install`], before the first frame is painted, so
+    /// the unlock and first-run screens already honour the choice — waiting for
+    /// a session would flash the wrong theme on every launch.
+    ///
+    /// Falls back to following the system when there is no store (the fatal
+    /// screen) or nothing saved yet.
+    pub fn apply_saved_theme(&self, ctx: &egui::Context) {
+        let choice = self
+            .store
+            .as_ref()
+            .map_or_else(ThemeChoice::default, |s| s.load_prefs().theme);
+        theme::apply_choice(ctx, choice);
     }
 }
 
@@ -930,7 +983,10 @@ impl eframe::App for App {
         // Drain any direct-transfer events (independent of the one-shot job slot).
         #[cfg(feature = "net")]
         self.poll_transfer(ctx);
-        let busy = self.job.is_some();
+        // Hold a close request open while plaintext temps are still being shredded,
+        // painting a spinner rather than a frozen window.
+        let exiting = self.poll_exit_wipe(ctx);
+        let busy = self.job.is_some() || exiting;
         let mut action: Option<Action> = None;
 
         // Left sidebar — only once unlocked. Auth/fatal screens are full-window.
@@ -982,13 +1038,20 @@ impl eframe::App for App {
             }
         }
 
-        // Busy overlay: dimmed backdrop + centered spinner.
+        // Busy overlay: dimmed backdrop + centered spinner. A pending shutdown
+        // takes the label, so the user sees why the window is still up.
         if busy {
-            let label = self
-                .job
-                .as_ref()
-                .map(|j| j.label.clone())
-                .unwrap_or_default();
+            let label = if exiting {
+                match self.wiper.pending() {
+                    0 | 1 => "Securing temporary files…".to_string(),
+                    n => format!("Securing temporary files… ({n} remaining)"),
+                }
+            } else {
+                self.job
+                    .as_ref()
+                    .map(|j| j.label.clone())
+                    .unwrap_or_default()
+            };
             egui::Modal::new(egui::Id::new("working"))
                 .backdrop_color(Color32::from_black_alpha(140))
                 .show(ctx, |ui| {
@@ -1019,16 +1082,18 @@ impl eframe::App for App {
         }
     }
 
-    /// Best-effort wipe of an active check-out's temp file and any read-only view
-    /// temps on a clean exit. A hard crash (SIGKILL/power loss) bypasses this; the
-    /// next-unlock `clean_checkout_dir` is the backstop.
+    /// Last chance to wipe an active check-out's temp file and any read-only view
+    /// temps. Normally a no-op: [`App::poll_exit_wipe`] already queued them and
+    /// waited with the UI still painting. This covers exits that bypass that gate
+    /// (an OS logout, a `Close` command from elsewhere). A hard crash
+    /// (SIGKILL/power loss) bypasses even this; the next-unlock
+    /// `clean_checkout_dir` is the backstop.
+    ///
+    /// The window is already gone here, so there is no UI left to block — but the
+    /// wait is still bounded so a slow shred cannot hang the quit.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let State::Unlocked(s) = &mut self.state {
-            if let Some(c) = &s.checkout {
-                let _ = crate::store::secure_wipe(&c.temp_path);
-            }
-            wipe_all_views(&mut s.views);
-        }
+        self.wipe_all_temps(None);
+        self.wiper.finish(std::time::Duration::from_secs(2));
     }
 }
 
@@ -1062,7 +1127,7 @@ impl App {
             #[cfg(feature = "net")]
             nav_item(ui, theme::icon::SEND, "Transfer", Nav::Transfer);
 
-            // Bottom-pinned: theme controls and Lock.
+            // Bottom-pinned: theme shortcut, Settings and Lock.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.add_space(2.0);
                 if theme::secondary_button(ui, "Lock").clicked() {
@@ -1070,19 +1135,15 @@ impl App {
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
+                    // One-click light/dark flip. The full three-way control,
+                    // including "follow the system", lives on the Settings page;
+                    // this shortcut stays usable during a check-out, when
+                    // navigating away is refused.
                     let dark = ui.visuals().dark_mode;
-                    let (glyph, hover, pref) = if dark {
-                        (
-                            theme::icon::SUN,
-                            "Switch to light",
-                            egui::ThemePreference::Light,
-                        )
+                    let (glyph, hover, choice) = if dark {
+                        (theme::icon::SUN, "Switch to light", ThemeChoice::Light)
                     } else {
-                        (
-                            theme::icon::MOON,
-                            "Switch to dark",
-                            egui::ThemePreference::Dark,
-                        )
+                        (theme::icon::MOON, "Switch to dark", ThemeChoice::Dark)
                     };
                     if ui
                         .add(
@@ -1092,19 +1153,23 @@ impl App {
                         .on_hover_text(hover)
                         .clicked()
                     {
-                        ui.ctx().set_theme(pref);
+                        *action = Some(Action::SetTheme(choice));
                     }
+                    // Settings has no nav row, so the accent tint is its
+                    // selected-state indicator.
+                    let on_settings = s.open.is_none() && s.nav == Nav::Settings;
+                    let gear_color = if on_settings { c.accent } else { c.text_muted };
                     if ui
                         .add(
                             egui::Button::new(
-                                theme::icon_text(theme::icon::GEAR, 16.0).color(c.text_muted),
+                                theme::icon_text(theme::icon::GEAR, 16.0).color(gear_color),
                             )
                             .frame(false),
                         )
-                        .on_hover_text("Follow system theme")
+                        .on_hover_text("Settings")
                         .clicked()
                     {
-                        ui.ctx().set_theme(egui::ThemePreference::System);
+                        *action = Some(Action::Nav(Nav::Settings));
                     }
                 });
             });
@@ -1383,6 +1448,97 @@ impl App {
         matches!(&self.state, State::Unlocked(s) if s.checkout.is_some())
     }
 
+    /// Hand every read-only view's temp file to the background shredder and clear
+    /// the list. Called when leaving the vault (close/nav/lock).
+    ///
+    /// Returns immediately: `secure_wipe` overwrites the whole file and `fsync`s,
+    /// which takes minutes on a large one, and the UI must not wait for it. The
+    /// banner clears in this frame; the shredding finishes behind the scenes.
+    /// Idempotent — `secure_wipe` tolerates an already-gone file, so a view whose
+    /// close-watcher got there first is harmless.
+    fn wipe_all_views(&mut self, ctx: &egui::Context) {
+        let paths: Vec<std::path::PathBuf> = match &mut self.state {
+            State::Unlocked(s) => s.views.drain(..).map(|v| v.temp_path).collect(),
+            _ => Vec::new(),
+        };
+        for p in paths {
+            self.wiper.enqueue(ctx, p);
+        }
+    }
+
+    /// Hand *every* plaintext temp this session still owns — the checked-out file
+    /// as well as all read-only views — to the shredder. Shutdown only: it drops
+    /// an in-flight check-out without checking it in, which is the long-standing
+    /// on-exit behaviour.
+    ///
+    /// The check-out temp is left alone while a background job is running: a
+    /// check-in streams that exact file back into the vault, and shredding it
+    /// mid-read would feed the worker random bytes. Leaving plaintext for the
+    /// next unlock's `clean_checkout_dir` sweep is the safer of the two failures.
+    ///
+    /// `ctx` is `None` from `on_exit`, where the window is already gone.
+    fn wipe_all_temps(&mut self, ctx: Option<&egui::Context>) {
+        let job_owns_checkout = self.job.is_some();
+        let paths: Vec<std::path::PathBuf> = match &mut self.state {
+            State::Unlocked(s) => s
+                .checkout
+                .take_if(|_| !job_owns_checkout)
+                .map(|c| c.temp_path)
+                .into_iter()
+                .chain(s.views.drain(..).map(|v| v.temp_path))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for p in paths {
+            match ctx {
+                Some(ctx) => self.wiper.enqueue(ctx, p),
+                None => self.wiper.enqueue_quiet(p),
+            }
+        }
+    }
+
+    /// Keep the window alive while the shredder finishes this session's plaintext
+    /// temps, instead of freezing on the way out. Returns `true` while a close is
+    /// being held open.
+    ///
+    /// `on_exit` runs *after* the window is torn down, so waiting there just makes
+    /// the app look hung. Instead the first close request queues every temp and
+    /// cancels the close; later frames keep painting a spinner until the queue
+    /// drains, then issue the close ourselves. If the queue outlives
+    /// [`EXIT_WIPE_GRACE`] we close anyway — `Store::clean_checkout_dir` shreds
+    /// whatever is left on the next unlock.
+    fn poll_exit_wipe(&mut self, ctx: &egui::Context) -> bool {
+        let now = ctx.input(|i| i.time);
+        if self.exit_wipe.is_none() {
+            if !ctx.input(|i| i.viewport().close_requested()) {
+                return false;
+            }
+            self.wipe_all_temps(Some(ctx));
+            if self.wiper.pending() == 0 {
+                // Nothing left to shred (the common case — most temps are queued
+                // the moment their viewer closes). Let the close through.
+                return false;
+            }
+            self.exit_wipe = Some(ExitWipe {
+                deadline: now + EXIT_WIPE_GRACE,
+            });
+        }
+        let deadline = match &self.exit_wipe {
+            Some(e) => e.deadline,
+            None => return false,
+        };
+        if self.wiper.pending() == 0 || now > deadline {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return true;
+        }
+        // `CancelClose` only counts on the frame the OS asked us to close; on the
+        // frames after that it is a harmless no-op, so sending it unconditionally
+        // keeps this in one place.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        true
+    }
+
     fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             // --- instant, UI-only actions ---
@@ -1391,9 +1547,7 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
-                if let State::Unlocked(s) = &mut self.state {
-                    wipe_all_views(&mut s.views);
-                }
+                self.wipe_all_views(ctx);
                 self.state = match &self.store {
                     Some(store) => State::Unlock(Unlock::for_store(store)),
                     None => State::Unlock(Unlock::default()),
@@ -1427,11 +1581,54 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
+                self.wipe_all_views(ctx);
                 if let State::Unlocked(s) = &mut self.state {
-                    wipe_all_views(&mut s.views);
                     s.nav = n;
                     s.open = None;
                 }
+            }
+            Action::SetTheme(choice) => {
+                // Apply first: the appearance changes even if the write fails.
+                theme::apply_choice(ctx, choice);
+                if let Some(store) = &self.store {
+                    // Read-modify-write rather than writing a fresh `Prefs`, so
+                    // a preference added by a newer build is not clobbered.
+                    let mut prefs = store.load_prefs();
+                    prefs.theme = choice;
+                    if store.save_prefs(&prefs).is_err() {
+                        self.set_toast(
+                            "Theme changed, but it could not be saved for next time.",
+                            true,
+                        );
+                    }
+                }
+            }
+            Action::CopyDataDir => {
+                let dir = if let State::Unlocked(s) = &self.state {
+                    Some(s.data_dir.clone())
+                } else {
+                    None
+                };
+                if let Some(dir) = dir {
+                    ctx.copy_text(dir);
+                    self.set_toast("Data folder path copied to clipboard.", false);
+                }
+            }
+            Action::RevealDataDir => {
+                let dir = if let State::Unlocked(s) = &self.state {
+                    Some(std::path::PathBuf::from(&s.data_dir))
+                } else {
+                    None
+                };
+                if let Some(dir) = dir {
+                    if !reveal_in_file_manager(&dir) {
+                        self.set_toast("Could not open the data folder.", true);
+                    }
+                }
+            }
+            Action::CopyBuildInfo => {
+                ctx.copy_text(build_info_line());
+                self.set_toast("Build details copied to clipboard.", false);
             }
             Action::ToggleNewVault(b) => {
                 if let State::Unlocked(s) = &mut self.state {
@@ -1446,8 +1643,8 @@ impl App {
                     self.set_toast("Check in or discard your edit first.", true);
                     return;
                 }
+                self.wipe_all_views(ctx);
                 if let State::Unlocked(s) = &mut self.state {
-                    wipe_all_views(&mut s.views);
                     s.open = None;
                     s.reset_browse();
                 }
@@ -3282,10 +3479,12 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        let leaf_clean = sanitize_leaf(&leaf);
+        let wiper = self.wiper.handle();
+        let view_ctx = ctx.clone();
         self.spawn_job(ctx, "Opening…", move || {
             // Decrypt the one file into a private temp, then drop it to read-only.
-            let temp_path = match store.create_private_checkout_file(&leaf_clean) {
+            // The temp is named `<random>.<ext>` — never the vault's own filename.
+            let temp_path = match store.create_private_checkout_file(&leaf) {
                 Ok(p) => p,
                 Err(e) => return JobReport::err(e),
             };
@@ -3319,7 +3518,7 @@ impl App {
             // Launch the app and, where the platform can report it, watch for the
             // app to close and wipe the temp then. Otherwise it's wiped on leaving
             // the vault.
-            let msg = match start_view(&temp_path) {
+            let msg = match start_view(&temp_path, &wiper, &view_ctx) {
                 ViewLaunch::WatchingForClose => {
                     format!("Viewing {leaf} (read-only) — wiped when you close it.")
                 }
@@ -3381,12 +3580,13 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        let leaf_clean = sanitize_leaf(&leaf);
         self.spawn_job(ctx, "Checking out…", move || {
             // Create the private (0600-from-creation) temp file, then stream the
             // one file's plaintext into it. Wipe on any failure so no partial
-            // plaintext is left behind.
-            let temp_path = match store.create_private_checkout_file(&leaf_clean) {
+            // plaintext is left behind. The temp is named `<random>.<ext>`, so the
+            // editor's title bar and the OS recent-items list never see the real
+            // name — the in-app banner is where you see what you are editing.
+            let temp_path = match store.create_private_checkout_file(&leaf) {
                 Ok(p) => p,
                 Err(e) => return JobReport::err(e),
             };
@@ -5189,6 +5389,7 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             Nav::Identity => identity_ui(s, ui, action),
             #[cfg(feature = "net")]
             Nav::Transfer => transfer_ui(s, ui, action),
+            Nav::Settings => settings_ui(s, ui, action),
         }
     }
 
@@ -6566,11 +6767,243 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
         }
 
         ui.add_space(4.0);
+        // The path itself now lives on the Settings page, with copy/reveal
+        // actions, so it is documented in exactly one place.
         ui.label(
-            RichText::new(format!("Encrypted data is stored at: {}", s.data_dir))
+            RichText::new("Where your encrypted data is stored is shown in Settings (⚙).")
                 .color(cc.text_muted)
                 .small(),
         );
+    });
+}
+
+/// The cargo features this binary was compiled with, in manifest order.
+///
+/// Uses `cfg!` (an expression, so every branch is always type-checked) rather
+/// than `#[cfg]` attributes, so all feature permutations compile the same code.
+fn compiled_features() -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if cfg!(feature = "pqc") {
+        v.push("pqc");
+    }
+    if cfg!(feature = "net") {
+        v.push("net");
+    }
+    if cfg!(feature = "keyring") {
+        v.push("keyring");
+    }
+    if cfg!(feature = "passkey") {
+        v.push("passkey");
+    }
+    v
+}
+
+/// Which of the two shipped builds this is.
+///
+/// Both compile the post-quantum suites in and both default new identities to
+/// classical; the functional difference is networking. See RELEASE.md.
+fn build_variant() -> &'static str {
+    if cfg!(feature = "net") {
+        "Networking build — offline exchange plus direct peer-to-peer transfer"
+    } else {
+        "Standard build — offline container exchange"
+    }
+}
+
+/// One-line build summary, for pasting into a bug report.
+fn build_info_line() -> String {
+    let features = compiled_features();
+    let features = if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(",")
+    };
+    format!(
+        "FileSec {} ({}) target={} features={}",
+        env!("CARGO_PKG_VERSION"),
+        if cfg!(feature = "net") {
+            "networking"
+        } else {
+            "standard"
+        },
+        env!("FILESEC_TARGET"),
+        features,
+    )
+}
+
+/// Open `dir` in the OS file manager.
+///
+/// Deliberately not [`start_view`]: that opens a *decrypted temp* and hands the
+/// path to the shredder's close-watcher. Here there is nothing to wipe, so no
+/// watcher thread and no blocking launcher. Returns `false` if the launcher
+/// could not be spawned.
+fn reveal_in_file_manager(dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    // Windows' explorer.exe returns a non-zero exit code even when it succeeds,
+    // so only the spawn itself is checked.
+    cmd.arg(dir).spawn().is_ok()
+}
+
+/// Appearance, storage location, on-device protections, and build details.
+///
+/// Reached from the sidebar gear. The gear used to be a third theme button
+/// ("follow system"); that choice now lives here alongside light and dark, so
+/// nothing was lost by repurposing it.
+fn settings_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let cc = theme::colors(ui);
+    theme::section_header(ui, "Settings", |_ui| {});
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        // ------------------------------------------------------------ Appearance
+        theme::card(ui, |ui| {
+            ui.label(RichText::new("Appearance").strong());
+            ui.add_space(6.0);
+            // egui's Options holds the live preference, so read it back rather
+            // than keeping a second copy that could drift from what is on screen.
+            let current = theme::current_choice(ui.ctx());
+            ui.horizontal(|ui| {
+                for choice in ThemeChoice::ALL {
+                    if ui
+                        .selectable_label(current == choice, choice.label())
+                        .clicked()
+                    {
+                        *action = Some(Action::SetTheme(choice));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            let hint = match current {
+                ThemeChoice::System => {
+                    if ui.visuals().dark_mode {
+                        "Following the system appearance (currently dark)."
+                    } else {
+                        "Following the system appearance (currently light)."
+                    }
+                }
+                ThemeChoice::Light => "Always light, whatever the system is set to.",
+                ThemeChoice::Dark => "Always dark, whatever the system is set to.",
+            };
+            ui.label(RichText::new(hint).color(cc.text_muted).small());
+        });
+
+        // ---------------------------------------------------------------- Data
+        theme::card(ui, |ui| {
+            ui.label(RichText::new("Data folder").strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(&s.data_dir).monospace().small());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if theme::icon_button(ui, theme::icon::COPY, "Copy path").clicked() {
+                    *action = Some(Action::CopyDataDir);
+                }
+                if theme::secondary_button(ui, "Show in file manager").clicked() {
+                    *action = Some(Action::RevealDataDir);
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Vaults, contacts and the vault index are encrypted to your own identity \
+                     here. Set FILESEC_DATA_DIR to use a different folder.",
+                )
+                .color(cc.text_muted)
+                .small(),
+            );
+        });
+
+        // ---------------------------------------------------- On-device protection
+        theme::card(ui, |ui| {
+            ui.label(RichText::new("Protection on this device").strong());
+            ui.add_space(6.0);
+            egui::Grid::new("settings_protection")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Rollback protection").color(cc.text_muted));
+                    if s.rollback_warning.is_some() {
+                        theme::badge(ui, "Degraded", theme::BadgeKind::Warn);
+                    } else {
+                        theme::badge(ui, "OS secure storage", theme::BadgeKind::Ok);
+                    }
+                    ui.end_row();
+
+                    ui.label(RichText::new("Unlock on this device").color(cc.text_muted));
+                    if autounlock::SUPPORTED {
+                        theme::badge(ui, "Available", theme::BadgeKind::Ok);
+                    } else {
+                        theme::badge(ui, "Not in this build", theme::BadgeKind::Neutral);
+                    }
+                    ui.end_row();
+
+                    ui.label(RichText::new("Security keys").color(cc.text_muted));
+                    if passkey::SUPPORTED {
+                        theme::badge(ui, "Supported", theme::BadgeKind::Ok);
+                    } else {
+                        theme::badge(ui, "Not in this build", theme::BadgeKind::Neutral);
+                    }
+                    ui.end_row();
+                });
+
+            if let Some(warning) = &s.rollback_warning {
+                ui.add_space(8.0);
+                theme::banner(ui, cc.warn, |ui| {
+                    ui.label(RichText::new(warning.as_str()).small());
+                });
+            }
+            if autounlock::SUPPORTED {
+                if let Some(note) = autounlock::device_binding_warning() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(note).color(cc.text_muted).small());
+                }
+            }
+        });
+
+        // --------------------------------------------------------------- About
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("About").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::icon_button(ui, theme::icon::COPY, "Copy build details").clicked() {
+                        *action = Some(Action::CopyBuildInfo);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::Grid::new("settings_about")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Version").color(cc.text_muted));
+                    ui.label(RichText::new(env!("CARGO_PKG_VERSION")).strong());
+                    ui.end_row();
+
+                    ui.label(RichText::new("Build").color(cc.text_muted));
+                    ui.label(build_variant());
+                    ui.end_row();
+
+                    ui.label(RichText::new("Platform").color(cc.text_muted));
+                    ui.label(RichText::new(env!("FILESEC_TARGET")).monospace().small());
+                    ui.end_row();
+
+                    ui.label(RichText::new("Features").color(cc.text_muted));
+                    let features = compiled_features();
+                    ui.label(
+                        RichText::new(if features.is_empty() {
+                            "none".to_string()
+                        } else {
+                            features.join(", ")
+                        })
+                        .monospace()
+                        .small(),
+                    );
+                    ui.end_row();
+                });
+        });
     });
 }
 
@@ -7502,28 +7935,6 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Sanitize a filename leaf for a checkout temp file, **preserving the extension**
-/// (dots are kept) so the OS opens it with the right application. Path separators
-/// and other oddities become `_`; the store always prepends a random prefix, so
-/// the result can never traverse or collide.
-fn sanitize_leaf(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "file".to_string()
-    } else {
-        cleaned
-    }
-}
-
 /// `CREATE_NO_WINDOW` (winbase.h). The `cmd /C start …` launcher we use to open
 /// files in their default app would otherwise flash an empty console window over
 /// the GUI every time. This flag suppresses that console without affecting the
@@ -7582,15 +7993,20 @@ enum ViewLaunch {
 /// Caveat: a blocking launcher reports when the *application* exits, not when a
 /// single document window closes — if the app was already running, the wipe waits
 /// until that whole app quits. The leave-the-vault backstop covers that gap.
-fn start_view(path: &std::path::Path) -> ViewLaunch {
+///
+/// The watcher hands the temp to `wiper` rather than shredding it itself, so a
+/// wipe that is still running is visible to the shutdown gate.
+fn start_view(path: &std::path::Path, wiper: &WipeHandle, ctx: &egui::Context) -> ViewLaunch {
     let p = path.to_path_buf();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let (wiper, ctx) = (wiper.clone(), ctx.clone());
     #[cfg(target_os = "macos")]
     {
         match std::process::Command::new("open").arg("-W").arg(&p).spawn() {
             Ok(mut child) => {
                 std::thread::spawn(move || {
                     let _ = child.wait();
-                    let _ = crate::store::secure_wipe(&p);
+                    wiper.enqueue(&ctx, p);
                 });
                 ViewLaunch::WatchingForClose
             }
@@ -7609,7 +8025,7 @@ fn start_view(path: &std::path::Path) -> ViewLaunch {
             Ok(mut child) => {
                 std::thread::spawn(move || {
                     let _ = child.wait();
-                    let _ = crate::store::secure_wipe(&p);
+                    wiper.enqueue(&ctx, p);
                 });
                 ViewLaunch::WatchingForClose
             }
@@ -7618,19 +8034,13 @@ fn start_view(path: &std::path::Path) -> ViewLaunch {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // No blocking launcher here, so nothing to watch: the temp is wiped when
+        // the user leaves the vault or quits.
+        let _ = (wiper, ctx);
         match std::process::Command::new("xdg-open").arg(&p).spawn() {
             Ok(_) => ViewLaunch::LaunchedNoWatch,
             Err(_) => ViewLaunch::Failed,
         }
-    }
-}
-
-/// Securely wipe every active view's temp file and clear the list. Called when
-/// leaving the vault (close/nav/lock) and on exit. Idempotent: `secure_wipe`
-/// tolerates already-gone files, so a watcher that wiped first is harmless.
-fn wipe_all_views(views: &mut Vec<ActiveView>) {
-    for v in views.drain(..) {
-        let _ = crate::store::secure_wipe(&v.temp_path);
     }
 }
 
@@ -8510,6 +8920,119 @@ mod ui_smoke {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every [`ThemeChoice`] must survive the round trip through egui's options.
+    ///
+    /// This is the regression guard for the sidebar gear change: the gear used
+    /// to be the only way to get back to "follow the system", and that choice
+    /// now exists solely as a `ThemeChoice` variant. If the mapping ever drops
+    /// `System`, this fails rather than silently stranding the user on light or
+    /// dark forever.
+    #[test]
+    fn every_theme_choice_round_trips_through_the_context() {
+        let ctx = test_ctx();
+        for choice in ThemeChoice::ALL {
+            theme::apply_choice(&ctx, choice);
+            assert_eq!(
+                theme::current_choice(&ctx),
+                choice,
+                "{choice:?} did not round-trip through egui options"
+            );
+        }
+    }
+
+    /// A saved theme must reach the *pre-unlock* screens.
+    ///
+    /// The whole reason `.prefs` is unencrypted is that the unlock screen is
+    /// painted before any identity exists to decrypt with. If the preference
+    /// were only applied after unlocking, every launch would flash the system
+    /// theme first.
+    #[test]
+    fn a_saved_theme_reaches_the_unlock_screen() {
+        let dir = std::env::temp_dir().join(format!(
+            "filesec-theme-{}",
+            hex(&filesec_core::secret::random_array::<8>().expect("rng"))
+        ));
+        let store = Store::at(&dir).expect("store");
+        store
+            .save_prefs(&crate::prefs::Prefs {
+                theme: ThemeChoice::Light,
+                ..crate::prefs::Prefs::default()
+            })
+            .expect("save prefs");
+
+        // `theme::install` leaves the context following the system, exactly as
+        // it does in `crate::run`.
+        let ctx = test_ctx();
+        let mut app = exit_test_app();
+        app.store = Some(Arc::new(Store::at(&dir).expect("store")));
+        app.apply_saved_theme(&ctx);
+
+        assert_eq!(theme::current_choice(&ctx), ThemeChoice::Light);
+        // Render the unlock screen itself: it must already be light.
+        let mut action = None;
+        frame(&ctx, |ui| {
+            unlock_ui(&mut Unlock::default(), ui, &mut action)
+        });
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole user-visible loop: picking a theme changes the appearance *and*
+    /// writes it to disk, so the next launch honours it.
+    ///
+    /// Covers the glue between the Settings page (and the sidebar shortcut),
+    /// which only emit [`Action::SetTheme`], and the store.
+    #[test]
+    fn choosing_a_theme_applies_it_and_persists_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "filesec-settheme-{}",
+            hex(&filesec_core::secret::random_array::<8>().expect("rng"))
+        ));
+        let ctx = test_ctx();
+        let mut app = exit_test_app();
+        app.store = Some(Arc::new(Store::at(&dir).expect("store")));
+
+        for choice in ThemeChoice::ALL {
+            app.dispatch(Action::SetTheme(choice), &ctx);
+            // Applied to the live context...
+            assert_eq!(
+                theme::current_choice(&ctx),
+                choice,
+                "not applied: {choice:?}"
+            );
+            // ...and readable by a fresh Store, i.e. it really went to disk.
+            assert_eq!(
+                Store::at(&dir).expect("store").load_prefs().theme,
+                choice,
+                "not persisted: {choice:?}"
+            );
+        }
+
+        // No store (the fatal screen): the appearance still changes, and nothing
+        // panics trying to save.
+        app.store = None;
+        app.dispatch(Action::SetTheme(ThemeChoice::Dark), &ctx);
+        assert_eq!(theme::current_choice(&ctx), ThemeChoice::Dark);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The About card must not claim a feature that is not compiled in.
+    #[test]
+    fn compiled_features_match_the_cfg_flags() {
+        let f = compiled_features();
+        assert_eq!(f.contains(&"pqc"), cfg!(feature = "pqc"));
+        assert_eq!(f.contains(&"net"), cfg!(feature = "net"));
+        assert_eq!(f.contains(&"keyring"), cfg!(feature = "keyring"));
+        assert_eq!(f.contains(&"passkey"), cfg!(feature = "passkey"));
+        // The build summary is what users paste into bug reports, so it has to
+        // carry the version and the target, not just the feature list.
+        let line = build_info_line();
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+        assert!(line.contains(env!("FILESEC_TARGET")), "{line}");
+    }
+
     #[test]
     fn screens_render_without_panic() {
         let ctx = test_ctx();
@@ -8525,6 +9048,12 @@ mod ui_smoke {
         frame(&ctx, |ui| vaults_ui(&mut s, ui, &mut action));
         frame(&ctx, |ui| contacts_ui(&mut s, ui, &mut action));
         frame(&ctx, |ui| identity_ui(&mut s, ui, &mut action));
+        frame(&ctx, |ui| settings_ui(&mut s, ui, &mut action));
+        // Settings again with the degraded-rollback banner showing, so the warn
+        // branch and its banner are exercised too.
+        s.rollback_warning = Some("Rollback protection is in degraded mode.".into());
+        frame(&ctx, |ui| settings_ui(&mut s, ui, &mut action));
+        s.rollback_warning = None;
         // First-run "restore from a backup" card (a backup file has been picked).
         let mut fr = FirstRun::default();
         fr.restore = Some(RestoreForm {
@@ -8726,5 +9255,167 @@ mod ui_smoke {
         frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn exit_test_app() -> App {
+        App {
+            store: None,
+            state: State::Unlocked(Box::new(test_session())),
+            toast: None,
+            job: None,
+            auto_unlock_pending: false,
+            wiper: Wiper::new(),
+            exit_wipe: None,
+        }
+    }
+
+    fn plaintext_temp() -> std::path::PathBuf {
+        let suffix = hex(&filesec_core::secret::random_array::<8>().expect("rng"));
+        let path = std::env::temp_dir().join(format!("filesec-exit-{suffix}"));
+        std::fs::write(&path, vec![0xa5u8; 256 * 1024]).expect("write temp");
+        path
+    }
+
+    fn close_request() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .events
+            .push(egui::ViewportEvent::Close);
+        input
+    }
+
+    fn commands(out: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        out.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone()
+    }
+
+    /// Quitting must not shred plaintext on the UI thread — that is what made the
+    /// app look frozen. The first close request hands every temp to the background
+    /// wiper and *cancels* the close, so the frame loop keeps painting; once the
+    /// queue drains the app issues the close itself.
+    #[test]
+    fn close_request_is_held_while_temps_are_shredded() {
+        let ctx = test_ctx();
+        let mut app = exit_test_app();
+        let temp = plaintext_temp();
+        if let State::Unlocked(s) = &mut app.state {
+            s.views.push(ActiveView {
+                leaf: "Q4 salary report.pdf".to_string(),
+                temp_path: temp.clone(),
+            });
+        }
+
+        // Frame 1: the OS asks us to close.
+        ctx.begin_pass(close_request());
+        let held = app.poll_exit_wipe(&ctx);
+        let out = ctx.end_pass();
+        assert!(held, "close must be held while a temp is still queued");
+        assert!(
+            commands(&out).contains(&egui::ViewportCommand::CancelClose),
+            "expected CancelClose, got {:?}",
+            commands(&out)
+        );
+        // The banner clears in the same frame even though the shred is still
+        // running behind it.
+        assert!(matches!(&app.state, State::Unlocked(s) if s.views.is_empty()));
+
+        // Once the queue drains, the app closes itself.
+        app.wiper.finish(std::time::Duration::from_secs(20));
+        assert!(!temp.exists(), "temp survived the wipe");
+        ctx.begin_pass(egui::RawInput::default());
+        assert!(app.poll_exit_wipe(&ctx));
+        let out = ctx.end_pass();
+        assert!(
+            commands(&out).contains(&egui::ViewportCommand::Close),
+            "expected Close once drained, got {:?}",
+            commands(&out)
+        );
+    }
+
+    /// With nothing left to shred — the common case, since a temp is queued the
+    /// moment its viewer closes — quitting must not be delayed at all.
+    #[test]
+    fn close_request_passes_straight_through_when_nothing_is_queued() {
+        let ctx = test_ctx();
+        let mut app = exit_test_app();
+        ctx.begin_pass(close_request());
+        let held = app.poll_exit_wipe(&ctx);
+        let out = ctx.end_pass();
+        assert!(!held);
+        assert!(
+            !commands(&out).contains(&egui::ViewportCommand::CancelClose),
+            "close must not be cancelled when there is nothing to wipe"
+        );
+    }
+
+    /// A check-in streams the check-out temp back into the vault. Quitting mid
+    /// check-in must not hand that file to the shredder, or the worker would read
+    /// random bytes over the user's edit. Views are still queued; the check-out
+    /// temp is left for the next unlock's sweep.
+    #[test]
+    fn quitting_mid_job_does_not_shred_the_file_the_job_is_reading() {
+        let ctx = test_ctx();
+        let mut app = exit_test_app();
+        let checkout_temp = plaintext_temp();
+        let view_temp = plaintext_temp();
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            rx,
+            label: "Checking in…".to_string(),
+        });
+        if let State::Unlocked(s) = &mut app.state {
+            s.checkout = Some(Checkout {
+                vault_id: "v".to_string(),
+                entry_path: "notes.txt".to_string(),
+                leaf: "notes.txt".to_string(),
+                temp_path: checkout_temp.clone(),
+                orig_blake3: [0u8; 32],
+                mode: None,
+            });
+            s.views.push(ActiveView {
+                leaf: "secret.pdf".to_string(),
+                temp_path: view_temp.clone(),
+            });
+        }
+
+        app.wipe_all_temps(Some(&ctx));
+        app.wiper.finish(std::time::Duration::from_secs(20));
+        assert!(
+            checkout_temp.exists(),
+            "the running job's file must not be shredded under it"
+        );
+        assert!(
+            matches!(&app.state, State::Unlocked(s) if s.checkout.is_some()),
+            "the check-out must stay registered so the job can finish"
+        );
+        assert!(!view_temp.exists(), "view temps are still wiped");
+        let _ = std::fs::remove_file(&checkout_temp);
+    }
+
+    /// Leaving the vault must return immediately and clear the banner, handing the
+    /// shred to the background wiper rather than blocking the frame on it.
+    #[test]
+    fn leaving_the_vault_queues_view_temps_instead_of_blocking() {
+        let ctx = test_ctx();
+        let mut app = exit_test_app();
+        let temps: Vec<std::path::PathBuf> = (0..3).map(|_| plaintext_temp()).collect();
+        if let State::Unlocked(s) = &mut app.state {
+            for t in &temps {
+                s.views.push(ActiveView {
+                    leaf: "secret.pdf".to_string(),
+                    temp_path: t.clone(),
+                });
+            }
+        }
+        app.wipe_all_views(&ctx);
+        assert!(matches!(&app.state, State::Unlocked(s) if s.views.is_empty()));
+        app.wiper.finish(std::time::Duration::from_secs(20));
+        for t in &temps {
+            assert!(!t.exists(), "{} survived the wipe", t.display());
+        }
     }
 }

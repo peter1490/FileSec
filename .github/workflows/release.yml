@@ -37,10 +37,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ---------------------------------------------------------- Version gate
+  # Runs before anything is built. `[workspace.package] version` in Cargo.toml is
+  # the source of truth; this fails the release if the pushed tag disagrees with
+  # it. Between v0.2.0 and v0.4.2 nothing checked, so Cargo.toml stayed at 0.2.0
+  # while the tags moved on — and every release shipped a .deb and an MSI whose
+  # internal version contradicted their own filenames. See packaging/release-vars.sh.
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: stable
+      - id: v
+        run: bash packaging/release-vars.sh --version >> "$GITHUB_OUTPUT"
+
   # ------------------------------------------------------------------ macOS
   macos:
     name: macOS (${{ matrix.variant }})
     runs-on: macos-latest
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
@@ -62,19 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Set variant parameters
-        run: |
-          if [ "${{ matrix.variant }}" = "pqc" ]; then
-            echo "BUILD_ARGS=-p filesec-pqc"                          >> "$GITHUB_ENV"
-            echo "BIN=filesec-pqc"                                    >> "$GITHUB_ENV"
-            echo "APP_NAME=FileSec"                                   >> "$GITHUB_ENV"
-            echo "BUNDLE_ID=dev.FileSec.FileSec.pqc"                  >> "$GITHUB_ENV"
-          else
-            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features pqc,keyring,passkey" >> "$GITHUB_ENV"
-            echo "BIN=filesec"                                        >> "$GITHUB_ENV"
-            echo "APP_NAME=FileSec"                                   >> "$GITHUB_ENV"
-            echo "BUNDLE_ID=dev.FileSec.FileSec"                      >> "$GITHUB_ENV"
-          fi
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: bash packaging/release-vars.sh "${{ matrix.variant }}" universal-apple-darwin >> "$GITHUB_ENV"
 
       - name: Build (aarch64 + x86_64 → universal)
         run: |
@@ -117,9 +125,8 @@ jobs:
 
       - name: Package archive + signed/notarized .dmg
         run: |
-          BASE="$BIN-$VERSION-universal-apple-darwin"
-          ( cd dist && tar -czf "$BASE.tar.gz" "$BIN" )
-          BIN_PATH="dist/$BIN" OUT_DMG="dist/$BASE.dmg" \
+          ( cd dist && tar -czf "$ARTIFACT_BASE.tar.gz" "$BIN" )
+          BIN_PATH="dist/$BIN" OUT_DMG="dist/$ARTIFACT_BASE.dmg" \
             bash packaging/macos/package_macos.sh
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -133,6 +140,7 @@ jobs:
   windows:
     name: Windows (${{ matrix.variant }})
     runs-on: windows-latest
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
@@ -155,21 +163,7 @@ jobs:
 
       - name: Set variant parameters
         shell: bash
-        run: |
-          if [ "${{ matrix.variant }}" = "pqc" ]; then
-            echo "BUILD_ARGS=-p filesec-pqc"  >> "$GITHUB_ENV"
-            echo "BIN=filesec-pqc"            >> "$GITHUB_ENV"
-            echo "PKG=filesec-pqc"            >> "$GITHUB_ENV"
-            echo "APP_NAME=FileSec"           >> "$GITHUB_ENV"
-            echo "REG_KEY=FileSec-pqc"        >> "$GITHUB_ENV"
-          else
-            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features pqc,keyring,passkey" >> "$GITHUB_ENV"
-            echo "BIN=filesec"                >> "$GITHUB_ENV"
-            echo "PKG=filesec-gui"            >> "$GITHUB_ENV"
-            echo "APP_NAME=FileSec"           >> "$GITHUB_ENV"
-            echo "REG_KEY=FileSec"            >> "$GITHUB_ENV"
-          fi
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: bash packaging/release-vars.sh "${{ matrix.variant }}" x86_64-pc-windows-msvc >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
@@ -192,12 +186,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          ( cd target/release && 7z a "$GITHUB_WORKSPACE/dist/$BIN-$VERSION-x86_64-pc-windows-msvc.zip" "$BIN.exe" )
+          ( cd target/release && 7z a "$GITHUB_WORKSPACE/dist/$ARTIFACT_BASE.zip" "$BIN.exe" )
 
       - name: NSIS installer
         shell: bash
         run: |
-          OUT="dist/$BIN-$VERSION-x86_64-windows-setup.exe"
+          OUT="dist/$ARTIFACT_BASE-setup.exe"
           # makensis cd's to the script's directory (packaging/windows) before
           # resolving relative paths, so SRC_EXE/OUT_FILE would be looked up
           # under packaging/windows/ and not be found. -NOCD keeps the working
@@ -217,15 +211,20 @@ jobs:
         shell: bash
         run: |
           cargo install cargo-wix --version 0.3.9 --locked
+          # --install-version is belt and braces: cargo-wix already defaults to
+          # the Cargo package version, and the verify-version job has proven that
+          # equals $VERSION. Passing it explicitly means the filename and the
+          # installed ProductVersion cannot disagree even if that ever changes.
           cargo wix -p "$PKG" --no-build --nocapture \
-            --output "dist/$BIN-$VERSION-x86_64.msi"
+            --install-version "$VERSION" \
+            --output "dist/$ARTIFACT_BASE.msi"
 
       - name: Sign installers
         shell: pwsh
         run: |
-          $setup = "dist/$env:BIN-$env:VERSION-x86_64-windows-setup.exe"
+          $setup = "dist/$env:ARTIFACT_BASE-setup.exe"
           if (Test-Path $setup) { ./packaging/windows/sign.ps1 -File $setup }
-          $msi = "dist/$env:BIN-$env:VERSION-x86_64.msi"
+          $msi = "dist/$env:ARTIFACT_BASE.msi"
           if (Test-Path $msi) { ./packaging/windows/sign.ps1 -File $msi }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -237,6 +236,7 @@ jobs:
   linux:
     name: Linux (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
@@ -256,17 +256,7 @@ jobs:
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Set variant parameters
-        run: |
-          if [ "${{ matrix.variant }}" = "pqc" ]; then
-            echo "BUILD_ARGS=-p filesec-pqc"  >> "$GITHUB_ENV"
-            echo "BIN=filesec-pqc"            >> "$GITHUB_ENV"
-            echo "PKG=filesec-pqc"            >> "$GITHUB_ENV"
-          else
-            echo "BUILD_ARGS=-p filesec-gui --bin filesec --features pqc,keyring,passkey" >> "$GITHUB_ENV"
-            echo "BIN=filesec"                >> "$GITHUB_ENV"
-            echo "PKG=filesec-gui"            >> "$GITHUB_ENV"
-          fi
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        run: bash packaging/release-vars.sh "${{ matrix.variant }}" x86_64-unknown-linux-gnu >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --locked --release $BUILD_ARGS
@@ -274,13 +264,17 @@ jobs:
       - name: Portable tarball
         run: |
           mkdir -p dist
-          ( cd target/release && tar -czf "$GITHUB_WORKSPACE/dist/$BIN-$VERSION-x86_64-unknown-linux-gnu.tar.gz" "$BIN" )
+          ( cd target/release && tar -czf "$GITHUB_WORKSPACE/dist/$ARTIFACT_BASE.tar.gz" "$BIN" )
 
+      # cargo-deb's own default name is `<crate>_<ver>-<rev>_<arch>.deb`, which is
+      # the correct Debian idiom but the odd one out among our artifacts — and the
+      # old blind `cp target/debian/*.deb` shipped whatever it happened to produce.
+      # --output pins the name to the same scheme as everything else. The Debian
+      # *package* name is set in the crate's [package.metadata.deb].
       - name: Build .deb
         run: |
           cargo install cargo-deb --version 3.7.0 --locked
-          cargo deb -p "$PKG" --no-build
-          cp target/debian/*.deb dist/
+          cargo deb -p "$PKG" --no-build --output "dist/$ARTIFACT_BASE.deb"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -295,6 +289,7 @@ jobs:
   sbom:
     name: SBOM
     runs-on: ubuntu-latest
+    needs: verify-version
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
@@ -303,9 +298,10 @@ jobs:
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Generate per-variant SBOMs (SPDX 2.3 JSON)
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
         run: |
           cargo install cargo-sbom --version 0.10.0 --locked
-          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cargo sbom --cargo-package filesec-gui > "dist/filesec-$VERSION.spdx.json"
           cargo sbom --cargo-package filesec-pqc > "dist/filesec-pqc-$VERSION.spdx.json"
@@ -318,7 +314,7 @@ jobs:
   # ----------------------------------------------------------------- Publish
   publish:
     name: Publish GitHub Release
-    needs: [macos, windows, linux, sbom]
+    needs: [verify-version, macos, windows, linux, sbom]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') && github.repository == 'peter1490/FileSec'
     permissions:
@@ -331,17 +327,67 @@ jobs:
         with:
           path: artifacts
 
-      - name: Collect artifacts and compute checksums
+      - name: Collect artifacts
         run: |
+          set -euo pipefail
           mkdir -p release
+          # `cp -n` used to be here; it silently *skipped* a file whose basename
+          # already existed, so a naming collision between two jobs would quietly
+          # drop an artifact instead of failing the release. Copy explicitly and
+          # refuse to overwrite.
           find artifacts -type f \( \
             -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \
             -o -name '*.deb' -o -name '*.msi' -o -name '*-setup.exe' \
             -o -name '*.spdx.json' \
-          \) -exec cp -n {} release/ \;
-          # Checksum every collected artifact. Write SHA256SUMS outside release/
-          # first so the glob never tries to hash the file being created, then
-          # move it in alongside the artifacts it covers.
+          \) -print0 | while IFS= read -r -d '' f; do
+            dest="release/$(basename "$f")"
+            if [ -e "$dest" ]; then
+              echo "::error::duplicate artifact name: $(basename "$f")" >&2
+              exit 1
+            fi
+            cp "$f" "$dest"
+          done
+
+      # Every published file must follow the one naming scheme:
+      #     <bin>-<version>-<target>[-setup].<ext>
+      # (SBOMs carry no target — they describe the dependency graph, not a build).
+      # This is the check that would have caught the .deb shipping 0.2.0 inside a
+      # 0.4.2 release. If you add an artifact, extend the pattern deliberately.
+      - name: Check artifact names
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          bins='(filesec|filesec-pqc)'
+          targets='(universal-apple-darwin|x86_64-pc-windows-msvc|x86_64-unknown-linux-gnu)'
+          exts='(tar\.gz|zip|dmg|deb|msi)'
+          ok="^${bins}-${VERSION}-${targets}\.${exts}$"
+          ok_setup="^${bins}-${VERSION}-${targets}-setup\.exe$"
+          ok_sbom="^${bins}-${VERSION}\.spdx\.json$"
+          bad=0
+          for f in release/*; do
+            n="$(basename "$f")"
+            if ! printf '%s' "$n" | grep -Eq "$ok|$ok_setup|$ok_sbom"; then
+              echo "::error::artifact does not match the naming scheme: $n" >&2
+              bad=1
+            fi
+          done
+          # 2 variants x (dmg + mac tar.gz + zip + setup.exe + msi + linux tar.gz
+          # + deb) = 14, plus 2 SBOMs.
+          count="$(find release -type f | wc -l | tr -d ' ')"
+          if [ "$count" != "16" ]; then
+            echo "::error::expected 16 artifacts, found $count" >&2
+            bad=1
+          fi
+          ls -1 release
+          [ "$bad" = "0" ]
+
+      - name: Compute checksums
+        run: |
+          set -euo pipefail
+          # Write SHA256SUMS outside release/ first so the glob never tries to
+          # hash the file being created, then move it in alongside the artifacts
+          # it covers.
           ( cd release && sha256sum * > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS )
           echo "----- SHA256SUMS -----"
           cat release/SHA256SUMS

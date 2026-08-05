@@ -23,6 +23,8 @@ use filesec_core::util::now_unix;
 use filesec_core::vault::Vault;
 use filesec_core::SuiteId;
 
+use crate::prefs::Prefs;
+
 /// The algorithm suite the local at-rest store encrypts itself under for
 /// `identity`. The suite **tracks the identity**: a hybrid (post-quantum)
 /// identity stores its vaults, contacts, and registry under the hybrid suite
@@ -58,6 +60,11 @@ const ANCHORS_VERSION: u16 = 1;
 const ANCHORS_FILE: &str = ".state-anchors";
 const ANCHORS_BACKEND_FILE: &str = ".state-anchor-backend";
 const QUARANTINE_DIR: &str = "quarantine";
+/// Unencrypted UI preferences. Dot-prefixed like the other non-container files.
+/// See [`crate::prefs`] for why this one is deliberately not encrypted.
+const PREFS_FILE: &str = ".prefs";
+const PREFS_TMP_FILE: &str = ".prefs.tmp";
+const MAX_PREFS_FILE_LEN: u64 = 64 * 1024;
 
 /// Quality of the independent high-water anchor backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +218,48 @@ impl Store {
         (self.anchor_backend == AnchorBackend::DegradedFile).then_some(
             "Rollback protection is in degraded mode: this system has no usable OS secure storage, so high-water anchors are kept in the FileSec data directory. Restoring the whole directory can also restore its anchors; keep an independent current backup and use the explicit recovery flow for quarantined state.",
         )
+    }
+
+    /// Load the non-secret UI preferences.
+    ///
+    /// **Infallible by design.** A missing, unreadable, oversized, corrupt, or
+    /// newer-versioned file yields [`Prefs::default`]. This runs before the
+    /// keystore is even opened, and the only thing in it is the theme — failing
+    /// to read it must never be able to keep someone out of their vaults.
+    #[must_use]
+    pub fn load_prefs(&self) -> Prefs {
+        let path = self.prefs_path();
+        if !path.exists() {
+            return Prefs::default();
+        }
+        let Ok(bytes) = read_bounded_file(&path, MAX_PREFS_FILE_LEN, "preferences file") else {
+            return Prefs::default();
+        };
+        match filesec_core::codec::from_slice::<Prefs>(&bytes) {
+            Ok(p) if p.version == crate::prefs::PREFS_VERSION => p,
+            _ => Prefs::default(),
+        }
+    }
+
+    /// Persist the non-secret UI preferences.
+    ///
+    /// Written atomically (private temp → fsync → rename) like everything else
+    /// this module writes, so a crash mid-write leaves either the old
+    /// preferences or the new ones — never a truncated file that would silently
+    /// read back as defaults.
+    ///
+    /// Deliberately outside the state-anchor machinery: these preferences are
+    /// unauthenticated and there is nothing an attacker gains by rolling them
+    /// back. See [`crate::prefs`].
+    pub fn save_prefs(&self, prefs: &Prefs) -> StoreResult<()> {
+        let bytes = filesec_core::codec::to_vec(prefs).map_err(err)?;
+        let final_path = self.prefs_path();
+        let tmp = self.data_dir.join(PREFS_TMP_FILE);
+        write_private_atomic(&tmp, &final_path, &bytes)
+    }
+
+    fn prefs_path(&self) -> PathBuf {
+        self.data_dir.join(PREFS_FILE)
     }
 
     fn keystore_path(&self) -> PathBuf {
@@ -958,15 +1007,18 @@ impl Store {
     /// Create an empty checkout temp file under the hardened `checkout/` dir and
     /// return its path. On Unix the file is created with mode 0600 from the
     /// outset (via [`open_private_truncating`]) so decrypted plaintext never
-    /// exists with loose permissions. A random hex prefix guarantees uniqueness;
-    /// `leaf` (a sanitized display name, extension intact) is appended so the OS
-    /// opens it with the right application.
+    /// exists with loose permissions.
+    ///
+    /// The name is a random hex stem plus, at most, `leaf`'s extension — the
+    /// vault's own filename is **never** written to disk. The name outlives the
+    /// file (recent-items lists, index caches, backups), so leaking it would
+    /// leak vault contents; the extension survives only because the OS launchers
+    /// need it to pick the right application. See [`temp_extension`].
     pub fn create_private_checkout_file(&self, leaf: &str) -> StoreResult<PathBuf> {
         let stem = random_hex::<8>()?;
-        let name = if leaf.is_empty() {
-            stem
-        } else {
-            format!("{stem}-{leaf}")
+        let name = match temp_extension(leaf) {
+            Some(ext) => format!("{stem}.{ext}"),
+            None => stem,
         };
         let path = self.checkout_dir.join(name);
         open_private_truncating(&path)?;
@@ -1294,6 +1346,30 @@ fn random_hex_from<const N: usize>(
     Ok(filesec_core::util::hex(&bytes))
 }
 
+/// The longest tail we will accept as a file extension. Anything longer is far
+/// more likely to be part of the name than a real extension, and carrying it
+/// onto a temp file would leak exactly what we are hiding.
+const MAX_TEMP_EXT: usize = 8;
+
+/// The extension to give a checkout temp file, or `None` for no extension.
+///
+/// Only a short, purely alphanumeric ASCII tail survives — everything that could
+/// carry a recognisable name is dropped — so the temp reveals the file's *type*
+/// and nothing more. The OS launchers (`open`, `start`, `xdg-open`) dispatch on
+/// the extension, which is the only reason to keep any of the name at all.
+fn temp_extension(leaf: &str) -> Option<String> {
+    let (stem, ext) = leaf.rsplit_once('.')?;
+    // A leading dot is a hidden file (`.bashrc`), not an extension — keeping the
+    // tail there would put the whole filename on disk.
+    if stem.is_empty() || ext.is_empty() || ext.len() > MAX_TEMP_EXT {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
 /// Write a decrypted vault's contents into `dest` on the real filesystem.
 ///
 /// Each path is re-validated with [`normalize_path`] (rejecting absolute or
@@ -1526,6 +1602,65 @@ mod tests {
     fn random_hex_encodes_successful_rng_output() {
         let result = random_hex_from::<4>(|| Ok([0xab, 0xcd, 0x01, 0x23])).unwrap();
         assert_eq!(result, "abcd0123");
+    }
+
+    #[test]
+    fn temp_extension_keeps_a_short_alphanumeric_tail() {
+        assert_eq!(temp_extension("report.pdf").as_deref(), Some("pdf"));
+        assert_eq!(temp_extension("archive.tar.gz").as_deref(), Some("gz"));
+        assert_eq!(temp_extension("PHOTO.JPG").as_deref(), Some("jpg"));
+        assert_eq!(
+            temp_extension("Q4 salary report.pdf").as_deref(),
+            Some("pdf")
+        );
+    }
+
+    #[test]
+    fn temp_extension_rejects_anything_that_could_carry_a_name() {
+        // No extension at all.
+        assert_eq!(temp_extension("no-extension"), None);
+        // Hidden files: the tail is the whole name.
+        assert_eq!(temp_extension(".bashrc"), None);
+        assert_eq!(temp_extension(".env"), None);
+        // Trailing dot.
+        assert_eq!(temp_extension("weird."), None);
+        // Non-alphanumeric or unicode tails.
+        assert_eq!(temp_extension("weird.p df"), None);
+        assert_eq!(temp_extension("notes.rés"), None);
+        // Implausibly long tail — probably part of the name.
+        assert_eq!(temp_extension("x.VERYLONGSUFFIX"), None);
+    }
+
+    #[test]
+    fn checkout_temp_name_leaks_nothing_but_the_extension() {
+        let dir = tmp("checkout-name");
+        let store = Store::at(&dir).unwrap();
+        let leaf = "Q4 salary report.pdf";
+        let path = store.create_private_checkout_file(leaf).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(name.ends_with(".pdf"), "extension must survive: {name}");
+        for word in ["Q4", "salary", "report"] {
+            assert!(
+                !name
+                    .to_ascii_lowercase()
+                    .contains(&word.to_ascii_lowercase()),
+                "temp name {name} leaks {word:?} from {leaf:?}"
+            );
+        }
+        // 16 hex chars + '.' + "pdf"
+        assert_eq!(name.len(), 20, "unexpected temp name shape: {name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkout_temp_name_omits_the_dot_when_there_is_no_extension() {
+        let dir = tmp("checkout-noext");
+        let store = Store::at(&dir).unwrap();
+        let path = store.create_private_checkout_file("Minutes 2026").unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 16, "expected a bare hex stem: {name}");
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tmp(name: &str) -> PathBuf {

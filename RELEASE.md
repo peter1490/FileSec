@@ -18,29 +18,73 @@ compiled into the standard binary (see the `default-members` note in the root
 
 ## How a release is built
 
-Push a version tag and GitHub Actions does the rest:
+**`[workspace.package] version` in `Cargo.toml` is the single source of truth.**
+Bump it with the script, then tag to match:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+scripts/bump-version.sh 0.4.4
+git add Cargo.toml Cargo.lock
+git commit -m 'Release v0.4.4'
+git tag v0.4.4
+git push origin main v0.4.4
 ```
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) is the
-authoritative pipeline. For each variant × OS it produces:
+The workflow's first job compares the tag against `cargo metadata` and **fails
+the release if they disagree**, so the two can no longer drift. They did drift
+once: `Cargo.toml` sat at `0.2.0` from v0.2.0 through v0.4.2 while the tags moved
+on, and because the `.deb` and the MSI's internal `ProductVersion` come from
+Cargo rather than the tag, every release in that window shipped installers whose
+version contradicted their own filename — which also meant the MSI could never
+detect and upgrade its predecessor.
 
-| OS | Installers | Portable |
-|----|-----------|----------|
-| macOS | `.dmg` (universal, signed + notarized) | `.tar.gz` |
-| Windows | `.msi` + NSIS `…-setup.exe` (Authenticode-signed) | `.zip` |
-| Linux | `.deb` | `.tar.gz` |
+Never edit the version by hand: `scripts/bump-version.sh` also refreshes
+`Cargo.lock`, without which every `cargo build --locked` in CI fails.
+
+### What gets published
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) is the
+authoritative pipeline. Every artifact is named by
+[`packaging/release-vars.sh`](packaging/release-vars.sh) — the one place names
+are composed — as:
+
+```
+<bin>-<version>-<target>.<ext>
+```
+
+For each of the two variants (`filesec`, `filesec-pqc`):
+
+| OS | Target | Installers | Portable |
+|----|--------|-----------|----------|
+| macOS | `universal-apple-darwin` | `.dmg` (signed + notarized) | `.tar.gz` |
+| Windows | `x86_64-pc-windows-msvc` | `.msi`, NSIS `…-setup.exe` (Authenticode-signed) | `.zip` |
+| Linux | `x86_64-unknown-linux-gnu` | `.deb` | `.tar.gz` |
+
+So a v0.4.4 release carries, for example,
+`filesec-0.4.4-x86_64-pc-windows-msvc.msi` and
+`filesec-pqc-0.4.4-x86_64-unknown-linux-gnu.deb`. The publish job re-checks every
+collected filename against that scheme and fails on anything that does not match,
+so a new artifact cannot quietly adopt its own convention. If you add one, derive
+its name from `$ARTIFACT_BASE` and extend the check deliberately.
 
 It also generates a per-variant **SBOM** (`filesec-<ver>.spdx.json`,
-`filesec-pqc-<ver>.spdx.json`; SPDX 2.3), then publishes every artifact plus a
+`filesec-pqc-<ver>.spdx.json`; SPDX 2.3 — no target, since they describe the
+dependency graph rather than a build), then publishes every artifact plus a
 **`SHA256SUMS`** file to a GitHub Release. Verify a download with:
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
 ```
+
+### Package identity
+
+The Debian package is `filesec` (not the crate name `filesec-gui`); releases up
+to v0.4.2 shipped as `filesec-gui`, so it declares `provides`/`replaces`/
+`conflicts` for a clean upgrade. On Windows both installers present as **FileSec**
+and **FileSec PQC** — these must stay distinct, because `filesec.nsi` derives the
+install directory and the Start Menu shortcut from the display name, and
+`package_macos.sh` names the `.app` bundle from it. When both variants used
+`FileSec`, installing one overwrote the other's install directory, shortcut, and
+`.app`.
 
 ### Provenance / attestation
 
@@ -52,7 +96,7 @@ verify each download against it:
 
 ```sh
 gh attestation verify SHA256SUMS --repo peter1490/FileSec
-gh attestation verify FileSec-<ver>-universal-apple-darwin.dmg --repo peter1490/FileSec
+gh attestation verify filesec-<ver>-universal-apple-darwin.dmg --repo peter1490/FileSec
 ```
 
 ### Signing is required for official tags

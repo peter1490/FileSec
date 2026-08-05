@@ -28,6 +28,17 @@ features = ["pqc", "keyring", "passkey"]
 # right features, then runs `cargo deb --no-build` to package this already-built
 # `target/release/filesec`.
 [package.metadata.deb]
+# The Debian package is `filesec`, matching the binary it installs and the
+# `filesec-pqc` package beside it. Without this it defaults to the *crate* name,
+# `filesec-gui`, which is an internal detail no user should have to type into
+# `apt`. Releases up to v0.4.2 shipped as `filesec-gui`, so declare the rename to
+# Debian: `provides` keeps `filesec-gui` resolvable as a dependency name,
+# `replaces` + `conflicts` let this package take over the old one's files instead
+# of erroring out on install.
+name = "filesec"
+provides = "filesec-gui"
+replaces = "filesec-gui"
+conflicts = "filesec-gui"
 maintainer = "FileSec contributors"
 copyright = "FileSec contributors"
 extended-description = """\
