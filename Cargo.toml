@@ -24,7 +24,7 @@ exclude = ["fuzz"]
 # reads it back out of `cargo metadata` and the release workflow refuses to build
 # a `v*` tag that disagrees with it, so this and the git tag can never drift.
 # Bump it with `scripts/bump-version.sh <version>`, never by hand.
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["FileSec contributors"]
