@@ -5903,25 +5903,8 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             }
         });
         ui.add_space(2.0);
-        let mut clicked: Option<(usize, RowClick)> = None;
-        let mut bg_clicked = false;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for (i, row) in rows.iter().enumerate() {
-                    let is_sel = s.selected.contains(&row.path);
-                    match entry_row(ui, c, row, is_sel, idle, searching, action) {
-                        RowClick::None => {}
-                        rc => clicked = Some((i, rc)),
-                    }
-                }
-                // A click on the empty space below the rows clears the selection.
-                let avail = ui.available_size();
-                if avail.y > 4.0 && ui.allocate_response(avail, egui::Sense::click()).clicked() {
-                    bg_clicked = true;
-                }
-            });
+        let (clicked, bg_clicked) =
+            browser_rows_ui(ui, c, &rows, &s.selected, idle, searching, action);
         // Resolve selection after the scroll area releases its borrow of `s`.
         if let Some((i, rc)) = clicked {
             apply_row_click(s, &rows, i, rc, action);
@@ -5960,6 +5943,62 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             c.accent,
         );
     }
+}
+
+/// Render only rows intersecting the viewport. Stable path IDs keep actions
+/// attached to the same entry while scrolling, sorting, or searching.
+fn browser_rows_ui(
+    ui: &mut egui::Ui,
+    c: theme::Colors,
+    rows: &[Row],
+    selected: &HashSet<String>,
+    idle: bool,
+    searching: bool,
+    action: &mut Option<Action>,
+) -> (Option<(usize, RowClick)>, bool) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let mut clicked = None;
+        let area = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, 44.0, rows.len(), |ui, range| {
+                for i in range {
+                    let row = &rows[i];
+                    let click = ui
+                        .push_id(&row.path, |ui| {
+                            entry_row(
+                                ui,
+                                c,
+                                row,
+                                selected.contains(&row.path),
+                                idle,
+                                searching,
+                                action,
+                            )
+                        })
+                        .inner;
+                    if !matches!(click, RowClick::None) {
+                        clicked = Some((i, click));
+                    }
+                }
+            });
+        // Preserve click-to-clear in the blank viewport below the final row.
+        let bottom = area.inner_rect.top() + rows.len() as f32 * 46.0 - area.state.offset.y;
+        let blank = egui::Rect::from_min_max(
+            egui::pos2(area.inner_rect.left(), bottom.max(area.inner_rect.top())),
+            area.inner_rect.max,
+        );
+        let bg_clicked = blank.height() > 4.0
+            && ui
+                .interact(
+                    blank,
+                    ui.id().with("browser-empty-space"),
+                    egui::Sense::click(),
+                )
+                .clicked();
+        (clicked, bg_clicked)
+    })
+    .inner
 }
 
 /// Render the folder breadcrumb ("Home / a / b"); each ancestor crumb navigates.
@@ -6801,7 +6840,7 @@ fn compiled_features() -> Vec<&'static str> {
 /// Which of the two shipped builds this is.
 ///
 /// Both compile the post-quantum suites in and both default new identities to
-/// classical; the functional difference is networking. See RELEASE.md.
+/// classical; the functional difference is networking. See docs/RELEASE.md.
 fn build_variant() -> &'static str {
     if cfg!(feature = "net") {
         "Networking build — offline exchange plus direct peer-to-peer transfer"
@@ -7795,18 +7834,7 @@ fn read_bounded_file(
     max_len: u64,
     label: &'static str,
 ) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err(format!("{label} is not a file."));
-    }
-    if meta.len() > max_len {
-        return Err(format!("{label} is too large."));
-    }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > max_len {
-        return Err(format!("{label} is too large."));
-    }
-    Ok(bytes)
+    filesec_core::safe_io::read_bounded_file(path, max_len).map_err(|e| format!("{label}: {e}"))
 }
 
 fn read_bounded_text_file(
@@ -8111,14 +8139,6 @@ fn clamp_dir(entries: &[(String, EntryKind, u64)], dir: &str) -> String {
     cur
 }
 
-/// How many entries sit directly inside `dir`.
-fn dir_child_count(entries: &[(String, EntryKind, u64)], dir: &str) -> usize {
-    entries
-        .iter()
-        .filter(|(p, _, _)| parent_dir(p) == dir)
-        .count()
-}
-
 /// A single browser row: a file or folder to display.
 struct Row {
     path: String,
@@ -8137,6 +8157,12 @@ fn visible_rows(
     search: &str,
     sort: SortMode,
 ) -> Vec<Row> {
+    // Count all immediate children once, rather than rescanning the entire
+    // vault for each folder rendered (quadratic for folder-heavy vaults).
+    let mut child_counts = std::collections::HashMap::<&str, usize>::new();
+    for (path, _, _) in entries {
+        *child_counts.entry(parent_dir(path)).or_default() += 1;
+    }
     let q = search.trim().to_lowercase();
     let mut rows: Vec<Row> = entries
         .iter()
@@ -8157,7 +8183,7 @@ fn visible_rows(
             kind: *k,
             size: *sz,
             children: if *k == EntryKind::Dir {
-                dir_child_count(entries, p)
+                child_counts.get(p.as_str()).copied().unwrap_or(0)
             } else {
                 0
             },
@@ -8170,19 +8196,33 @@ fn visible_rows(
 /// Sort rows in place: directories first, then by the chosen key. Names compare
 /// case-insensitively by leaf; size ties break by name for a stable order.
 fn sort_rows(rows: &mut [Row], sort: SortMode) {
-    rows.sort_by(|a, b| {
-        let dirs_first = (a.kind != EntryKind::Dir).cmp(&(b.kind != EntryKind::Dir));
-        dirs_first.then_with(|| {
-            let an = leaf_name(&a.path).to_lowercase();
-            let bn = leaf_name(&b.path).to_lowercase();
-            match sort {
-                SortMode::NameAsc => an.cmp(&bn),
-                SortMode::NameDesc => bn.cmp(&an),
-                SortMode::SizeDesc => b.size.cmp(&a.size).then(an.cmp(&bn)),
-                SortMode::SizeAsc => a.size.cmp(&b.size).then(an.cmp(&bn)),
-            }
-        })
-    });
+    use std::cmp::Reverse;
+    // Cache each case-folded name once per sort, instead of allocating two new
+    // strings for every comparison. Stable ties preserve the manifest order.
+    match sort {
+        SortMode::NameAsc => rows
+            .sort_by_cached_key(|r| (r.kind != EntryKind::Dir, leaf_name(&r.path).to_lowercase())),
+        SortMode::NameDesc => rows.sort_by_cached_key(|r| {
+            (
+                r.kind != EntryKind::Dir,
+                Reverse(leaf_name(&r.path).to_lowercase()),
+            )
+        }),
+        SortMode::SizeDesc => rows.sort_by_cached_key(|r| {
+            (
+                r.kind != EntryKind::Dir,
+                Reverse(r.size),
+                leaf_name(&r.path).to_lowercase(),
+            )
+        }),
+        SortMode::SizeAsc => rows.sort_by_cached_key(|r| {
+            (
+                r.kind != EntryKind::Dir,
+                r.size,
+                leaf_name(&r.path).to_lowercase(),
+            )
+        }),
+    }
 }
 
 /// A one-line summary of a browser view: "2 folders · 5 files · 4.2 MB", or
@@ -8507,6 +8547,48 @@ mod browse_tests {
 
     fn names(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| leaf_name(&r.path)).collect()
+    }
+
+    #[test]
+    fn large_browser_only_renders_the_visible_rows() {
+        let rows: Vec<Row> = (0..10_000)
+            .map(|i| Row {
+                path: format!("file-{i}.txt"),
+                kind: EntryKind::File,
+                size: i,
+                children: 0,
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    browser_rows_ui(
+                        ui,
+                        theme::colors(ui),
+                        &rows,
+                        &HashSet::new(),
+                        true,
+                        false,
+                        &mut None,
+                    );
+                });
+            },
+        );
+        assert!(!output.shapes.is_empty());
+        assert!(
+            output.shapes.len() < 1000,
+            "offscreen rows were rendered: {} shapes",
+            output.shapes.len()
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub fn write_frame(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
 
 /// Read one length-prefixed frame, rejecting anything larger than `max` before
 /// allocating the buffer.
+#[cfg(test)]
 pub fn read_frame_bounded(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
@@ -50,6 +51,7 @@ pub fn read_frame_bounded(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> 
 }
 
 /// Read one bulk `Data` frame, rejecting anything larger than [`MAX_FRAME`].
+#[cfg(test)]
 pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
     read_frame_bounded(r, MAX_FRAME)
 }
@@ -57,6 +59,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
 /// Read one handshake/control frame, rejecting anything larger than
 /// [`MAX_HANDSHAKE_FRAME`] — a far tighter cap for the pre-/just-authenticated
 /// phase than the bulk-data path uses.
+#[cfg(test)]
 pub fn read_handshake_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
     read_frame_bounded(r, MAX_HANDSHAKE_FRAME)
 }
@@ -68,37 +71,57 @@ pub fn read_handshake_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
 /// keep each individual read alive still cannot hold the connection past the
 /// deadline (slowloris defense). Returns [`io::ErrorKind::TimedOut`] on expiry.
 pub fn read_handshake_frame_deadline(r: &mut impl Read, deadline: Instant) -> io::Result<Vec<u8>> {
+    read_frame_until(r, MAX_HANDSHAKE_FRAME, deadline, || false)
+}
+
+/// Read a bounded frame with a whole-frame deadline and cancellation checks
+/// between partial reads. Socket callers must set a short read timeout so an
+/// idle peer cannot prevent either check from running.
+pub fn read_frame_until(
+    r: &mut impl Read,
+    max: usize,
+    deadline: Instant,
+    mut cancelled: impl FnMut() -> bool,
+) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    read_exact_deadline(r, &mut len_buf, deadline)?;
+    read_exact_deadline(r, &mut len_buf, deadline, &mut cancelled)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_HANDSHAKE_FRAME {
+    if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame exceeds the maximum allowed size",
         ));
     }
     let mut buf = vec![0u8; len];
-    read_exact_deadline(r, &mut buf, deadline)?;
+    read_exact_deadline(r, &mut buf, deadline, &mut cancelled)?;
     Ok(buf)
 }
 
 /// Fill `buf` while enforcing an absolute `deadline`. A per-read socket timeout
 /// (set by the caller) surfaces as `WouldBlock`/`TimedOut`; we treat those as
 /// "check the clock and keep waiting" until the deadline, then give up.
-fn read_exact_deadline(r: &mut impl Read, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+fn read_exact_deadline(
+    r: &mut impl Read,
+    buf: &mut [u8],
+    deadline: Instant,
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
+        if cancelled() {
+            return Err(io::Error::other("Transfer cancelled."));
+        }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "handshake deadline exceeded",
+                "frame deadline exceeded",
             ));
         }
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "connection closed mid-handshake",
+                    "connection closed mid-frame",
                 ))
             }
             Ok(n) => filled += n,
@@ -188,6 +211,46 @@ mod tests {
         // spinning forever on the WouldBlock stream.
         let past = Instant::now();
         let err = read_handshake_frame_deadline(&mut Stalled, past).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_partial_frame() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, b"partial body").unwrap();
+        let mut input = Cursor::new(bytes);
+        let mut checks = 0;
+        let err = read_frame_until(
+            &mut input,
+            MAX_HANDSHAKE_FRAME,
+            Instant::now() + std::time::Duration::from_secs(5),
+            || {
+                checks += 1;
+                checks > 1
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
+        assert_eq!(input.position(), 4); // prefix read, body untouched
+    }
+
+    #[test]
+    fn deadline_applies_across_dribbled_reads() {
+        struct Dribble;
+        impl Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                buf[0] = 0;
+                Ok(1)
+            }
+        }
+        let err = read_frame_until(
+            &mut Dribble,
+            MAX_HANDSHAKE_FRAME,
+            Instant::now() + std::time::Duration::from_millis(15),
+            || false,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }

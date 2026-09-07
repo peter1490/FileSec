@@ -8,7 +8,7 @@
 # Signing and notarization are mandatory when RELEASE_SIGNING_REQUIRED=1
 # (official upstream tag releases). Without that flag, missing credentials only
 # produce warnings so forks and manual development runs can still build unsigned
-# artifacts. See RELEASE.md for the required secrets.
+# artifacts. See docs/RELEASE.md for the required secrets.
 #
 # Required env:
 #   BIN_PATH      path to the built binary (e.g. target/universal/filesec)

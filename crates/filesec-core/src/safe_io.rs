@@ -22,14 +22,43 @@
 //! *final* component, and the parent-component checks close the common
 //! local-tampering window, but a narrow TOCTOU race against a concurrent
 //! attacker who can write inside the destination directory remains — which the
-//! project threat model already places out of scope (see `README.md`).
+//! project threat model already places out of scope (see `docs/README.md`).
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::secret::random_array;
 use crate::util::hex;
+
+/// Read a regular file through a single handle, enforcing `max` during the read.
+/// A file growing after the metadata check can consume at most `max + 1` bytes;
+/// metadata is never trusted as the sole allocation bound.
+pub fn read_bounded_file(path: &Path, max: u64) -> Result<Vec<u8>> {
+    // Avoid blocking while opening an already-present FIFO or device. Repeat
+    // the check on the opened handle to bind the actual read to its metadata.
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(Error::Format("path is not a regular file"));
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::Format("path is not a regular file"));
+    }
+    if meta.len() > max {
+        return Err(Error::Format("file too large"));
+    }
+    read_bounded(file, max)
+}
+
+fn read_bounded(reader: impl Read, max: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(Error::Format("file too large"));
+    }
+    Ok(bytes)
+}
 
 /// A hardened, atomic writer for sensitive output.
 ///
@@ -160,7 +189,8 @@ pub fn create_dirs_no_symlink(root: &Path, dir: &Path) -> Result<()> {
                     "extraction path collides with a non-directory",
                 ))
             }
-            Err(_) => create_private_dir(&cur)?, // missing — create this one level
+            Err(e) if e.kind() == io::ErrorKind::NotFound => create_private_dir(&cur)?,
+            Err(e) => return Err(Error::Io(e)),
         }
     }
     Ok(())
@@ -174,7 +204,9 @@ fn reject_symlink(path: &Path) -> Result<()> {
         Ok(m) if m.file_type().is_symlink() => Err(Error::UnsafePath(
             "refusing to write through an existing symlink",
         )),
-        _ => Ok(()),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Io(e)),
     }
 }
 
@@ -182,15 +214,10 @@ fn reject_symlink(path: &Path) -> Result<()> {
 /// will become `dest`. Uses `create_new` (`O_EXCL`) so it never opens an existing
 /// file or follows a symlink; the name carries a random suffix, retried on the
 /// astronomically unlikely collision.
-fn create_private_temp(dir: &Path, dest: &Path) -> Result<(PathBuf, std::fs::File)> {
-    let base = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("out");
+fn create_private_temp(dir: &Path, _dest: &Path) -> Result<(PathBuf, std::fs::File)> {
     for _ in 0..8 {
         let suffix = hex(&random_array::<8>()?);
-        let candidate = dir.join(format!(".{base}.{suffix}.fstmp"));
+        let candidate = dir.join(format!(".filesec-{suffix}.fstmp"));
         match open_new_private(&candidate) {
             Ok(f) => return Ok((candidate, f)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -241,6 +268,14 @@ mod tests {
     // unwrap/expect/panic are relaxed here as in the other modules.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn bounded_read_stops_a_growing_or_infinite_source() {
+        let mut source = io::repeat(7).take(100);
+        assert!(read_bounded(&mut source, 8).is_err());
+        assert_eq!(source.limit(), 91); // exactly max + 1 bytes consumed
+        assert_eq!(read_bounded(&b"12345678"[..], 8).unwrap(), b"12345678");
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         // Unique per (pid, tag, counter) without needing `Date`/`rand` in tests.

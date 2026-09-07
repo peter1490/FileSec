@@ -686,3 +686,77 @@ fn v2_rekey_tamper_is_rejected() {
     cleanup(&dir);
     cleanup(&dir2);
 }
+
+#[test]
+fn empty_blob_tampering_is_rejected_by_read_export_and_rekey() {
+    for corruption in ["tamper", "truncate", "extend", "remove"] {
+        let identity = ident("Owner");
+        let dir = tmp_dir(corruption);
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader.put_file_bytes("empty.txt", b"", None, None).unwrap();
+        let blob = largest_blob(&dir);
+        let mut bytes = std::fs::read(&blob).unwrap();
+        match corruption {
+            "tamper" => bytes[0] ^= 1,
+            "truncate" => {
+                bytes.pop();
+            }
+            "extend" => bytes.push(0),
+            _ => {}
+        }
+        std::fs::write(&blob, bytes).unwrap();
+        if corruption == "remove" {
+            std::fs::remove_file(&blob).unwrap();
+        }
+        assert!(
+            reader.read_entry("empty.txt").is_err(),
+            "read accepted {corruption}"
+        );
+        let output = tmp_file("existing.fsec");
+        std::fs::write(&output, b"previous export").unwrap();
+        assert!(
+            export_v2_to_path(
+                &reader,
+                &identity,
+                &[identity.public()],
+                &ExportOptions::default(),
+                &output
+            )
+            .is_err(),
+            "export accepted {corruption}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous export");
+        let rekeyed = tmp_dir("rekeyed");
+        assert!(
+            VaultReaderV2::from_reader_v2(&rekeyed, &identity, SuiteId::Classic, &reader).is_err(),
+            "rekey accepted {corruption}"
+        );
+        cleanup(&dir);
+        cleanup(&rekeyed);
+        std::fs::remove_file(output).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_manifest_write_ignores_planted_legacy_temp_symlink() {
+    use std::os::unix::fs::symlink;
+    let identity = ident("Owner");
+    let dir = tmp_dir("temp-symlink");
+    let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+    let victim = dir.join("untouched");
+    std::fs::write(&victim, b"must survive").unwrap();
+    symlink(&victim, dir.join("manifest.tmp")).unwrap();
+    reader
+        .put_file_bytes("new.txt", b"content", None, None)
+        .unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
+    assert_eq!(
+        &*VaultReaderV2::open(&dir, &identity)
+            .unwrap()
+            .read_entry("new.txt")
+            .unwrap(),
+        b"content"
+    );
+    cleanup(&dir);
+}

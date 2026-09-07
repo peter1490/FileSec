@@ -30,6 +30,7 @@ env:
 
 jobs:
   fuzz:
+    timeout-minutes: 75
     name: fuzz smoke (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -69,11 +70,21 @@ jobs:
 
       # A PR pass is a quick smoke; scheduled/dispatch runs go longer.
       - name: Smoke-run ${{ matrix.target }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_DURATION: ${{ github.event.inputs.duration || '120' }}
+          FUZZ_TARGET: ${{ matrix.target }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             DURATION=30
           else
-            DURATION="${{ github.event.inputs.duration || '120' }}"
+            DURATION="$REQUESTED_DURATION"
           fi
-          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+          case "$DURATION" in
+            ''|*[!0-9]*) echo "Duration must be an integer in seconds"; exit 1 ;;
+          esac
+          if [ "$DURATION" -lt 1 ] || [ "$DURATION" -gt 3600 ]; then
+            echo "Duration must be between 1 and 3600 seconds"; exit 1
+          fi
+          cargo fuzz run "$FUZZ_TARGET" -- \
             -max_total_time="$DURATION" -rss_limit_mb=4096 -timeout=15

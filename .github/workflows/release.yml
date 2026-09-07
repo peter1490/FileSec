@@ -17,7 +17,7 @@ name: Release
 # notarization are mandatory for official version tags on the upstream repo.
 # Forks and manual development runs may still build unsigned artifacts, but they
 # do not publish stable upstream releases (the publish job is gated on the tag
-# and the upstream repository). See RELEASE.md for the secrets.
+# and the upstream repository). See docs/RELEASE.md for the secrets.
 #
 # Supply-chain note: every third-party GitHub Action is pinned by commit SHA with
 # the human-readable version in a trailing comment, and every release-time cargo

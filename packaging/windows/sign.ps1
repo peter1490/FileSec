@@ -8,7 +8,7 @@
 #
 # For organizations using Azure Trusted Signing or an HSM/cloud CSP instead of a
 # local .pfx, replace the signtool invocation below with the relevant
-# `signtool sign /dlib ...` (Trusted Signing) call — see RELEASE.md.
+# `signtool sign /dlib ...` (Trusted Signing) call — see docs/RELEASE.md.
 param(
   [Parameter(Mandatory = $true)][string]$File
 )

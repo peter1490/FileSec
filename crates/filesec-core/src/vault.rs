@@ -213,6 +213,36 @@ pub fn normalize_path(path: &str) -> Result<String> {
                 if comp.bytes().any(|b| b < 0x20 || b == 0x7f) {
                     return Err(Error::Vault("control characters in path".into()));
                 }
+                // Enforce the same portable namespace on every OS. Windows
+                // interprets ':' as an alternate data stream and strips trailing
+                // dots/spaces; device names remain special even with extensions.
+                if comp.contains([':', '<', '>', '"', '|', '?', '*']) || comp.ends_with(['.', ' '])
+                {
+                    return Err(Error::Vault("non-portable path component".into()));
+                }
+                let stem = comp.split('.').next().unwrap_or(comp).to_uppercase();
+                let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                    || ["COM", "LPT"].iter().any(|prefix| {
+                        stem.strip_prefix(prefix).is_some_and(|n| {
+                            matches!(
+                                n,
+                                "1" | "2"
+                                    | "3"
+                                    | "4"
+                                    | "5"
+                                    | "6"
+                                    | "7"
+                                    | "8"
+                                    | "9"
+                                    | "¹"
+                                    | "²"
+                                    | "³"
+                            )
+                        })
+                    });
+                if device {
+                    return Err(Error::Vault("reserved device name in path".into()));
+                }
                 components.push(comp);
             }
         }
@@ -224,4 +254,36 @@ pub fn normalize_path(path: &str) -> Result<String> {
         return Err(Error::Vault("path is too deep".into()));
     }
     Ok(components.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_windows_devices_streams_and_aliases_on_every_platform() {
+        for path in [
+            "a/b:secret",
+            "a/NUL.txt",
+            "con",
+            "a/COM1",
+            "LPT³.log",
+            "a/.. ",
+            "a/file.",
+            "a/file ",
+            "a/*.txt",
+            "a/b?",
+            "a/b|c",
+        ] {
+            assert!(normalize_path(path).is_err(), "accepted {path}");
+        }
+        for path in [
+            "report.txt",
+            "a/COM10.txt",
+            "console",
+            "日本語/document.txt",
+        ] {
+            assert!(normalize_path(path).is_ok(), "rejected {path}");
+        }
+    }
 }

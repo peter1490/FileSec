@@ -705,8 +705,8 @@ fn path_normalization_blocks_traversal() {
     assert!(normalize_path("C:\\Windows").is_err()); // drive absolute
     assert!(normalize_path("c:/windows").is_err()); // drive absolute (fwd slash)
     assert!(normalize_path("C:file").is_err()); // drive-relative
-                                                // A colon that is not a drive prefix stays a legal relative path on Unix.
-    assert_eq!(normalize_path("a/b:c").unwrap(), "a/b:c");
+                                                // Portable paths reject Windows alternate data streams even on Unix.
+    assert!(normalize_path("a/b:c").is_err());
 }
 
 /// Recursively assert no hardened-writer temp files (`*.fstmp`) survive under
@@ -816,4 +816,20 @@ fn reader_extract_fails(path: &std::path::Path, id: &Identity, dest: &std::path:
         .unwrap()
         .extract_to(dest)
         .is_err()
+}
+
+#[test]
+fn failed_export_preserves_existing_destination() {
+    let path = tmp_path("preserved.fsec");
+    std::fs::write(&path, b"previous complete export").unwrap();
+    let result = format::export_vault_to_path(
+        &sample_vault(),
+        &ident("Alice"),
+        &[],
+        &ExportOptions::default(),
+        &path,
+    );
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous complete export");
+    std::fs::remove_file(path).unwrap();
 }

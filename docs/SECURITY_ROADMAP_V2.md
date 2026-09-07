@@ -495,7 +495,7 @@ Required tests:
 
 **Implementation status (2026-07-10): complete.** CI gained a **supply-chain
 gate** (`.github/workflows/ci.yml`, `supply-chain` job) running `cargo deny`
-(new [`deny.toml`](deny.toml): RustSec advisories, a permissive-only license
+(new [`deny.toml`](../deny.toml): RustSec advisories, a permissive-only license
 allow-list enumerated from the actual graph, crates.io-only sources, and a
 wildcard/duplicate bans policy) and `cargo audit` (new `.cargo/audit.toml`) as a
 canonical RustSec cross-check; both tools are pinned by version and share one
@@ -637,7 +637,7 @@ CBOR, pasted/armored keys, identity backup, manifest, the P2P `Hello` handshake,
 and path normalization — live in the detached `fuzz/` crate (its own workspace +
 lock, `exclude`d from the root so it never touches the MSRV-1.86 stable build or
 the supply-chain scan) and are smoke-run by a new `.github/workflows/fuzz.yml`
-(weekly + on PRs touching the core parsers). `THREAT_MODEL.md` at the repo root
+(weekly + on PRs touching the core parsers). `THREAT_MODEL.md` in this documentation folder
 now states, authoritatively, what is protected, against whom, and what is out of
 scope. Intentional scoping consistent with the dependency-light, `unsafe`-free
 posture: further zeroization is bounded by what the PQC dependency API exposes,

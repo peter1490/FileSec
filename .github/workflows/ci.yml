@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +29,7 @@ jobs:
   # commands operate on the default workspace members (filesec-core, filesec-gui),
   # i.e. the dependency-light classical path — filesec-pqc is excluded.
   test:
+    timeout-minutes: 45
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -69,6 +79,7 @@ jobs:
   # feature needs; hardware-backed passkey tests still require a physical key and
   # stay #[ignore]d (see crates/filesec-gui/src/passkey.rs).
   features:
+    timeout-minutes: 45
     name: features (release feature sets)
     runs-on: macos-latest
     steps:
@@ -107,6 +118,9 @@ jobs:
       - name: Build (post-quantum variant binary)
         run: cargo build -p filesec-pqc --locked
 
+      - name: Test (all shipped features together)
+        run: cargo test --workspace --all-features --locked
+
   # Supply-chain gate. Blocks known-vulnerable/yanked dependencies, disallowed
   # licenses, and any crate sourced from outside crates.io. cargo-deny is the
   # comprehensive gate (advisories + licenses + bans + sources, config in
@@ -115,6 +129,7 @@ jobs:
   # accepted-advisory ignore lists are kept in lockstep. Neither reads the
   # workspace's MSRV, so they build with the CI `stable` toolchain.
   supply-chain:
+    timeout-minutes: 30
     name: supply-chain (audit, deny)
     runs-on: ubuntu-latest
     steps:
@@ -136,7 +151,7 @@ jobs:
 
       # Canonical RustSec cross-check against Cargo.lock.
       - name: cargo audit
-        run: cargo audit
+        run: cargo audit --deny unsound
 
   # Validate the GitHub Actions workflows themselves: action-reference format,
   # expression syntax, matrix/needs/permissions consistency, and the signing-gate

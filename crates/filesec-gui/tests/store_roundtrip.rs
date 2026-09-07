@@ -737,3 +737,36 @@ fn oversized_prefs_are_rejected_without_reading_them() {
     assert_eq!(store.load_prefs(), Prefs::default());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn corrupt_v2_vault_does_not_destroy_the_legacy_recovery_copy() {
+    let dir = tmp();
+    let store = Store::at(&dir).unwrap();
+    let identity = Identity::generate("Owner", 1).unwrap();
+    let id = new_vault_id().unwrap();
+    let mut vault = Vault::new("Recovery", 1);
+    vault
+        .add_file("file.txt", b"recover me".to_vec(), None, None)
+        .unwrap();
+    store.save_vault(&identity, &id, &vault).unwrap();
+    let legacy = dir.join("vaults").join(format!("{id}.fsec"));
+    filesec_core::format::export_vault_to_path(
+        &vault,
+        &identity,
+        &[identity.public()],
+        &Default::default(),
+        &legacy,
+    )
+    .unwrap();
+    let original = std::fs::read(&legacy).unwrap();
+    std::fs::write(
+        dir.join("vaults")
+            .join(format!("{id}.fsv2"))
+            .join("manifest"),
+        b"corrupt",
+    )
+    .unwrap();
+    assert!(store.open_vault(&identity, &id).is_err());
+    assert_eq!(std::fs::read(&legacy).unwrap(), original);
+    std::fs::remove_dir_all(dir).unwrap();
+}

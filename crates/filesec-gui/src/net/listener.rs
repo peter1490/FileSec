@@ -20,7 +20,9 @@ use filesec_core::{codec, format, Identity};
 
 use super::concurrency::{RateLimiter, Semaphore};
 use super::nat::PortMapping;
-use super::wire::{read_frame, read_handshake_frame, read_handshake_frame_deadline, write_frame};
+use super::wire::{
+    read_frame_until, read_handshake_frame_deadline, write_frame, MAX_FRAME, MAX_HANDSHAKE_FRAME,
+};
 use super::{
     display_transfer_code, generate_transfer_secret, now_unix, DecisionMsg, Emitter, ListenConfig,
     NatStatus, NetCommand, NetEvent, OfferMsg, TRANSFER_SECRET_LEN,
@@ -274,8 +276,12 @@ fn service(shared: &Shared, stream: TcpStream, ip: IpAddr) {
 fn handle_conn(shared: &Shared, mut stream: TcpStream, ip: IpAddr) -> Result<(), ConnError> {
     // Handshake phase: short per-read timeout so the deadline reader can enforce
     // the absolute HANDSHAKE_DEADLINE against a slow/dribbling peer.
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_READ_POLL));
-    let _ = stream.set_write_timeout(Some(HANDSHAKE_READ_POLL));
+    stream
+        .set_read_timeout(Some(HANDSHAKE_READ_POLL))
+        .map_err(|e| ConnError::probe(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(HANDSHAKE_READ_POLL))
+        .map_err(|e| ConnError::probe(e.to_string()))?;
     let deadline = Instant::now() + HANDSHAKE_DEADLINE;
 
     let mut responder = Responder::new(&shared.identity, shared.secret.as_ref(), shared.expected)
@@ -332,8 +338,12 @@ fn handle_conn(shared: &Shared, mut stream: TcpStream, ip: IpAddr) -> Result<(),
     }
 
     // Transfer phase: switch to the longer per-operation timeout.
-    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|e| ConnError::quiet(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|e| ConnError::quiet(e.to_string()))?;
 
     run_transfer(shared, &mut stream, session, &peer, &dec_rx)
 }
@@ -364,7 +374,13 @@ fn run_transfer(
     }
 
     // Read the offer.
-    let offer_frame = read_handshake_frame(stream).map_err(|e| ConnError::shown(e.to_string()))?;
+    let offer_frame = read_frame_until(
+        stream,
+        MAX_HANDSHAKE_FRAME,
+        Instant::now() + SOCKET_TIMEOUT,
+        || transfer_cancelled(shared, dec_rx),
+    )
+    .map_err(|e| ConnError::shown(e.to_string()))?;
     let (rtype, plaintext) = session
         .open_record(&offer_frame)
         .map_err(|e| ConnError::shown(e.to_string()))?;
@@ -389,14 +405,14 @@ fn run_transfer(
         ));
     }
     shared.emitter.emit(NetEvent::Offer {
-        filename: offer.filename.clone(),
+        filename: filesec_core::sanitize_display_name(&offer.filename),
         size: offer.size,
         sender_name: name.clone(),
         verified,
     });
 
     // Wait for the user to accept or reject, then tell the sender.
-    let accept = wait_decision(dec_rx)?;
+    let accept = wait_decision(dec_rx, &shared.stop)?;
     let decision =
         codec::to_vec(&DecisionMsg { accept }).map_err(|e| ConnError::shown(e.to_string()))?;
     let frame = session
@@ -451,16 +467,35 @@ impl Drop for ActiveGuard<'_> {
 }
 
 /// Wait (up to [`OFFER_DECISION_TIMEOUT`]) for the accept/reject command.
-fn wait_decision(dec_rx: &Receiver<NetCommand>) -> Result<bool, ConnError> {
-    match dec_rx.recv_timeout(OFFER_DECISION_TIMEOUT) {
-        Ok(NetCommand::AcceptOffer) => Ok(true),
-        Ok(NetCommand::RejectOffer) => Ok(false),
-        Ok(_) => Err(ConnError::quiet("Transfer cancelled.")),
-        Err(RecvTimeoutError::Timeout) => Err(ConnError::shown(
-            "No response to the transfer offer (timed out).",
-        )),
-        Err(RecvTimeoutError::Disconnected) => Err(ConnError::quiet("Transfer cancelled.")),
+fn wait_decision(dec_rx: &Receiver<NetCommand>, stop: &AtomicBool) -> Result<bool, ConnError> {
+    let deadline = Instant::now() + OFFER_DECISION_TIMEOUT;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(ConnError::quiet("Transfer cancelled."));
+        }
+        match dec_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(NetCommand::AcceptOffer) => return Ok(true),
+            Ok(NetCommand::RejectOffer) => return Ok(false),
+            Ok(_) => return Err(ConnError::quiet("Transfer cancelled.")),
+            Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                return Err(ConnError::shown(
+                    "No response to the transfer offer (timed out).",
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(ConnError::quiet("Transfer cancelled."))
+            }
+        }
     }
+}
+
+fn transfer_cancelled(shared: &Shared, commands: &Receiver<NetCommand>) -> bool {
+    shared.stop.load(Ordering::Acquire)
+        || matches!(
+            commands.try_recv(),
+            Ok(NetCommand::Cancel | NetCommand::Stop) | Err(TryRecvError::Disconnected)
+        )
 }
 
 /// Read `Data` records into `temp` until `Done`, enforcing the declared size.
@@ -482,6 +517,7 @@ fn receive_into(
         .open(temp)
         .map_err(|e| e.to_string())?;
     let mut received: u64 = 0;
+    let mut last_progress = Instant::now();
     loop {
         if shared.stop.load(Ordering::Acquire) {
             return Err("Transfer cancelled.".into());
@@ -493,26 +529,35 @@ fn receive_into(
             Err(TryRecvError::Disconnected) => return Err("Transfer cancelled.".into()),
             _ => {}
         }
-        let frame = read_frame(stream).map_err(|e| e.to_string())?;
+        let frame = read_frame_until(stream, MAX_FRAME, Instant::now() + SOCKET_TIMEOUT, || {
+            transfer_cancelled(shared, dec_rx)
+        })
+        .map_err(|e| e.to_string())?;
         let (rtype, plaintext) = session.open_record(&frame).map_err(|e| e.to_string())?;
         match rtype {
             RecordType::Data => {
+                if plaintext.is_empty() {
+                    return Err("protocol error: empty data record".into());
+                }
                 received = received.saturating_add(plaintext.len() as u64);
                 if received > size {
                     return Err("the sender exceeded the declared size".into());
                 }
                 file.write_all(&plaintext).map_err(|e| e.to_string())?;
-                shared.emitter.emit(NetEvent::Progress {
-                    done: received,
-                    total: size,
-                });
+                if received == size || last_progress.elapsed() >= Duration::from_millis(100) {
+                    shared.emitter.emit(NetEvent::Progress {
+                        done: received,
+                        total: size,
+                    });
+                    last_progress = Instant::now();
+                }
             }
-            RecordType::Done => break,
+            RecordType::Done if plaintext.is_empty() => break,
             _ => return Err("protocol error during the transfer".into()),
         }
     }
     file.flush().map_err(|e| e.to_string())?;
-    let _ = file.sync_all();
+    file.sync_all().map_err(|e| e.to_string())?;
     if received != size {
         return Err("the transfer ended early (size mismatch)".into());
     }

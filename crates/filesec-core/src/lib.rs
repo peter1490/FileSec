@@ -11,7 +11,7 @@
 //! * [`envelope`], [`manifest`], [`vault`], [`format`] — the `.fsec` container.
 //! * [`safe_io`] — hardened, atomic, symlink-rejecting writes for plaintext.
 //!
-//! See `THREAT_MODEL.md` at the repo root for the authoritative threat model
+//! See `docs/THREAT_MODEL.md` for the authoritative threat model
 //! (what is protected, against whom, and what is out of scope) and the workspace
 //! plan for the container format specification.
 

@@ -42,9 +42,9 @@ Never edit the version by hand: `scripts/bump-version.sh` also refreshes
 
 ### What gets published
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) is the
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) is the
 authoritative pipeline. Every artifact is named by
-[`packaging/release-vars.sh`](packaging/release-vars.sh) — the one place names
+[`packaging/release-vars.sh`](../packaging/release-vars.sh) — the one place names
 are composed — as:
 
 ```
@@ -144,7 +144,7 @@ job env in `release.yml` if you prefer that method.)
 
 Using **Azure Trusted Signing** or a cloud HSM/CSP instead of a local `.pfx`?
 Replace the `signtool sign /f …` call in
-[`packaging/windows/sign.ps1`](packaging/windows/sign.ps1) with the equivalent
+[`packaging/windows/sign.ps1`](../packaging/windows/sign.ps1) with the equivalent
 `signtool sign /dlib …` (Trusted Signing) invocation.
 
 ## Supply-chain controls
@@ -158,8 +158,8 @@ tampering:
 - **Pinned tools.** `cargo-wix`, `cargo-deb`, `cargo-sbom`, `cargo-deny`, and
   `cargo-audit` are installed at explicit `--version`s.
 - **Advisory + license + source gate.** The CI `supply-chain` job runs
-  [`cargo deny`](deny.toml) (RustSec advisories, a permissive-only license
-  allow-list, and a crates.io-only source rule) and [`cargo audit`](.cargo/audit.toml)
+  [`cargo deny`](../deny.toml) (RustSec advisories, a permissive-only license
+  allow-list, and a crates.io-only source rule) and [`cargo audit`](../.cargo/audit.toml)
   as a canonical RustSec cross-check. Run them locally with `cargo deny check`
   and `cargo audit`.
 - **Workflow lint.** `actionlint` (pinned + checksum-verified) validates the
@@ -178,7 +178,7 @@ block every build); instead the review process is:
    `ml-kem`, `ml-dsa`, `blake3`, `argon2`, `ring`) or untrusted-input parsing
    (`ciborium`, `x509-parser`, `quick-xml`, the container/transport parsers) is
    reviewed by hand before its version is bumped, and the MSRV-1.86 pin is
-   re-checked (see [`Cargo.toml`](Cargo.toml)).
+   re-checked (see [`Cargo.toml`](../Cargo.toml)).
 3. **License policy is explicit.** The allow-list in `deny.toml` lists every
    license currently present in the graph; adding a crate under any other license
    is a deliberate, reviewed decision.
@@ -217,7 +217,7 @@ result.
 
 ## cargo-dist (optional, complementary)
 
-The repo also carries a [`[workspace.metadata.dist]`](Cargo.toml) configuration
+The repo also carries a [`[workspace.metadata.dist]`](../Cargo.toml) configuration
 so maintainers who prefer **cargo-dist** can get its cross-platform archives,
 `curl | sh` / `irm | iex` installers, and Windows MSI with published checksums:
 
@@ -244,4 +244,4 @@ and is useless without this machine's keystore file. It is off until explicitly
 enabled, the passphrase always remains the recovery secret, and turning it off
 removes both the keyslot and the token. On Linux the Secret Service has no
 device-binding guarantee, so the UI shows a caveat. See
-[`crates/filesec-gui/src/autounlock.rs`](crates/filesec-gui/src/autounlock.rs).
+[`crates/filesec-gui/src/autounlock.rs`](../crates/filesec-gui/src/autounlock.rs).

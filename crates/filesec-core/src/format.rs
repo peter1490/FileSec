@@ -683,8 +683,9 @@ pub fn export_vault_to_path(
     options: &ExportOptions,
     path: &Path,
 ) -> Result<()> {
-    let file = fs_err::File::create(path)?;
-    export_vault(vault, sender, recipients, options, file)
+    let mut file = crate::safe_io::SafeFileWriter::create(path)?;
+    export_vault(vault, sender, recipients, options, &mut file)?;
+    file.commit()
 }
 
 /// Import (verify + decrypt) a container from its raw bytes.
@@ -971,17 +972,7 @@ fn reconstruct_vault_streaming<R: Read>(manifest: &Manifest, mut plaintext: R) -
 /// large containers prefer the streaming [`open_vault_from_path`] /
 /// [`verify_and_open`], which hold only a chunk at a time.
 pub fn import_vault_from_path(path: &Path, identity: &Identity) -> Result<ImportedVault> {
-    let meta = fs_err::metadata(path)?;
-    if !meta.is_file() {
-        return Err(Error::Format("container path is not a file"));
-    }
-    if meta.len() > MAX_IN_MEMORY_CONTAINER_LEN {
-        return Err(Error::Format("container too large to import in memory"));
-    }
-    let bytes = fs_err::read(path)?;
-    if bytes.len() as u64 > MAX_IN_MEMORY_CONTAINER_LEN {
-        return Err(Error::Format("container too large to import in memory"));
-    }
+    let bytes = crate::safe_io::read_bounded_file(path, MAX_IN_MEMORY_CONTAINER_LEN)?;
     import_vault(&bytes, identity)
 }
 
@@ -1189,8 +1180,9 @@ impl VaultReader {
         options: &ExportOptions,
         path: &Path,
     ) -> Result<()> {
-        let file = fs_err::File::create(path)?;
-        self.reexport(sender, recipients, options, file)
+        let mut file = crate::safe_io::SafeFileWriter::create(path)?;
+        self.reexport(sender, recipients, options, &mut file)?;
+        file.commit()
     }
 
     /// Write a **new** container that is this vault plus `added` files (streamed
@@ -1285,8 +1277,9 @@ impl VaultReader {
         added_dirs: &[String],
         path: &Path,
     ) -> Result<()> {
-        let file = fs_err::File::create(path)?;
-        self.append_files(sender, recipients, options, added, added_dirs, file)
+        let mut file = crate::safe_io::SafeFileWriter::create(path)?;
+        self.append_files(sender, recipients, options, added, added_dirs, &mut file)?;
+        file.commit()
     }
 
     /// Write a **new** container that is this vault minus every path in `remove`
@@ -1362,8 +1355,9 @@ impl VaultReader {
         remove: &[String],
         path: &Path,
     ) -> Result<()> {
-        let file = fs_err::File::create(path)?;
-        self.remove_paths(sender, recipients, options, remove, file)
+        let mut file = crate::safe_io::SafeFileWriter::create(path)?;
+        self.remove_paths(sender, recipients, options, remove, &mut file)?;
+        file.commit()
     }
 
     /// Write a **new** container identical to this vault except that the file at
@@ -1487,10 +1481,11 @@ impl VaultReader {
         mode: Option<u32>,
         out_path: &Path,
     ) -> Result<()> {
-        let file = fs_err::File::create(out_path)?;
+        let mut file = crate::safe_io::SafeFileWriter::create(out_path)?;
         self.replace_file(
-            sender, recipients, options, path, new_source, mtime, mode, file,
-        )
+            sender, recipients, options, path, new_source, mtime, mode, &mut file,
+        )?;
+        file.commit()
     }
 
     /// A [`Read`] that yields this vault's full decrypted plaintext, streamed

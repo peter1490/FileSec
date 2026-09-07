@@ -12,12 +12,12 @@
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use filesec_core::transport::{Initiator, RecordType, Session};
 use filesec_core::{codec, ExportOptions, Identity};
 
-use super::wire::{read_handshake_frame, write_frame};
+use super::wire::{read_frame_until, write_frame, MAX_HANDSHAKE_FRAME};
 use super::{
     decode_transfer_code, DecisionMsg, Emitter, NetCommand, NetEvent, OfferMsg, SendConfig,
 };
@@ -57,8 +57,12 @@ pub fn run(
             config.host, config.port
         )
     })?;
-    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|e| e.to_string())?;
 
     // 2. Mutual-auth handshake; aborts in core on a fingerprint or transfer-secret
     //    mismatch. Completing it proves the receiver is up *and* is the contact we
@@ -75,7 +79,13 @@ pub fn run(
         Initiator::new(identity, config.recipient_fpr, &secret).map_err(|e| e.to_string())?;
     let hello = initiator.write_hello().map_err(|e| e.to_string())?;
     write_frame(&mut stream, &hello).map_err(|e| e.to_string())?;
-    let auth = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
+    let auth = read_frame_until(
+        &mut stream,
+        MAX_HANDSHAKE_FRAME,
+        Instant::now() + SOCKET_TIMEOUT,
+        || cancelled(cmd_rx),
+    )
+    .map_err(|e| e.to_string())?;
     let (confirm, mut session) = initiator
         .read_auth_write_confirm(&auth)
         .map_err(|e| e.to_string())?;
@@ -112,9 +122,13 @@ pub fn run(
     let who = peer_name.clone().unwrap_or_else(|| "the receiver".into());
     emitter.emit(NetEvent::Status(format!("Waiting for {who} to accept…")));
 
-    let _ = stream.set_read_timeout(Some(DECISION_TIMEOUT));
-    let decision_frame = read_handshake_frame(&mut stream).map_err(|e| e.to_string())?;
-    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let decision_frame = read_frame_until(
+        &mut stream,
+        MAX_HANDSHAKE_FRAME,
+        Instant::now() + DECISION_TIMEOUT,
+        || cancelled(cmd_rx),
+    )
+    .map_err(|e| e.to_string())?;
     let (rtype, plaintext) = session
         .open_record(&decision_frame)
         .map_err(|e| e.to_string())?;
@@ -149,26 +163,27 @@ pub fn run(
 ///
 /// [`filesec_core::format_v2::V2ExportPlan::write_to`] writes the whole container
 /// straight through here, so encryption and the network send are interleaved.
-struct RecordWriter<'a> {
+struct RecordWriter<'a, W: Write> {
     session: &'a mut Session,
-    stream: &'a mut TcpStream,
+    stream: &'a mut W,
     emitter: &'a Emitter,
     cmd_rx: &'a Receiver<NetCommand>,
     /// Total container bytes — equal to the size declared in the offer.
     total: u64,
     /// Container bytes handed to the socket so far.
     sent: u64,
-    /// Bytes buffered toward the next `Data` record (kept below `CHUNK + one write`).
+    last_progress: Instant,
+    /// Bytes buffered toward the next `Data` record (at most `CHUNK`).
     buf: Vec<u8>,
     /// Set if a Cancel/Stop arrived (or the UI dropped the command channel) so the
     /// caller can report a clean cancellation instead of a raw socket error.
     cancelled: bool,
 }
 
-impl<'a> RecordWriter<'a> {
+impl<'a, W: Write> RecordWriter<'a, W> {
     fn new(
         session: &'a mut Session,
-        stream: &'a mut TcpStream,
+        stream: &'a mut W,
         emitter: &'a Emitter,
         cmd_rx: &'a Receiver<NetCommand>,
         total: u64,
@@ -180,6 +195,7 @@ impl<'a> RecordWriter<'a> {
             cmd_rx,
             total,
             sent: 0,
+            last_progress: Instant::now(),
             buf: Vec::with_capacity(CHUNK),
             cancelled: false,
         }
@@ -208,10 +224,13 @@ impl<'a> RecordWriter<'a> {
             .map_err(|e| io::Error::other(e.to_string()))?;
         write_frame(self.stream, &frame)?;
         self.sent = self.sent.saturating_add(chunk.len() as u64);
-        self.emitter.emit(NetEvent::Progress {
-            done: self.sent,
-            total: self.total,
-        });
+        if self.sent == self.total || self.last_progress.elapsed() >= Duration::from_millis(100) {
+            self.emitter.emit(NetEvent::Progress {
+                done: self.sent,
+                total: self.total,
+            });
+            self.last_progress = Instant::now();
+        }
         Ok(())
     }
 
@@ -229,12 +248,27 @@ impl<'a> RecordWriter<'a> {
     }
 }
 
-impl Write for RecordWriter<'_> {
+impl<W: Write> Write for RecordWriter<'_, W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        while self.buf.len() >= CHUNK {
-            let chunk: Vec<u8> = self.buf.drain(..CHUNK).collect();
-            self.send_data(&chunk)?;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            if self.buf.is_empty() && remaining.len() >= CHUNK {
+                // Send complete chunks directly from the caller's slice. This
+                // avoids copying a large header and repeatedly shifting its tail.
+                self.send_data(&remaining[..CHUNK])?;
+                remaining = &remaining[CHUNK..];
+            } else {
+                let n = remaining.len().min(CHUNK - self.buf.len());
+                self.buf.extend_from_slice(&remaining[..n]);
+                remaining = &remaining[n..];
+                if self.buf.len() == CHUNK {
+                    let chunk = std::mem::take(&mut self.buf);
+                    let result = self.send_data(&chunk);
+                    self.buf = chunk;
+                    self.buf.clear();
+                    result?;
+                }
+            }
         }
         Ok(data.len())
     }
@@ -254,4 +288,67 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, String> {
         .map_err(|e| format!("could not resolve {host}: {e}"))?
         .next()
         .ok_or_else(|| format!("no address found for {host}"))
+}
+
+fn cancelled(commands: &Receiver<NetCommand>) -> bool {
+    matches!(
+        commands.try_recv(),
+        Ok(NetCommand::Cancel | NetCommand::Stop) | Err(TryRecvError::Disconnected)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filesec_core::transport::Responder;
+    use std::io::Cursor;
+    use std::sync::mpsc;
+
+    #[test]
+    fn record_writer_bounds_buffer_and_preserves_fragmented_content() {
+        let alice = Identity::generate("Alice", 0).unwrap();
+        let bob = Identity::generate("Bob", 0).unwrap();
+        let secret = b"record writer test transfer secret";
+        let initiator = Initiator::new(&alice, bob.fingerprint(), secret).unwrap();
+        let mut responder = Responder::new(&bob, secret, None).unwrap();
+        let auth = responder
+            .read_hello_write_auth(&initiator.write_hello().unwrap())
+            .unwrap();
+        let (confirm, mut sending) = initiator.read_auth_write_confirm(&auth).unwrap();
+        let (_, mut receiving) = responder.read_confirm(&confirm).unwrap();
+        let (event_tx, _events) = mpsc::channel();
+        let (_commands, command_rx) = mpsc::channel();
+        let emitter = Emitter {
+            tx: event_tx,
+            ctx: egui::Context::default(),
+        };
+        let data: Vec<u8> = (0..CHUNK * 20 + 123).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::new();
+        let mut writer = RecordWriter::new(
+            &mut sending,
+            &mut wire,
+            &emitter,
+            &command_rx,
+            data.len() as u64,
+        );
+        writer.write_all(&data[..17]).unwrap();
+        writer.write_all(&data[17..]).unwrap();
+        assert!(writer.buf.capacity() <= CHUNK);
+        writer.finish().unwrap();
+        let mut wire = Cursor::new(wire);
+        let mut restored = Vec::new();
+        loop {
+            let frame = super::super::wire::read_frame(&mut wire).unwrap();
+            let (kind, body) = receiving.open_record(&frame).unwrap();
+            if kind == RecordType::Done {
+                assert!(body.is_empty());
+                break;
+            }
+            assert_eq!(kind, RecordType::Data);
+            assert!(body.len() <= CHUNK);
+            restored.extend_from_slice(&body);
+        }
+        assert_eq!(restored, data);
+        assert_eq!(wire.position(), wire.get_ref().len() as u64);
+    }
 }

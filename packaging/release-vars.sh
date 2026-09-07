@@ -112,7 +112,7 @@ version="$(resolve_version)"
 
 # The matrix keys are historical: `classical` is the standard build (post-quantum
 # suites compiled in, networking off) and `pqc` is the networking build. They are
-# kept only so artifact names stay stable across releases. See RELEASE.md.
+# kept only so artifact names stay stable across releases. See docs/RELEASE.md.
 case "$variant" in
     classical)
         bin="filesec"

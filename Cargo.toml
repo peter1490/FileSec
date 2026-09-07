@@ -51,7 +51,7 @@ inherits = "release"
 # native .dmg / .deb / NSIS installers and does code signing + notarization is
 # .github/workflows/release.yml (cargo-dist does not emit those formats). Run
 # `dist init` to (re)generate dist's own CI if you want the hosted installers.
-# See RELEASE.md.
+# See docs/RELEASE.md.
 # ---------------------------------------------------------------------------
 [workspace.metadata.dist]
 # Pin the dist CLI version for reproducible installer output.

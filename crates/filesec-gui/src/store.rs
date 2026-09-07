@@ -705,10 +705,6 @@ impl Store {
         if v2.exists() {
             // A crash after the migration commit but before the old file was
             // wiped can leave the v1 container behind; the v2 dir wins.
-            let v1 = self.vault_path(id);
-            if v1.exists() {
-                let _ = secure_wipe(&v1);
-            }
             let reader = VaultReaderV2::open(&v2, identity).map_err(err)?;
             let state = reader
                 .state_metadata()
@@ -718,6 +714,10 @@ impl Store {
                 return Err("vault object id does not match its registry/path id".into());
             }
             self.accept_state(state, &v2)?;
+            let v1 = self.vault_path(id);
+            if v1.exists() {
+                let _ = secure_wipe(&v1);
+            }
             return Ok(reader);
         }
         if self.vault_path(id).exists() {
@@ -1322,12 +1322,7 @@ fn reject_oversized_file(path: &Path, max_len: u64, label: &'static str) -> Stor
 }
 
 fn read_bounded_file(path: &Path, max_len: u64, label: &'static str) -> StoreResult<Vec<u8>> {
-    reject_oversized_file(path, max_len, label)?;
-    let bytes = std::fs::read(path).map_err(err)?;
-    if bytes.len() as u64 > max_len {
-        return Err(format!("{label} is too large"));
-    }
-    Ok(bytes)
+    filesec_core::safe_io::read_bounded_file(path, max_len).map_err(|e| format!("{label}: {e}"))
 }
 
 /// Generate a fresh random vault id (hex of 16 random bytes).
@@ -1466,10 +1461,25 @@ fn wipe_vault_dir(dir: &Path) {
 /// bar against casual recovery only.
 pub fn secure_wipe(path: &Path) -> StoreResult<()> {
     use std::io::{Seek, SeekFrom, Write};
-    let meta = match std::fs::metadata(path) {
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(_) => return Ok(()), // absent (or unreadable) — nothing to wipe
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(e)),
     };
+    // A cleanup sweep must never overwrite a symlink's target or a special file.
+    if meta.file_type().is_symlink() {
+        return std::fs::remove_file(path).map_err(err);
+    }
+    if !meta.is_file() {
+        return Err("refusing to wipe a non-regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return std::fs::remove_file(path).map_err(err);
+        }
+    }
     let len = meta.len();
     // Read-only files (e.g. view temps) can't be opened for writing; restore
     // owner write first so we can overwrite before unlinking.
@@ -1513,8 +1523,7 @@ fn open_private_create(path: &Path) -> StoreResult<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
         .map_err(err)
@@ -1524,8 +1533,7 @@ fn open_private_create(path: &Path) -> StoreResult<std::fs::File> {
 fn open_private_create(path: &Path) -> StoreResult<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
         .map_err(err)
 }
@@ -1539,31 +1547,8 @@ fn open_private_truncating(path: &Path) -> StoreResult<()> {
 /// fsync'd and renamed into place, then best-effort fsync the directory so the
 /// rename is durable. A crash can leave the old file or the new one, never a
 /// half-written one. The temp is cleaned up on any failure.
-fn write_private_atomic(tmp: &Path, final_path: &Path, bytes: &[u8]) -> StoreResult<()> {
-    use std::io::Write;
-    let mut f = open_private_create(tmp)?;
-    let write = (|| {
-        f.write_all(bytes)?;
-        f.flush()?;
-        f.sync_all()
-    })();
-    drop(f);
-    if let Err(e) = write {
-        let _ = std::fs::remove_file(tmp);
-        return Err(err(e));
-    }
-    if let Err(e) = std::fs::rename(tmp, final_path) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(err(e));
-    }
-    // Best-effort: fsync the containing directory so the rename itself survives a
-    // crash. Not all platforms/filesystems support directory fsync; ignore errors.
-    if let Some(parent) = final_path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
+fn write_private_atomic(_tmp: &Path, final_path: &Path, bytes: &[u8]) -> StoreResult<()> {
+    write_private_export(final_path, bytes)
 }
 
 #[cfg(unix)]
@@ -1759,5 +1744,23 @@ mod tests {
         assert_eq!(store.load_contacts(&identity).unwrap().contacts.len(), 1);
         assert_eq!(store.load_registry(&identity).unwrap().vaults.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_unlinks_symlinks_and_hardlinks_without_overwriting_targets() {
+        let dir = tmp("wipe-links");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("original");
+        std::fs::write(&victim, b"keep this file").unwrap();
+        let symlink = dir.join("symlink");
+        std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+        secure_wipe(&symlink).unwrap();
+        let hardlink = dir.join("hardlink");
+        std::fs::hard_link(&victim, &hardlink).unwrap();
+        secure_wipe(&hardlink).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep this file");
+        assert!(std::fs::symlink_metadata(&symlink).is_err());
+        assert!(!hardlink.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

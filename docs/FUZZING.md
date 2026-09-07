@@ -19,18 +19,18 @@ nightly-only. It never enters the MSRV-1.86 stable build or the supply-chain sca
 ## Running
 
 ```sh
-rustup toolchain install nightly
-cargo install cargo-fuzz --version 0.12.0 --locked
+rustup toolchain install nightly-2026-07-01 --profile minimal
+cargo install cargo-fuzz --version 0.13.2 --locked
 
 # Run one target indefinitely:
-cargo +nightly fuzz run identity_from_bytes
+cargo +nightly-2026-07-01 fuzz run identity_from_bytes
 
 # Short smoke run (what CI does):
-cargo +nightly fuzz run identity_from_bytes -- -max_total_time=60
+cargo +nightly-2026-07-01 fuzz run identity_from_bytes -- -max_total_time=60
 ```
 
 Crashes are written under `fuzz/artifacts/<target>/`; reproduce with
-`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>`.
+`cargo +nightly-2026-07-01 fuzz run <target> fuzz/artifacts/<target>/<crash-file>`.
 
 CI runs a weekly smoke of every target and a short smoke on PRs that touch the
 core parsers (`.github/workflows/fuzz.yml`).

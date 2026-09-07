@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::envelope::{self, RecipientStanza};
 use crate::error::{Error, Result};
@@ -112,6 +112,7 @@ fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()>
         return Err(Error::Format("too many manifest entries"));
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut total_size = 0u64;
     for e in &manifest.entries {
         let norm = normalize_path(&e.path)?;
         if !seen.insert(norm) {
@@ -126,6 +127,12 @@ fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()>
             if e.chunk_size == 0 || e.chunk_size as usize > aead::MAX_CHUNK_SIZE {
                 return Err(Error::Format("bad chunk size"));
             }
+            if num_chunks(e.size, u64::from(e.chunk_size)) > u64::from(u32::MAX) {
+                return Err(Error::Format("too many blob chunks"));
+            }
+            total_size = total_size
+                .checked_add(e.size)
+                .ok_or(Error::Format("size overflow"))?;
             if e.key.is_none() {
                 return Err(Error::Format("missing blob key"));
             }
@@ -149,6 +156,18 @@ struct VaultHeaderV2 {
     manifest_stanza: RecipientStanza,
 }
 
+// Preserve the existing CBOR array representation while wiping every owned key
+// on drop, including cloned readers and export plans. Never format key bytes.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+struct BlobKey([u8; 32]);
+
+impl std::fmt::Debug for BlobKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlobKey(***redacted***)")
+    }
+}
+
 /// One manifest entry. For directories `file_id`/`key`/`nonce` are `None`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EntryV2 {
@@ -163,7 +182,7 @@ struct EntryV2 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    key: Option<[u8; 32]>,
+    key: Option<BlobKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nonce: Option<Vec<u8>>,
     #[serde(default)]
@@ -498,6 +517,25 @@ impl VaultReaderV2 {
         self.dir.join(BLOBS_DIR).join(file_id)
     }
 
+    fn open_blob(&self, file_id: &str, size: u64, chunk_size: u32) -> Result<fs_err::File> {
+        if chunk_size == 0 {
+            return Err(Error::Format("bad chunk size"));
+        }
+        let chunks = num_chunks(size, u64::from(chunk_size));
+        if chunks > u64::from(u32::MAX) {
+            return Err(Error::Format("too many blob chunks"));
+        }
+        let expected = size
+            .checked_add(chunks * aead::TAG_LEN as u64)
+            .ok_or(Error::Format("blob length overflow"))?;
+        let file = fs_err::File::open(self.blob_path(file_id))?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.len() != expected {
+            return Err(Error::Format("blob length mismatch"));
+        }
+        Ok(file)
+    }
+
     fn file_entry(&self, path: &str) -> Result<&EntryV2> {
         let norm = normalize_path(path)?;
         let e = self
@@ -550,22 +588,22 @@ impl VaultReaderV2 {
     /// its BLAKE3 as it streams. Peak memory is a single chunk.
     pub fn read_entry_to_writer<W: Write>(&self, path: &str, out: &mut W) -> Result<()> {
         let entry = self.file_entry(path)?;
-        if entry.size == 0 {
-            if !ct_eq(blake3::hash(&[]).as_bytes(), &entry.blake3) {
-                return Err(Error::Auth);
-            }
-            return Ok(());
-        }
         let chunk = u64::from(entry.chunk_size);
         if chunk == 0 {
             return Err(Error::Format("bad chunk size"));
         }
-        let key = SymKey::from_bytes(entry.key.ok_or(Error::Format("missing blob key"))?);
+        let key = SymKey::from_bytes(
+            entry
+                .key
+                .as_ref()
+                .ok_or(Error::Format("missing blob key"))?
+                .0,
+        );
         let nonce = entry
             .nonce
             .as_ref()
             .ok_or(Error::Format("missing blob nonce"))?;
-        let mut file = fs_err::File::open(self.blob_path(blob_id(entry)?))?;
+        let mut file = self.open_blob(blob_id(entry)?, entry.size, entry.chunk_size)?;
         let last_index = num_chunks(entry.size, chunk) - 1;
         let mut hasher = blake3::Hasher::new();
         for c in 0..=last_index {
@@ -582,7 +620,11 @@ impl VaultReaderV2 {
     /// Decrypt and return a whole file's content (buffers the file).
     pub fn read_entry(&self, path: &str) -> Result<Zeroizing<Vec<u8>>> {
         let entry = self.file_entry(path)?;
-        let mut buf = Zeroizing::new(Vec::with_capacity(entry.size as usize));
+        let capacity =
+            usize::try_from(entry.size).map_err(|_| Error::Format("file too large to buffer"))?;
+        let mut buf = Zeroizing::new(Vec::new());
+        buf.try_reserve_exact(capacity)
+            .map_err(|_| Error::Format("file too large to buffer"))?;
         self.read_entry_to_writer(path, &mut *buf)?;
         Ok(buf)
     }
@@ -717,15 +759,23 @@ impl VaultReaderV2 {
         let file_id = new_file_id()?;
         let key = SymKey::random()?;
         let nonce = crate::secret::random_vec(self.suite.aead_alg().stream_nonce_len())?;
+        let mut source = HashingReader::new(source);
         encrypt_blob(
             &self.blob_path(&file_id),
             self.suite.aead_alg(),
             &key,
             &nonce,
             &self.header_bytes,
-            source,
+            &mut source,
             aead::DEFAULT_CHUNK_SIZE,
         )?;
+        // A source on disk can change between the initial hash and this read.
+        // Preserve the old entry/blob unless the bytes actually encrypted match
+        // the metadata that will be committed to the manifest.
+        if source.bytes_read != size || !ct_eq(source.finalize().as_bytes(), &blake3) {
+            let _ = fs_err::remove_file(self.blob_path(&file_id));
+            return Err(Error::Auth);
+        }
         // Disk write succeeded; now mutate the in-memory manifest.
         let old = match self.manifest.entries.iter().position(|e| e.path == norm) {
             Some(pos) => self.manifest.entries.remove(pos).file_id,
@@ -740,7 +790,7 @@ impl VaultReaderV2 {
             mode,
             blake3,
             file_id: Some(file_id),
-            key: Some(*key.as_bytes()),
+            key: Some(BlobKey(*key.as_bytes())),
             nonce: Some(nonce),
             chunk_size: aead::DEFAULT_CHUNK_SIZE as u32,
         });
@@ -947,13 +997,9 @@ impl VaultReaderV2 {
                     if e.data_offset != offset {
                         return Err(Error::Format("non-contiguous data offset"));
                     }
-                    let mut src = HashingReader::new((&mut plaintext).take(e.size));
+                    let mut src = (&mut plaintext).take(e.size);
                     // Fresh vault, so this never overwrites (no old blob to drop).
                     me.stage_file(e.path.clone(), e.blake3, e.size, &mut src, e.mtime, e.mode)?;
-                    // Defense in depth atop the already-verified container signature.
-                    if !ct_eq(src.finalize().as_bytes(), &e.blake3) {
-                        return Err(Error::Auth);
-                    }
                     offset = offset
                         .checked_add(e.size)
                         .ok_or(Error::Format("size overflow"))?;
@@ -1041,13 +1087,8 @@ impl VaultReaderV2 {
                     // Stream this one blob's plaintext straight into a fresh blob,
                     // re-hashing as we go. Fresh vault, so this never overwrites
                     // (no old blob to drop).
-                    let mut src = HashingReader::new(source.entry_plaintext(e)?);
+                    let mut src = source.entry_plaintext(e)?;
                     me.stage_file(e.path.clone(), e.blake3, e.size, &mut src, e.mtime, e.mode)?;
-                    // Defense in depth atop the per-chunk AEAD already verified as
-                    // the source was pulled.
-                    if !ct_eq(src.finalize().as_bytes(), &e.blake3) {
-                        return Err(Error::Auth);
-                    }
                 }
             }
         }
@@ -1056,22 +1097,19 @@ impl VaultReaderV2 {
     }
 
     /// A pull-[`Read`] over one file entry's decrypted plaintext, streamed a chunk
-    /// at a time from its blob (peak memory is a couple of chunks). An empty file
-    /// opens no blob. Feeds [`Self::stage_file`] from [`Self::from_reader_v2_inner`]
-    /// without ever buffering the whole file.
+    /// at a time from its blob (peak memory is a couple of chunks). Empty files
+    /// authenticate their tag-only blob. Feeds [`Self::stage_file`] from
+    /// [`Self::from_reader_v2_inner`] without buffering the whole file.
     fn entry_plaintext(&self, e: &EntryV2) -> Result<EntryPlaintext> {
-        if e.size == 0 {
-            return Ok(EntryPlaintext::Empty(std::io::empty()));
-        }
         if e.chunk_size == 0 {
             return Err(Error::Format("bad chunk size"));
         }
-        let key = SymKey::from_bytes(e.key.ok_or(Error::Format("missing blob key"))?);
+        let key = SymKey::from_bytes(e.key.as_ref().ok_or(Error::Format("missing blob key"))?.0);
         let nonce = e
             .nonce
             .as_ref()
             .ok_or(Error::Format("missing blob nonce"))?;
-        let file = BufReader::new(fs_err::File::open(self.blob_path(blob_id(e)?))?);
+        let file = BufReader::new(self.open_blob(blob_id(e)?, e.size, e.chunk_size)?);
         Ok(EntryPlaintext::Blob(aead::StreamDecryptReader::new_with(
             self.suite.aead_alg(),
             &key,
@@ -1194,7 +1232,7 @@ impl VaultReaderV2 {
                     });
                     files.push(ExportFile {
                         file_id: blob_id(e)?.to_string(),
-                        key: e.key.ok_or(Error::Format("missing blob key"))?,
+                        key: e.key.clone().ok_or(Error::Format("missing blob key"))?,
                         nonce: e.nonce.clone().ok_or(Error::Format("missing blob nonce"))?,
                         blake3: e.blake3,
                         size: e.size,
@@ -1238,44 +1276,15 @@ fn new_file_id() -> Result<String> {
 
 /// Read a whole file, rejecting anything larger than `max` (untrusted-input guard).
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
-    let meta = fs_err::metadata(path)?;
-    if !meta.is_file() {
-        return Err(Error::Format("metadata path is not a file"));
-    }
-    if meta.len() > max {
-        return Err(Error::Format("file too large"));
-    }
-    let bytes = fs_err::read(path)?;
-    if bytes.len() as u64 > max {
-        return Err(Error::Format("file too large"));
-    }
-    Ok(bytes)
-}
-
-/// A temp sibling path (`<path>.tmp`) that tolerates names containing dots.
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".tmp");
-    PathBuf::from(s)
+    crate::safe_io::read_bounded_file(path, max)
 }
 
 /// Atomically write `bytes` to `path`: temp + fsync + rename (+ best-effort dir
 /// fsync), hardened to 0600 on Unix.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = tmp_path(path);
-    {
-        let mut f = fs_err::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    harden_file(&tmp);
-    fs_err::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(d) = fs_err::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
-    Ok(())
+    let mut writer = crate::safe_io::SafeFileWriter::create(path)?;
+    writer.write_all(bytes)?;
+    writer.commit()
 }
 
 /// Encrypt `source` into a fresh blob at `path` (temp + fsync + rename), 0600.
@@ -1288,21 +1297,9 @@ fn encrypt_blob<R: Read>(
     source: R,
     chunk_size: usize,
 ) -> Result<()> {
-    let tmp = tmp_path(path);
-    {
-        let mut f = fs_err::File::create(&tmp)?;
-        aead::encrypt_stream_with(alg, key, nonce, aad, source, &mut f, chunk_size)?;
-        f.sync_all()?;
-    }
-    harden_file(&tmp);
-    fs_err::rename(&tmp, path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn harden_file(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    let mut writer = crate::safe_io::SafeFileWriter::create(path)?;
+    aead::encrypt_stream_with(alg, key, nonce, aad, source, &mut writer, chunk_size)?;
+    writer.commit()
 }
 
 #[cfg(unix)]
@@ -1310,9 +1307,6 @@ fn harden_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
 }
-
-#[cfg(not(unix))]
-fn harden_file(_path: &Path) {}
 
 #[cfg(not(unix))]
 fn harden_dir(_path: &Path) {}
@@ -1328,8 +1322,9 @@ pub fn export_v2_to_path(
     path: &Path,
 ) -> Result<()> {
     let plan = reader.export_plan(sender, recipients, options)?;
-    let file = fs_err::File::create(path)?;
-    plan.write_to(file)
+    let mut file = crate::safe_io::SafeFileWriter::create(path)?;
+    plan.write_to(&mut file)?;
+    file.commit()
 }
 
 /// One blob to stream during an export: the metadata needed to open and decrypt
@@ -1337,7 +1332,7 @@ pub fn export_v2_to_path(
 /// have a simple lifetime.
 struct ExportFile {
     file_id: String,
-    key: [u8; 32],
+    key: BlobKey,
     nonce: Vec<u8>,
     blake3: [u8; 32],
     size: u64,
@@ -1380,6 +1375,7 @@ impl V2ExportPlan<'_> {
 struct HashingReader<R: Read> {
     inner: R,
     hasher: blake3::Hasher,
+    bytes_read: u64,
 }
 
 impl<R: Read> HashingReader<R> {
@@ -1387,6 +1383,7 @@ impl<R: Read> HashingReader<R> {
         Self {
             inner,
             hasher: blake3::Hasher::new(),
+            bytes_read: 0,
         }
     }
 
@@ -1399,6 +1396,10 @@ impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.hasher.update(&buf[..n]);
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(n as u64)
+            .ok_or_else(|| std::io::Error::other("source length overflow"))?;
         Ok(n)
     }
 }
@@ -1411,19 +1412,17 @@ struct CurrentBlob {
     expected: [u8; 32],
 }
 
-/// A pull-[`Read`] over a single v2 file entry's plaintext: either an empty file
-/// (no blob is opened) or a blob decrypted one chunk at a time. Lets
+/// A pull-[`Read`] over a single v2 file entry's plaintext, including the
+/// authenticated tag-only blob for an empty file. Lets
 /// [`VaultReaderV2::from_reader_v2_inner`] hand [`VaultReaderV2::stage_file`] one
 /// concrete reader per file without buffering the whole file.
 enum EntryPlaintext {
-    Empty(std::io::Empty),
     Blob(aead::StreamDecryptReader<BufReader<fs_err::File>>),
 }
 
 impl Read for EntryPlaintext {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            EntryPlaintext::Empty(r) => r.read(buf),
             EntryPlaintext::Blob(r) => r.read(buf),
         }
     }
@@ -1447,30 +1446,25 @@ fn auth_io_err() -> std::io::Error {
 enum Advance {
     /// A blob was opened into `current` and is ready to stream.
     Opened,
-    /// An empty file was verified and skipped (it yields no plaintext).
-    SkippedEmpty,
     /// No files remain.
     Done,
 }
 
 impl V2PlaintextReader<'_> {
-    /// Move to the next file: open its blob into `current`, skip an empty file
-    /// (after checking its digest is the hash of nothing), or report completion.
+    /// Open the next blob, including empty files, or report completion.
     fn advance(&mut self) -> std::io::Result<Advance> {
         let f = match self.files.next() {
             Some(f) => f,
             None => return Ok(Advance::Done),
         };
-        if f.size == 0 {
-            if !ct_eq(blake3::hash(&[]).as_bytes(), &f.blake3) {
-                return Err(auth_io_err());
-            }
-            return Ok(Advance::SkippedEmpty);
-        }
-        let file = BufReader::new(fs_err::File::open(self.reader.blob_path(&f.file_id))?);
+        let file = BufReader::new(
+            self.reader
+                .open_blob(&f.file_id, f.size, f.chunk_size)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        );
         let dec = aead::StreamDecryptReader::new_with(
             self.reader.suite.aead_alg(),
-            &SymKey::from_bytes(f.key),
+            &SymKey::from_bytes(f.key.0),
             &f.nonce,
             &self.reader.header_bytes,
             file,
@@ -1488,11 +1482,13 @@ impl V2PlaintextReader<'_> {
 
 impl Read for V2PlaintextReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             if self.current.is_none() {
                 match self.advance()? {
                     Advance::Opened => {}
-                    Advance::SkippedEmpty => continue,
                     Advance::Done => return Ok(0),
                 }
             }
@@ -1520,6 +1516,59 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn blob_keys_keep_wire_compatibility_and_redact_debug() {
+        let bytes = [42; 32];
+        let key = BlobKey(bytes);
+        assert_eq!(codec::to_vec(&key).unwrap(), codec::to_vec(&bytes).unwrap());
+        assert_eq!(
+            codec::from_slice::<BlobKey>(&codec::to_vec(&bytes).unwrap())
+                .unwrap()
+                .0,
+            bytes
+        );
+        assert_eq!(format!("{key:?}"), "BlobKey(***redacted***)");
+    }
+
+    #[test]
+    fn changed_source_does_not_replace_the_previous_file() {
+        let dir = tmp("changed-source");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader
+            .put_file_bytes("file.txt", b"old content", None, None)
+            .unwrap();
+        let before = fs_err::read(dir.join(MANIFEST_FILE)).unwrap();
+        let result = reader.stage_file(
+            "file.txt".into(),
+            *blake3::hash(b"expected").as_bytes(),
+            8,
+            &b"modified"[..],
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(Error::Auth)));
+        assert_eq!(&*reader.read_entry("file.txt").unwrap(), b"old content");
+        assert_eq!(fs_err::read(dir.join(MANIFEST_FILE)).unwrap(), before);
+        assert_eq!(fs_err::read_dir(dir.join(BLOBS_DIR)).unwrap().count(), 1);
+        fs_err::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_blob_counter_overflow() {
+        let dir = tmp("counter-overflow");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader.put_file_bytes("file.txt", b"x", None, None).unwrap();
+        reader.manifest.entries[0].size = u64::MAX;
+        reader.manifest.entries[0].chunk_size = 1;
+        assert!(matches!(
+            validate_manifest_v2(&reader.manifest, reader.suite.aead_alg()),
+            Err(Error::Format("too many blob chunks"))
+        ));
+        fs_err::remove_dir_all(dir).unwrap();
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let suffix = crate::util::hex(&crate::secret::random_array::<8>().unwrap());
