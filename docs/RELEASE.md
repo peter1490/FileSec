@@ -234,6 +234,7 @@ packaging/
   macos/verify_macos.sh      # post-packaging check of the archive's binary, the .dmg, and the app inside it
   windows/filesec.nsi        # NSIS installer (variant chosen via /D defines)
   windows/sign.ps1           # Authenticode signing helper
+  windows/verify_resources.ps1  # checks each built .exe embeds the DPI manifest (RT_MANIFEST)
 crates/filesec-gui/packaging/filesec.desktop       # Linux .desktop (cargo-deb)
 crates/filesec-pqc/packaging/filesec-pqc.desktop   #   "
 crates/filesec-gui/wix/main.wxs                    # committed WiX source (deterministic .msi)
@@ -277,3 +278,14 @@ enabled, the passphrase always remains the recovery secret, and turning it off
 removes both the keyslot and the token. On Linux the Secret Service has no
 device-binding guarantee, so the UI shows a caveat. See
 [`crates/filesec-gui/src/autounlock.rs`](../crates/filesec-gui/src/autounlock.rs).
+
+## Windows resources (icon + DPI manifest)
+
+Both executables embed the same icon and the same system-DPI-aware application
+manifest from `crates/filesec-gui/build_support/windows_resources.rs` (the
+workaround for winit's Windows 11 24H2 multi-monitor resize loop). The manifest
+is required, so a build that cannot embed it **fails**; the release and CI
+Windows jobs then read the manifest back out of each final `.exe`
+(`packaging/windows/verify_resources.ps1`). For a check-only cross build from a
+host without a Windows resource compiler, set
+`FILESEC_ALLOW_MISSING_WINDOWS_RESOURCES=1` — never for a binary that will run.

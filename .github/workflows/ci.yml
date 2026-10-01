@@ -79,6 +79,11 @@ jobs:
       - name: Build (classical)
         run: cargo build --locked
 
+      - name: Verify embedded Windows resources
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/windows/verify_resources.ps1 -File target/debug/filesec.exe
+
       - name: Test (classical)
         run: cargo test --locked
 

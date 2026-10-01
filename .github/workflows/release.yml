@@ -198,6 +198,12 @@ jobs:
         shell: bash
         run: cargo build --locked --release $BUILD_ARGS
 
+      # Both variants must carry the system-DPI-aware manifest (FS-15). Read it
+      # back out of the final executable rather than trusting the build script.
+      - name: Verify embedded Windows resources
+        shell: pwsh
+        run: ./packaging/windows/verify_resources.ps1 -File "target/release/$env:BIN.exe"
+
       - name: Require Windows signing for official tags
         if: env.RELEASE_SIGNING_REQUIRED == '1'
         shell: pwsh
