@@ -1105,6 +1105,10 @@ impl VaultReader {
     /// file chunk-by-chunk straight to disk. Peak memory is a single chunk — not
     /// the size of the largest file, and never the whole vault.
     ///
+    /// Refused up front, with nothing written, if entries would alias on a
+    /// case- or normalization-insensitive destination or a file already exists
+    /// there ([`crate::vault::preflight_extraction`]).
+    ///
     /// Each file is written through [`crate::safe_io::SafeFileWriter`]: a private
     /// temp is created, the plaintext is authenticated as it streams (per-chunk
     /// AEAD plus a full-file BLAKE3 check inside [`Self::decrypt_entry_to_writer`]),
@@ -1114,6 +1118,13 @@ impl VaultReader {
     /// directories are created without descending through attacker-planted
     /// symlinks, and an existing symlink at a target path is refused.
     pub fn extract_to(&self, dest: &Path) -> Result<()> {
+        crate::vault::preflight_extraction(
+            dest,
+            self.manifest
+                .entries
+                .iter()
+                .map(|e| (e.path.as_str(), e.kind)),
+        )?;
         let mut file = fs_err::File::open(&self.path)?;
         for entry in &self.manifest.entries {
             let norm = normalize_path(&entry.path)?;

@@ -1899,12 +1899,21 @@ fn temp_extension(leaf: &str) -> Option<String> {
 
 /// Write a decrypted vault's contents into `dest` on the real filesystem.
 ///
+/// Refused before anything is written if two entries would alias on a case- or
+/// normalization-insensitive destination or a file already exists there
+/// ([`filesec_core::vault::preflight_extraction`]).
+///
 /// Each path is re-validated with [`normalize_path`] (rejecting absolute or
 /// traversal paths) and written through [`extract_file_hardened`], so a malicious
 /// vault can neither escape `dest` nor make FileSec write plaintext through a
 /// symlink planted inside it; a write that fails leaves no partial file.
 pub fn extract_vault(vault: &Vault, dest: &Path) -> StoreResult<()> {
     use filesec_core::manifest::EntryKind;
+    filesec_core::vault::preflight_extraction(
+        dest,
+        vault.entries().iter().map(|e| (e.path.as_str(), e.kind)),
+    )
+    .map_err(err)?;
     for e in vault.entries() {
         match e.kind {
             EntryKind::Dir => extract_dir_hardened(dest, &e.path)?,

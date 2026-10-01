@@ -34,6 +34,10 @@ getrandom = "0.2"
 serde = { version = "1.0.228", features = ["derive"] }
 subtle = "2.6.1"
 thiserror = "2.0.18"
+# NFC/NFD for the portable extraction collision key (FS-09): two vault paths
+# that differ only in Unicode normalization land on one file on APFS/HFS+.
+# MIT/Apache-2.0, MSRV 1.36, pulls only tinyvec.
+unicode-normalization = "0.1.25"
 walkdir = "2.5.0"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 zeroize = { version = "1.8.2", features = ["derive"] }

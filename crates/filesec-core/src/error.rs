@@ -78,6 +78,13 @@ pub enum Error {
     #[error("unsafe filesystem path: {0}")]
     UnsafePath(&'static str),
 
+    /// Extraction was refused before writing anything because entries would
+    /// land on the same destination file (paths differing only in case or
+    /// Unicode normalization) or would replace a file already at the
+    /// destination. The message lists the conflicting paths.
+    #[error("extraction would lose data: {0}")]
+    ExtractionConflict(String),
+
     /// A filesystem operation failed.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

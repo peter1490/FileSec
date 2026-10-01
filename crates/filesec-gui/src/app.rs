@@ -3160,6 +3160,16 @@ impl App {
         };
         let n = paths.len();
         self.spawn_job(ctx, "Decrypting…", move || {
+            // Nothing is written if two selected files would land on one file
+            // (case/Unicode aliases) or would replace a file already there.
+            if let Err(e) = filesec_core::vault::preflight_extraction(
+                &dest,
+                paths.iter().map(|p| (p.as_str(), EntryKind::File)),
+            ) {
+                return JobReport::err(format!(
+                    "Nothing was extracted: {e}. Rename the entries or pick an empty folder."
+                ));
+            }
             let mut failed = 0usize;
             for path in &paths {
                 // Each file streams through the hardened writer: parents are made
@@ -3451,12 +3461,24 @@ impl App {
         self.spawn_job(ctx, "Decrypting…", move || {
             // Extract the live tree only — soft-deleted files stay in the trash
             // and are never written to disk (matching what "Send…" exports).
+            let live: Vec<(String, EntryKind)> = snapshot_entries(&reader)
+                .into_iter()
+                .filter(|(path, _, _)| !is_trashed(path))
+                .map(|(path, kind, _)| (path, kind))
+                .collect();
+            // Nothing is written if two entries would land on one file
+            // (case/Unicode aliases) or would replace a file already there.
+            if let Err(e) = filesec_core::vault::preflight_extraction(
+                &dest,
+                live.iter().map(|(p, k)| (p.as_str(), *k)),
+            ) {
+                return JobReport::err(format!(
+                    "Nothing was extracted: {e}. Rename the entries or pick an empty folder."
+                ));
+            }
             let mut failed = 0usize;
             let mut files = 0usize;
-            for (path, kind, _) in snapshot_entries(&reader) {
-                if is_trashed(&path) {
-                    continue;
-                }
+            for (path, kind) in live {
                 // Hardened writes: symlink-rejecting parent creation, and per-file
                 // authenticate-then-atomically-rename so no partial plaintext lands
                 // under `dest`.

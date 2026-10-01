@@ -112,6 +112,12 @@ docs.
   the target, then an atomic rename. A failed/aborted decrypt unlinks the temp, so
   a tampered container leaves **no partial plaintext and no scratch file**. Symlink
   destinations and symlinked parent directories are refused (F06, Stage 4).
+- Every extraction is preflighted before the first byte is written: entries
+  whose paths differ only in case or Unicode normalization (which would land on
+  one file on NTFS/APFS/HFS+) are reported as a conflict, and a file already
+  present at the destination is never replaced. Both source entries and the
+  user's existing files are preserved; the error names the conflicting paths
+  (FS-09).
 
 ### In transit (P2P networking build)
 

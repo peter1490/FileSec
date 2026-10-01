@@ -760,3 +760,53 @@ fn atomic_manifest_write_ignores_planted_legacy_temp_symlink() {
     );
     cleanup(&dir);
 }
+
+/// FS-09: a vault holding paths that alias on a case- or
+/// normalization-insensitive filesystem is refused before anything is
+/// written, instead of silently keeping only the last entry.
+#[test]
+fn extraction_refuses_case_and_normalization_aliases_before_writing() {
+    for (first, second) in [("Report", "report"), ("caf\u{e9}.txt", "cafe\u{301}.txt")] {
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let dir = tmp_dir("alias-src");
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader.put_file_bytes(first, b"first", None, None).unwrap();
+        reader
+            .put_file_bytes(second, b"second", None, None)
+            .unwrap();
+        let dest = tmp_dir("alias-dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let error = reader.extract_to(&dest).unwrap_err();
+        assert!(
+            matches!(error, filesec_core::Error::ExtractionConflict(_)),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "nothing written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+}
+
+#[test]
+fn extraction_never_replaces_an_existing_file() {
+    let identity = Identity::generate("Owner", 0).unwrap();
+    let dir = tmp_dir("existing-src");
+    let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+    reader
+        .put_file_bytes("notes.txt", b"vault", None, None)
+        .unwrap();
+    let dest = tmp_dir("existing-dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("notes.txt"), b"user's own").unwrap();
+    assert!(reader.extract_to(&dest).is_err());
+    assert_eq!(
+        std::fs::read(dest.join("notes.txt")).unwrap(),
+        b"user's own"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dest);
+}

@@ -638,7 +638,17 @@ impl VaultReaderV2 {
     /// a verified file is atomically renamed into place — so a tampered blob never
     /// leaves partial plaintext behind. Parent directories are created without
     /// descending through planted symlinks, and a symlinked target is refused.
+    /// Refused up front, with nothing written, if entries would alias on a
+    /// case- or normalization-insensitive destination or a file already exists
+    /// there ([`crate::vault::preflight_extraction`]).
     pub fn extract_to(&self, dest: &Path) -> Result<()> {
+        crate::vault::preflight_extraction(
+            dest,
+            self.manifest
+                .entries
+                .iter()
+                .map(|e| (e.path.as_str(), e.kind)),
+        )?;
         for e in &self.manifest.entries {
             let target = dest.join(normalize_path(&e.path)?);
             match e.kind {

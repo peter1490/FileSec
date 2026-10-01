@@ -4,6 +4,9 @@
 //!
 //! File contents are held in zeroizing buffers while a vault is open.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
@@ -256,8 +259,71 @@ pub fn normalize_path(path: &str) -> Result<String> {
     Ok(components.join("/"))
 }
 
+/// The identity of a normalized vault path on the most aliasing filesystems
+/// FileSec extracts to: case-insensitive (NTFS, default APFS/HFS+) and
+/// Unicode-normalization-insensitive (APFS, HFS+). Two different vault paths
+/// with the same key would be written to one file there, the later silently
+/// replacing the earlier (FS-09).
+#[must_use]
+pub fn portable_collision_key(normalized: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let folded = normalized.nfd().collect::<String>().to_lowercase();
+    folded.nfc().collect()
+}
+
+/// How many conflicts an [`Error::ExtractionConflict`] message lists.
+const MAX_REPORTED_CONFLICTS: usize = 8;
+
+/// Refuse an extraction **before writing anything** if it could lose data.
+///
+/// `entries` are the vault paths about to be written under `dest`. The
+/// extraction is refused if two distinct entries share a
+/// [`portable_collision_key`] (they would alias on a case- or
+/// normalization-insensitive destination, wherever that destination is), or
+/// if a file entry's target already exists at the destination — FileSec never
+/// replaces a file the user already has. Existing directories are fine to
+/// extract into. Both source entries and the user's existing outputs are thus
+/// preserved; the error names the conflicting paths.
+pub fn preflight_extraction<'a, I>(dest: &Path, entries: I) -> Result<()>
+where
+    I: IntoIterator<Item = (&'a str, EntryKind)>,
+{
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut conflicts = Vec::new();
+    for (path, kind) in entries {
+        let norm = normalize_path(path)?;
+        let key = portable_collision_key(&norm);
+        match seen.get(&key) {
+            Some(first) if *first != norm => {
+                conflicts.push(format!("\"{first}\" and \"{norm}\" name the same file"));
+            }
+            Some(_) => {}
+            None => {
+                if kind == EntryKind::File {
+                    if let Ok(meta) = std::fs::symlink_metadata(dest.join(&norm)) {
+                        if !meta.is_dir() {
+                            conflicts.push(format!("\"{norm}\" already exists at the destination"));
+                        }
+                    }
+                }
+                seen.insert(key, norm);
+            }
+        }
+        if conflicts.len() >= MAX_REPORTED_CONFLICTS {
+            break;
+        }
+    }
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::ExtractionConflict(conflicts.join("; ")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -285,5 +351,58 @@ mod tests {
         ] {
             assert!(normalize_path(path).is_ok(), "rejected {path}");
         }
+    }
+
+    #[test]
+    fn collision_key_folds_case_and_unicode_normalization() {
+        assert_eq!(
+            portable_collision_key("Report"),
+            portable_collision_key("report")
+        );
+        assert_eq!(
+            portable_collision_key("caf\u{e9}.txt"),
+            portable_collision_key("cafe\u{301}.txt")
+        );
+        assert_eq!(
+            portable_collision_key("DIR/\u{c9}t\u{c9}"),
+            portable_collision_key("dir/e\u{301}te\u{301}")
+        );
+        assert_ne!(portable_collision_key("a/b"), portable_collision_key("a-b"));
+    }
+
+    #[test]
+    fn preflight_reports_aliases_and_existing_files_without_writing() {
+        let dest = std::env::temp_dir().join(format!(
+            "filesec-preflight-{}",
+            crate::util::hex(&crate::secret::random_array::<8>().unwrap())
+        ));
+        std::fs::create_dir_all(dest.join("docs")).unwrap();
+        std::fs::write(dest.join("kept.txt"), b"mine").unwrap();
+        let ok = [("docs", EntryKind::Dir), ("docs/new.txt", EntryKind::File)];
+        preflight_extraction(&dest, ok).unwrap();
+
+        let case = [("Report", EntryKind::File), ("report", EntryKind::File)];
+        let error = preflight_extraction(&dest, case).unwrap_err().to_string();
+        assert!(
+            error.contains("Report") && error.contains("report"),
+            "{error}"
+        );
+
+        let nfd = [
+            ("caf\u{e9}.txt", EntryKind::File),
+            ("cafe\u{301}.txt", EntryKind::File),
+        ];
+        assert!(matches!(
+            preflight_extraction(&dest, nfd),
+            Err(Error::ExtractionConflict(_))
+        ));
+
+        let existing = [("kept.txt", EntryKind::File)];
+        let error = preflight_extraction(&dest, existing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(std::fs::read(dest.join("kept.txt")).unwrap(), b"mine");
+        std::fs::remove_dir_all(dest).unwrap();
     }
 }
