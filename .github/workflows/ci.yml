@@ -60,7 +60,7 @@ jobs:
             libudev-dev
 
       # Linux needs rustc >= 1.87 (rfd/directories -> zbus); macOS/Windows build
-      # on the 1.86 MSRV. The pinned RUST_TOOLCHAIN
+      # on the 1.86 MSRV (checked by the `msrv` job). The pinned RUST_TOOLCHAIN
       # satisfies all and the locked deps still apply. The action is pinned by
       # SHA, so the toolchain must be named explicitly.
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
@@ -141,6 +141,47 @@ jobs:
 
       - name: Test (all shipped features together)
         run: cargo test --workspace --all-features --locked
+
+  # The declared minimum toolchain (`rust-version = "1.86"` in Cargo.toml). The
+  # other jobs build with the newer pinned toolchain, which cannot catch a
+  # dependency or language feature that silently raised the real minimum.
+  # macOS and Windows build on 1.86; Linux needs 1.87 because rfd/directories
+  # pull zbus there (documented in README.md). Covers the shipped feature graph.
+  msrv:
+    timeout-minutes: 45
+    name: msrv (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            toolchain: 1.86.0
+          - os: windows-2025
+            toolchain: 1.86.0
+          - os: ubuntu-24.04
+            toolchain: 1.87.0
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
+            libudev-dev
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
+        with:
+          key: msrv-${{ matrix.toolchain }}
+
+      - name: Check (declared minimum, all shipped features)
+        run: cargo check --workspace --all-features --all-targets --locked
 
   # Supply-chain gate. Blocks known-vulnerable/yanked dependencies, disallowed
   # licenses, and any crate sourced from outside crates.io. cargo-deny is the

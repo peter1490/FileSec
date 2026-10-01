@@ -47,8 +47,8 @@ A tag cannot publish on the strength of its build alone:
 - **CI for the tagged commit.** The release workflow calls the whole
   [`ci.yml`](../.github/workflows/ci.yml) (`validate` job) for exactly the tagged
   commit: formatting, clippy, the classical **and the shipped feature graph**
-  (`--all-features`) tests on Linux, macOS, and Windows, `cargo deny` +
-  `cargo audit`, and actionlint. `publish` needs `validate`, so a
+  (`--all-features`) tests on Linux, macOS, and Windows, a check on the
+  declared minimum toolchain, `cargo deny` + `cargo audit`, and actionlint. `publish` needs `validate`, so a
   commit whose CI failed — or never ran, e.g. a tag pushed off a branch — is not
   released.
 - **Pinned toolchain and runners.** CI and releases build with one pinned Rust

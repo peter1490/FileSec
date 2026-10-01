@@ -333,7 +333,10 @@ security-relevant belongs in the keychain or the encrypted store instead.
 
 ## Build & run
 
-Requires a recent stable Rust toolchain (built and tested with 1.86).
+Minimum supported Rust: **1.86 on macOS and Windows, 1.87 on Linux** (there
+`rfd`/`directories` pull `zbus`, which needs 1.87). CI checks exactly these
+minimums with every shipped feature (the `msrv` job), while builds, tests, and
+releases use one newer pinned toolchain (`RUST_TOOLCHAIN` in the workflows).
 
 ```sh
 # Run the desktop app (classical)
