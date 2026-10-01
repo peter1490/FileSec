@@ -151,6 +151,18 @@ fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()>
     crate::vault::check_tree_shape(&shape)
 }
 
+/// Fuzzing entry point: decode `bytes` as a v2 manifest and run the same
+/// validation [`VaultReaderV2::open`] applies after decryption, for every
+/// supported bulk cipher. Not part of the stable API.
+#[doc(hidden)]
+pub fn fuzz_validate_manifest(bytes: &[u8]) -> Result<()> {
+    let manifest: ManifestV2 = codec::from_slice(bytes)?;
+    validate_manifest_v2(&manifest, SuiteId::Classic.aead_alg())?;
+    #[cfg(feature = "pqc")]
+    validate_manifest_v2(&manifest, SuiteId::Aes256Gcm.aead_alg())?;
+    Ok(())
+}
+
 /// Plaintext header file. Stable for the vault's lifetime; fed as AAD into the
 /// manifest AEAD and every blob STREAM (anti-downgrade binding).
 #[derive(Clone, Debug, Serialize, Deserialize)]

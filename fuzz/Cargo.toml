@@ -74,6 +74,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "container_open"
+path = "fuzz_targets/container_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_manifest"
+path = "fuzz_targets/v2_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_ops"
+path = "fuzz_targets/vault_ops.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace so root `cargo build`/`test`/`deny` never see
 # this crate or libfuzzer-sys.
 [workspace]

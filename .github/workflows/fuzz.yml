@@ -43,6 +43,9 @@ jobs:
           - manifest
           - transport_hello
           - normalize_path
+          - container_open
+          - v2_manifest
+          - vault_ops
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -68,6 +71,13 @@ jobs:
       - name: Install cargo-fuzz (pinned)
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
+      # The detached fuzz workspace has its own tracked Cargo.lock. cargo-fuzz
+      # has no --locked flag, so verify up front that the lockfile already
+      # resolves the graph (fails instead of silently re-resolving), and after
+      # the run that nothing rewrote it.
+      - name: Verify the fuzz lockfile is current
+        run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+
       # A PR pass is a quick smoke; scheduled/dispatch runs go longer.
       - name: Smoke-run ${{ matrix.target }}
         env:
@@ -88,3 +98,4 @@ jobs:
           fi
           cargo fuzz run "$FUZZ_TARGET" -- \
             -max_total_time="$DURATION" -rss_limit_mb=4096 -timeout=15
+          git diff --exit-code -- fuzz/Cargo.lock
