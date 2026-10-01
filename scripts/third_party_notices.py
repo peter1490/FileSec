@@ -48,7 +48,11 @@ def cargo_metadata(target):
         "--filter-platform",
         target,
     ]
-    out = subprocess.run(cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+    # cargo emits UTF-8; without an explicit encoding Python decodes with the
+    # locale's (cp1252 on the Windows release runner) and mangles author names.
+    out = subprocess.run(
+        cmd, cwd=REPO_ROOT, check=True, capture_output=True, encoding="utf-8"
+    )
     return json.loads(out.stdout)
 
 
