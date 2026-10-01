@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Build a signed, notarized macOS .dmg for one FileSec variant.
+# Build a signed, notarized macOS .dmg for one FileSec variant, and sign the
+# standalone executable that the portable .tar.gz ships.
 #
 # Assembles a minimal .app bundle around an already-built (ideally universal)
 # binary, code-signs it with a Developer ID Application certificate, packages it
 # into a .dmg, then submits the .dmg for notarization and staples the ticket.
+#
+# The portable archive contains BIN_PATH itself, not the bundle, so BIN_PATH is
+# signed **in place** with the same Developer ID identity (hardened runtime +
+# secure timestamp) and notarized too (a bare Mach-O cannot be stapled; Gatekeeper
+# fetches its ticket online). The caller must create the archive only after this
+# script succeeds — archiving first shipped the unsigned, ad-hoc binary (FS-13).
 #
 # Signing and notarization are mandatory when RELEASE_SIGNING_REQUIRED=1
 # (official upstream tag releases). Without that flag, missing credentials only
@@ -96,6 +103,14 @@ else
   echo "WARNING: MACOS_SIGN_IDENTITY not set — producing an UNSIGNED .dmg." >&2
 fi
 
+# --- Sign the standalone executable for the portable archive -------------
+if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+  echo "Signing standalone executable $BIN_PATH"
+  codesign --force --options runtime --timestamp \
+    --sign "$MACOS_SIGN_IDENTITY" "$BIN_PATH"
+  codesign --verify --strict --verbose=2 "$BIN_PATH"
+fi
+
 # --- Build the .dmg -------------------------------------------------------
 stage="$(mktemp -d)"
 trap 'rm -rf "$workdir" "$stage"' EXIT
@@ -110,18 +125,34 @@ fi
 
 # --- Notarize + staple (optional) ----------------------------------------
 notarize() {
+  local submission="$1"
   if [[ -n "${AC_API_KEY_PATH:-}" && -n "${AC_API_KEY_ID:-}" && -n "${AC_API_ISSUER:-}" ]]; then
-    xcrun notarytool submit "$OUT_DMG" --wait \
+    xcrun notarytool submit "$submission" --wait \
       --key "$AC_API_KEY_PATH" --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER"
   elif [[ -n "${AC_APPLE_ID:-}" && -n "${AC_APP_PASSWORD:-}" && -n "${AC_TEAM_ID:-}" ]]; then
-    xcrun notarytool submit "$OUT_DMG" --wait \
+    xcrun notarytool submit "$submission" --wait \
       --apple-id "$AC_APPLE_ID" --password "$AC_APP_PASSWORD" --team-id "$AC_TEAM_ID"
   else
     return 1
   fi
 }
 
-if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]] && notarize; then
+# The standalone executable is submitted as a zip (notarytool's accepted form
+# for a bare binary). Its ticket cannot be stapled to a Mach-O; Gatekeeper
+# retrieves it online on first launch.
+standalone_zip="$workdir/$(basename "$BIN_PATH")-notarize.zip"
+if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]] &&
+  ditto -c -k --keepParent "$BIN_PATH" "$standalone_zip" &&
+  notarize "$standalone_zip"; then
+  echo "Notarized standalone executable: $BIN_PATH"
+elif [[ "$signing_required" == "1" ]]; then
+  echo "ERROR: notarization failed for the standalone executable." >&2
+  exit 1
+else
+  echo "WARNING: standalone executable not notarized (no credentials or unsigned)." >&2
+fi
+
+if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]] && notarize "$OUT_DMG"; then
   xcrun stapler staple "$OUT_DMG"
   echo "Notarized and stapled: $OUT_DMG"
 else

@@ -55,7 +55,7 @@ For each of the two variants (`filesec`, `filesec-pqc`):
 
 | OS | Target | Installers | Portable |
 |----|--------|-----------|----------|
-| macOS | `universal-apple-darwin` | `.dmg` (signed + notarized) | `.tar.gz` |
+| macOS | `universal-apple-darwin` | `.dmg` (signed + notarized) | `.tar.gz` (Developer ID-signed + notarized executable) |
 | Windows | `x86_64-pc-windows-msvc` | `.msi`, NSIS `…-setup.exe` (Authenticode-signed) | `.zip` |
 | Linux | `x86_64-unknown-linux-gnu` | `.deb` | `.tar.gz` |
 
@@ -108,6 +108,14 @@ job only runs on a tag pushed to `peter1490/FileSec`. Forks and manual
 `workflow_dispatch` runs may still build *unsigned* artifacts for local testing,
 but they never publish a stable GitHub Release. Configure the secrets below to get
 signed, notarized upstream output.
+
+On macOS the portable `.tar.gz` ships the standalone executable, so
+`package_macos.sh` signs that executable in place (Developer ID, hardened
+runtime, secure timestamp) and notarizes it before the archive is created; a
+bare Mach-O cannot be stapled, so Gatekeeper fetches its ticket online.
+`verify_macos.sh` then checks every macOS format as shipped — the archive's
+executable, the `.dmg` signature and stapled ticket, and the app inside the
+`.dmg` (including `spctl`) — and fails an official release on any gap.
 
 ## Required secrets (signing + notarization)
 
@@ -199,7 +207,8 @@ block every build); instead the review process is:
 
 ```
 packaging/
-  macos/package_macos.sh     # assemble .app, codesign, build .dmg, notarize, staple
+  macos/package_macos.sh     # assemble .app, codesign it and the standalone binary, build .dmg, notarize, staple
+  macos/verify_macos.sh      # post-packaging check of the archive's binary, the .dmg, and the app inside it
   windows/filesec.nsi        # NSIS installer (variant chosen via /D defines)
   windows/sign.ps1           # Authenticode signing helper
 crates/filesec-gui/packaging/filesec.desktop       # Linux .desktop (cargo-deb)

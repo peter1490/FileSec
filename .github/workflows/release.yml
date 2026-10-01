@@ -123,11 +123,23 @@ jobs:
           test -n "$AC_API_KEY_ID"
           test -n "$AC_API_ISSUER"
 
-      - name: Package archive + signed/notarized .dmg
+      # Sign/notarize first, archive second: the portable archive ships the
+      # standalone executable, which package_macos.sh signs in place with the
+      # same Developer ID identity as the .app (FS-13). Archiving before
+      # packaging shipped the ad-hoc-signed original.
+      - name: Signed/notarized .dmg + signed standalone executable
         run: |
-          ( cd dist && tar -czf "$ARTIFACT_BASE.tar.gz" "$BIN" )
           BIN_PATH="dist/$BIN" OUT_DMG="dist/$ARTIFACT_BASE.dmg" \
             bash packaging/macos/package_macos.sh
+
+      - name: Portable archive (of the signed executable)
+        run: ( cd dist && tar -czf "$ARTIFACT_BASE.tar.gz" "$BIN" )
+
+      # Verify every macOS distribution format as shipped, not just the DMG.
+      - name: Verify macOS distributions
+        run: |
+          bash packaging/macos/verify_macos.sh \
+            "dist/$ARTIFACT_BASE.tar.gz" "dist/$ARTIFACT_BASE.dmg"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
