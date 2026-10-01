@@ -482,6 +482,11 @@ struct Session {
     /// Direct network-transfer state (the `net` feature).
     #[cfg(feature = "net")]
     transfer: TransferState,
+    /// Everything the browser derives from the open vault's manifest, built
+    /// once per committed revision rather than every frame (O-02).
+    browser_model: Option<Arc<BrowserModel>>,
+    /// The visible rows for the last (revision, folder, search, sort) shown.
+    rows_cache: Option<(RowsKey, Arc<Vec<Row>>)>,
 }
 
 impl Session {
@@ -535,7 +540,43 @@ impl Session {
             rollback_warning,
             #[cfg(feature = "net")]
             transfer: TransferState::default(),
+            browser_model: None,
+            rows_cache: None,
         }
+    }
+
+    /// The browser model for the open vault, rebuilt only when the vault's
+    /// committed state (or the vault itself) changed since the last frame.
+    fn browser_model(&mut self) -> Option<Arc<BrowserModel>> {
+        let open = self.open.as_ref()?;
+        let key = BrowserModel::key_of(&open.id, &open.reader);
+        match &self.browser_model {
+            Some(model) if model.key == key => Some(Arc::clone(model)),
+            _ => {
+                let model = Arc::new(BrowserModel::build(key, &open.reader));
+                self.browser_model = Some(Arc::clone(&model));
+                Some(model)
+            }
+        }
+    }
+
+    /// The visible rows for `dir`/`search`/`sort` over `model`, reusing the
+    /// previous frame's rows when none of those changed.
+    fn visible_rows(&mut self, model: &BrowserModel, dir: &str, search: &str) -> Arc<Vec<Row>> {
+        let key = RowsKey {
+            model: model.key.clone(),
+            dir: dir.to_string(),
+            search: search.to_string(),
+            sort: self.sort,
+        };
+        if let Some((cached, rows)) = &self.rows_cache {
+            if *cached == key {
+                return Arc::clone(rows);
+            }
+        }
+        let rows = Arc::new(visible_rows(&model.entries, dir, search, self.sort));
+        self.rows_cache = Some((key, Arc::clone(&rows)));
+        rows
     }
 
     /// Reset the browser's transient view state. Called when a vault is opened or
@@ -4659,8 +4700,13 @@ impl App {
         for event in events {
             self.apply_net_event(event);
         }
-        if matches!(&self.state, State::Unlocked(s) if s.transfer.active.is_some()) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // Event-driven: the worker wakes the UI (`request_repaint`) whenever it
+        // emits, so an idle listener needs no timer. Only genuinely active work
+        // (a connected peer, an offer, progress, an outgoing send) gets a
+        // bounded periodic repaint for its progress/spinner (O-02).
+        if matches!(&self.state, State::Unlocked(s) if s.transfer.active.as_ref().is_some_and(transfer_is_busy))
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 
@@ -5264,6 +5310,16 @@ fn send_card(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     });
 }
 
+/// Whether a transfer is doing visible work that needs periodic repaints, as
+/// opposed to a listener idling for a sender.
+#[cfg(feature = "net")]
+fn transfer_is_busy(active: &ActiveTransfer) -> bool {
+    active.kind == ActiveKind::Send
+        || active.peer.is_some()
+        || active.offer.is_some()
+        || active.progress.is_some()
+}
+
 #[cfg(feature = "net")]
 fn active_transfer_card(active: &ActiveTransfer, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let cc = theme::colors(ui);
@@ -5274,7 +5330,14 @@ fn active_transfer_card(active: &ActiveTransfer, ui: &mut egui::Ui, action: &mut
         // misleading "Receiving". The direction (send vs receive) is clear from
         // the rows below (the listen address/code, the peer, the progress).
         ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new());
+            // An animated spinner repaints every frame; show it only while
+            // something is actually happening (O-02). An idle listener gets a
+            // static glyph and repaints only when the worker reports an event.
+            if transfer_is_busy(active) {
+                ui.add(egui::Spinner::new());
+            } else {
+                ui.label(theme::icon_text(theme::icon::DOWNLOAD, 18.0).color(cc.accent));
+            }
             ui.add_space(6.0);
             ui.label(RichText::new(&active.status).strong().size(15.0));
         });
@@ -5790,13 +5853,13 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
 fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let panel_rect = ui.max_rect();
-    let (name, id, entries) = match &s.open {
-        Some(o) => (
-            o.reader.name().to_string(),
-            o.id.clone(),
-            snapshot_entries(&o.reader),
-        ),
+    let (name, id) = match &s.open {
+        Some(o) => (o.reader.name().to_string(), o.id.clone()),
         None => return,
+    };
+    // Cached per committed revision: no per-frame clone, index, or trash scan.
+    let Some(model) = s.browser_model() else {
+        return;
     };
     // Drop any view whose temp a watcher already wiped (the app was closed), so
     // the banner reflects what is actually still open.
@@ -5804,18 +5867,11 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     // Keep the browse state coherent with the (possibly just-mutated) vault: clamp
     // the current folder to one that still exists, and drop any selection (or
     // anchor) whose entries were removed / renamed / trashed out from under us.
-    s.current_dir = clamp_dir(&entries, &s.current_dir);
-    {
-        let live: HashSet<&str> = entries
-            .iter()
-            .filter(|(p, _, _)| !is_trashed(p))
-            .map(|(p, _, _)| p.as_str())
-            .collect();
-        s.selected.retain(|p| live.contains(p.as_str()));
-        if let Some(a) = &s.select_anchor {
-            if !live.contains(a.as_str()) {
-                s.select_anchor = None;
-            }
+    s.current_dir = clamp_dir(&model.dirs, &s.current_dir);
+    s.selected.retain(|p| model.live.contains(p));
+    if let Some(a) = &s.select_anchor {
+        if !model.live.contains(a) {
+            s.select_anchor = None;
         }
     }
 
@@ -5826,7 +5882,7 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let idle = editing.is_none();
     let c = theme::colors(ui);
     let cur = s.current_dir.clone();
-    let trash = trashed_items(&entries);
+    let trash = &model.trash;
     let in_trash = s.show_trash;
 
     // ---- Header: back, title, and whole-vault actions ----
@@ -5915,7 +5971,7 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
     // ---- Trash view: a separate mode that replaces the file list ----
     if in_trash {
-        trash_panel(ui, c, &trash, idle, s.confirm_empty_trash, action);
+        trash_panel(ui, c, trash, idle, s.confirm_empty_trash, action);
         return;
     }
 
@@ -6116,11 +6172,11 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     // ---- The file/folder list ----
     let search = s.file_search.clone();
     let searching = !search.trim().is_empty();
-    let rows = visible_rows(&entries, &cur, &search, s.sort);
+    let rows = s.visible_rows(&model, &cur, &search);
 
     // A vault holding only trashed files still reads as empty here (the live tree
     // is what the browser shows; the trash has its own view).
-    if !has_live_entries(&entries) {
+    if !model.has_live {
         theme::empty_state(
             ui,
             theme::icon::FOLDER,
@@ -6422,15 +6478,15 @@ fn trash_item_detail(item: &TrashItem) -> String {
 
 /// The "move to folder" dialog: pick a destination folder for the chosen entries.
 fn move_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
-    let entries = match &s.open {
-        Some(o) => snapshot_entries(&o.reader),
-        None => return,
+    let Some(model) = s.browser_model() else {
+        return;
     };
+    let entries = &model.entries;
     let (paths, dest) = match &s.move_form {
         Some(f) => (f.paths.clone(), f.dest.clone()),
         None => return,
     };
-    let options = move_folder_options(&entries, &paths);
+    let options = move_folder_options(entries, &paths);
     let (close, _) = theme::modal(ctx, "Move to…", |ui| {
         let cc = theme::colors(ui);
         ui.label(
@@ -8438,18 +8494,73 @@ fn leaf_name(path: &str) -> &str {
 
 /// Clamp `dir` to the nearest existing ancestor directory (or the root, ""), so a
 /// folder removed/renamed out from under the browser never strands the view.
-fn clamp_dir(entries: &[(String, EntryKind, u64)], dir: &str) -> String {
-    let exists = |d: &str| {
-        d.is_empty()
-            || entries
-                .iter()
-                .any(|(p, k, _)| p == d && *k == EntryKind::Dir)
-    };
+fn clamp_dir(dirs: &HashSet<String>, dir: &str) -> String {
+    let exists = |d: &str| d.is_empty() || dirs.contains(d);
     let mut cur = dir.to_string();
     while !cur.is_empty() && !exists(&cur) {
         cur = parent_dir(&cur).to_string();
     }
     cur
+}
+
+/// Identifies one committed revision of one vault: its id plus the epoch and
+/// hash of its rollback-protected state (and the entry count as a guard).
+type ModelKey = (String, u64, [u8; 32], usize);
+
+/// The file browser's view of one vault revision (O-02). Built once when the
+/// vault's committed state changes — a mutation, or opening another vault —
+/// and shared (`Arc`) by every frame until then, instead of cloning, indexing,
+/// and scanning the whole manifest on every repaint.
+struct BrowserModel {
+    key: ModelKey,
+    entries: Vec<(String, EntryKind, u64)>,
+    /// Every directory path, for O(1) "does this folder still exist".
+    dirs: HashSet<String>,
+    /// Every non-trashed path, for pruning a stale selection in O(selected).
+    live: HashSet<String>,
+    has_live: bool,
+    trash: Vec<TrashItem>,
+}
+
+impl BrowserModel {
+    fn key_of(id: &str, reader: &VaultReaderV2) -> ModelKey {
+        let (epoch, hash) = reader.state_metadata().map_or((0, [0u8; 32]), |state| {
+            (state.epoch, state.current_state_hash)
+        });
+        (id.to_string(), epoch, hash, reader.entries().len())
+    }
+
+    fn build(key: ModelKey, reader: &VaultReaderV2) -> Self {
+        let entries = snapshot_entries(reader);
+        let dirs = entries
+            .iter()
+            .filter(|(_, kind, _)| *kind == EntryKind::Dir)
+            .map(|(path, _, _)| path.clone())
+            .collect();
+        let live: HashSet<String> = entries
+            .iter()
+            .filter(|(path, _, _)| !is_trashed(path))
+            .map(|(path, _, _)| path.clone())
+            .collect();
+        let trash = trashed_items(&entries);
+        Self {
+            key,
+            has_live: !live.is_empty(),
+            entries,
+            dirs,
+            live,
+            trash,
+        }
+    }
+}
+
+/// Everything the visible rows depend on.
+#[derive(PartialEq)]
+struct RowsKey {
+    model: ModelKey,
+    dir: String,
+    search: String,
+    sort: SortMode,
 }
 
 /// A single browser row: a file or folder to display.
@@ -8762,12 +8873,6 @@ fn trashed_items(entries: &[(String, EntryKind, u64)]) -> Vec<TrashItem> {
     items
 }
 
-/// Whether the vault has any entry outside the trash. A vault holding only
-/// trashed files should still read as "empty" in the browser.
-fn has_live_entries(entries: &[(String, EntryKind, u64)]) -> bool {
-    entries.iter().any(|(p, _, _)| !is_trashed(p))
-}
-
 /// (live file count, live total size) — i.e. excluding the trash — so a vault's
 /// card shrinks the moment a file is trashed.
 fn live_counts(entries: &[(String, EntryKind, u64)]) -> (u64, u64) {
@@ -8955,7 +9060,11 @@ mod browse_tests {
 
     #[test]
     fn clamp_keeps_existing_drops_missing() {
-        let e = sample();
+        let e: HashSet<String> = sample()
+            .into_iter()
+            .filter(|(_, k, _)| *k == EntryKind::Dir)
+            .map(|(p, _, _)| p)
+            .collect();
         assert_eq!(clamp_dir(&e, "docs/sub"), "docs/sub");
         assert_eq!(clamp_dir(&e, ""), "");
         // A folder that no longer exists clamps to the nearest real ancestor.
@@ -9064,7 +9173,6 @@ mod browse_tests {
         let search = visible_rows(&e, "", "p1", SortMode::NameAsc);
         assert!(search.is_empty(), "trashed files must not match search");
         // Live-only views of the vault.
-        assert!(has_live_entries(&e));
         assert_eq!(live_counts(&e), (1, 10)); // docs/a.txt only
     }
 
@@ -9721,6 +9829,58 @@ mod ui_smoke {
         });
         frame(&ctx, |ui| browser_ui(&mut s, ui, &mut action));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O-02: the browser model and rows are built once per committed vault
+    /// revision and reused across frames; a commit (or switching folder,
+    /// search, or sort) invalidates exactly what depends on it.
+    #[test]
+    fn browser_model_is_cached_per_revision() {
+        let dir = std::env::temp_dir().join(format!(
+            "filesec-model-cache-{}",
+            hex(&filesec_core::secret::random_array::<8>().unwrap())
+        ));
+        let store = Store::at_with_secure_storage(&dir, None).expect("store");
+        let mut s = test_session();
+        let vid = new_vault_id().unwrap();
+        let mut vault = Vault::new("Docs", 0);
+        vault.add_file("a.txt", b"a".to_vec(), None, None).unwrap();
+        store
+            .save_vault(s.identity.as_ref(), &vid, &vault)
+            .expect("save");
+        let reader = store.open_vault(s.identity.as_ref(), &vid).expect("open");
+        s.open = Some(OpenVault {
+            id: vid.clone(),
+            reader,
+        });
+
+        let first = s.browser_model().unwrap();
+        let again = s.browser_model().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same revision reuses the model"
+        );
+        let rows = s.visible_rows(&first, "", "");
+        assert!(Arc::ptr_eq(&rows, &s.visible_rows(&first, "", "")));
+        assert!(!Arc::ptr_eq(&rows, &s.visible_rows(&first, "", "a")));
+
+        let reader = s.open.as_ref().unwrap().reader.clone();
+        store
+            .put_bytes_in_vault(s.identity.as_ref(), &vid, &reader, "b.txt", b"b", None)
+            .expect("mutate");
+        s.open = Some(OpenVault {
+            id: vid.clone(),
+            reader: store.open_vault(s.identity.as_ref(), &vid).expect("reopen"),
+        });
+        let rebuilt = s.browser_model().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &rebuilt),
+            "a commit rebuilds the model"
+        );
+        assert_eq!(rebuilt.entries.len(), 2);
+        assert_eq!(s.visible_rows(&rebuilt, "", "").len(), 2);
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
