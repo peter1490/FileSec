@@ -624,6 +624,14 @@ struct TextEditor {
     original: String,
 }
 
+/// Scrub the plaintext however the editor goes away — closed, replaced, or an
+/// `OpenTextEditor` outcome that arrives after the session changed.
+impl Drop for TextEditor {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 impl TextEditor {
     fn dirty(&self) -> bool {
         self.content != self.original
@@ -3091,9 +3099,11 @@ impl App {
 
     /// Save the quick editor's buffer back to the vault as a fresh blob.
     fn spawn_save_text_file(&mut self, ctx: &egui::Context) {
+        // The worker's copy of the plaintext is wiped when the job ends, like the
+        // editor's own buffers (hygiene; live-memory attackers are out of scope).
         let (path, content) = match &self.state {
             State::Unlocked(s) => match &s.text_editor {
-                Some(te) => (te.path.clone(), te.content.clone()),
+                Some(te) => (te.path.clone(), Zeroizing::new(te.content.clone())),
                 None => return,
             },
             _ => return,
