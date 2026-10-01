@@ -181,6 +181,18 @@ pub fn save_state_anchors(account: &str, bytes: &[u8]) -> Result<(), AutoUnlockE
         })
 }
 
+/// Remove an anchor record from OS secure storage. Succeeds (idempotently) if
+/// nothing was stored.
+#[cfg(feature = "keyring")]
+pub fn delete_state_anchors(account: &str) -> Result<(), AutoUnlockError> {
+    match entry_for(ANCHOR_SERVICE, account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(AutoUnlockError::new(format!(
+            "could not remove rollback anchors from the OS keychain: {e}"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Inert stubs when the `keyring` feature is off (the default build).
 // ---------------------------------------------------------------------------
@@ -211,5 +223,10 @@ pub fn load_state_anchors(_account: &str) -> Result<Option<Vec<u8>>, AutoUnlockE
 
 #[cfg(not(feature = "keyring"))]
 pub fn save_state_anchors(_account: &str, _bytes: &[u8]) -> Result<(), AutoUnlockError> {
+    Err(AutoUnlockError::new(NO_SUPPORT))
+}
+
+#[cfg(not(feature = "keyring"))]
+pub fn delete_state_anchors(_account: &str) -> Result<(), AutoUnlockError> {
     Err(AutoUnlockError::new(NO_SUPPORT))
 }

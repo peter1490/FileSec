@@ -7,7 +7,7 @@
 //! supports it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use filesec_core::util::now_unix;
 use filesec_core::vault::Vault;
 use filesec_core::SuiteId;
 
+use crate::anchors::SecureAnchorStorage;
 use crate::prefs::Prefs;
 
 /// The algorithm suite the local at-rest store encrypts itself under for
@@ -60,6 +61,15 @@ const ANCHORS_VERSION: u16 = 1;
 const ANCHORS_FILE: &str = ".state-anchors";
 const ANCHORS_BACKEND_FILE: &str = ".state-anchor-backend";
 const QUARANTINE_DIR: &str = "quarantine";
+const BACKEND_MARKER_SECURE: &str = "secure-v1";
+const BACKEND_MARKER_DEGRADED: &str = "degraded-v1";
+const MAX_BACKEND_MARKER_LEN: u64 = 64;
+
+/// Stable prefix of every error that means "the rollback-anchor backend cannot
+/// be trusted as found and needs the explicit, passphrase-authenticated
+/// [`Store::recover_rollback_anchors`] flow". The GUI matches on it to offer
+/// that recovery instead of a dead-end error screen.
+pub const ANCHOR_RECOVERY_REQUIRED: &str = "rollback-protection anchors need recovery";
 /// Unencrypted UI preferences. Dot-prefixed like the other non-container files.
 /// See [`crate::prefs`] for why this one is deliberately not encrypted.
 const PREFS_FILE: &str = ".prefs";
@@ -151,6 +161,7 @@ pub struct Store {
     checkout_dir: PathBuf,
     anchor_backend: AnchorBackend,
     anchor_account: String,
+    secure: Option<Arc<dyn SecureAnchorStorage>>,
     anchor_lock: Mutex<()>,
 }
 
@@ -161,17 +172,48 @@ impl Store {
     /// (useful for portable installs and tests); otherwise uses the standard
     /// per-OS location via `directories`.
     pub fn discover() -> StoreResult<Self> {
+        Self::at(Self::default_data_dir()?)
+    }
+
+    /// The data directory [`Self::discover`] opens: `FILESEC_DATA_DIR` when set,
+    /// otherwise the standard per-OS location.
+    pub fn default_data_dir() -> StoreResult<PathBuf> {
         if let Some(dir) = std::env::var_os("FILESEC_DATA_DIR") {
-            return Self::at(PathBuf::from(dir));
+            return Ok(PathBuf::from(dir));
         }
         let pd = directories::ProjectDirs::from("dev", "FileSec", "FileSec")
             .ok_or_else(|| "could not determine the application data directory".to_string())?;
-        Self::at(pd.data_dir().to_path_buf())
+        Ok(pd.data_dir().to_path_buf())
     }
 
-    /// Open (and create) a store rooted at a specific directory.
+    /// Open (and create) a store rooted at a specific directory, keeping its
+    /// rollback anchors in this build's platform secure storage when available.
     pub fn at(data_dir: impl Into<PathBuf>) -> StoreResult<Self> {
-        let data_dir = data_dir.into();
+        Self::at_with_secure_storage(data_dir, crate::anchors::platform_storage())
+    }
+
+    /// Open (and create) a store whose rollback anchors use `secure` as the OS
+    /// secure storage (`None` = no secure storage on this system). Production
+    /// code uses [`Self::at`]; this seam lets tests substitute
+    /// [`crate::anchors::MemoryAnchorStorage`].
+    pub fn at_with_secure_storage(
+        data_dir: impl Into<PathBuf>,
+        secure: Option<Arc<dyn SecureAnchorStorage>>,
+    ) -> StoreResult<Self> {
+        let mut store = Self::unselected(data_dir.into(), secure)?;
+        store.anchor_backend = select_anchor_backend(
+            &store.data_dir,
+            &store.anchor_account,
+            store.secure.as_deref(),
+        )?;
+        Ok(store)
+    }
+
+    /// Lay out the directory tree without deciding the anchor backend yet.
+    fn unselected(
+        data_dir: PathBuf,
+        secure: Option<Arc<dyn SecureAnchorStorage>>,
+    ) -> StoreResult<Self> {
         let vaults_dir = data_dir.join("vaults");
         let checkout_dir = data_dir.join("checkout");
         std::fs::create_dir_all(&vaults_dir).map_err(err)?;
@@ -183,13 +225,13 @@ impl Store {
             .unwrap_or_else(|_| data_dir.clone())
             .display()
             .to_string();
-        let anchor_backend = select_anchor_backend(&data_dir, &anchor_account)?;
         Ok(Self {
             data_dir,
             vaults_dir,
             checkout_dir,
-            anchor_backend,
+            anchor_backend: AnchorBackend::DegradedFile,
             anchor_account,
+            secure,
             anchor_lock: Mutex::new(()),
         })
     }
@@ -218,6 +260,92 @@ impl Store {
         (self.anchor_backend == AnchorBackend::DegradedFile).then_some(
             "Rollback protection is in degraded mode: this system has no usable OS secure storage, so high-water anchors are kept in the FileSec data directory. Restoring the whole directory can also restore its anchors; keep an independent current backup and use the explicit recovery flow for quarantined state.",
         )
+    }
+
+    /// Explicit, passphrase-authenticated re-establishment of rollback anchors.
+    ///
+    /// This is the only way to move a store whose anchor backend cannot be
+    /// trusted as found (an error carrying [`ANCHOR_RECOVERY_REQUIRED`]) onto a
+    /// new backend — for example after the OS keychain was reset or the data
+    /// directory moved to another machine. An unauthenticated edit of the
+    /// `.state-anchor-backend` marker never does this.
+    ///
+    /// The passphrase must unlock the signed keystore, and every protected
+    /// object currently on disk (keystore, contacts, registry, each v2 vault)
+    /// must authenticate under that identity. Their current states then become
+    /// the new high-water anchors, in OS secure storage when it is reachable
+    /// and in the degraded file otherwise.
+    ///
+    /// **This trusts the on-disk state as the newest intended state.** Only run
+    /// it after confirming the data directory is the copy you mean to keep: an
+    /// older copy recovered here becomes the new high-water mark. Nothing is
+    /// deleted, re-encrypted, or quarantined.
+    pub fn recover_rollback_anchors(
+        data_dir: impl Into<PathBuf>,
+        secure: Option<Arc<dyn SecureAnchorStorage>>,
+        passphrase: &[u8],
+    ) -> StoreResult<Self> {
+        let mut store = Self::unselected(data_dir.into(), secure)?;
+        let bytes = read_bounded_file(
+            &store.keystore_path(),
+            MAX_KEYSTORE_FILE_LEN,
+            "keystore file",
+        )?;
+        let ks = KeystoreFile::from_bytes(&bytes).map_err(err)?;
+        let identity = ks.unlock(passphrase).map_err(err)?;
+        let ks_state = ks
+            .state_metadata()
+            .cloned()
+            .ok_or_else(|| "keystore has no rollback-protection metadata".to_string())?;
+        if ks_state.identity_fingerprint != identity.fingerprint() {
+            return Err("keystore state does not belong to the unlocked identity".into());
+        }
+        let mut anchors = vec![StateAnchor::from_metadata(&ks_state)];
+        if let Some(record) = store.read_protected_record::<ContactBook>(
+            &identity,
+            &store.contacts_path(),
+            CONTACTS_BLOB,
+            StateObjectType::Contacts,
+            "contacts",
+        )? {
+            anchors.push(StateAnchor::from_metadata(&record.state));
+        }
+        if let Some(record) = store.read_protected_record::<Registry>(
+            &identity,
+            &store.index_path(),
+            REGISTRY_BLOB,
+            StateObjectType::Registry,
+            "registry",
+        )? {
+            anchors.push(StateAnchor::from_metadata(&record.state));
+        }
+        for (id, dir) in store.v2_vaults() {
+            let reader = VaultReaderV2::open(&dir, &identity)
+                .map_err(|e| format!("vault {id} could not be authenticated: {e}"))?;
+            let state = reader
+                .state_metadata()
+                .ok_or_else(|| format!("vault {id} has no rollback-protection metadata"))?;
+            if state.object_id != id || state.identity_fingerprint != identity.fingerprint() {
+                return Err(format!("vault {id} does not belong to this store"));
+            }
+            anchors.push(StateAnchor::from_metadata(state));
+        }
+        store.anchor_backend = match probe_secure(store.secure.as_deref(), &store.anchor_account) {
+            SecureProbe::Unreachable => AnchorBackend::DegradedFile,
+            SecureProbe::Established | SecureProbe::Empty => AnchorBackend::SecureStorage,
+        };
+        {
+            let _guard = store
+                .anchor_lock
+                .lock()
+                .map_err(|_| "state anchor lock is unavailable".to_string())?;
+            store.save_anchor_set_locked(&AnchorSet {
+                version: ANCHORS_VERSION,
+                anchors,
+            })?;
+        }
+        write_backend_marker(&store.data_dir, store.anchor_backend)?;
+        Ok(store)
     }
 
     /// Load the non-secret UI preferences.
@@ -284,13 +412,19 @@ impl Store {
         self.data_dir.join(ANCHORS_FILE)
     }
 
+    fn secure_storage(&self) -> StoreResult<&dyn SecureAnchorStorage> {
+        self.secure
+            .as_deref()
+            .ok_or_else(|| "OS secure storage is not available in this build".to_string())
+    }
+
     fn load_anchor_set_locked(&self) -> StoreResult<AnchorSet> {
         let bytes = match self.anchor_backend {
-            AnchorBackend::SecureStorage => {
-                crate::autounlock::load_state_anchors(&self.anchor_account)
-                    .map_err(err)?
-                    .unwrap_or_default()
-            }
+            AnchorBackend::SecureStorage => self
+                .secure_storage()?
+                .load(&self.anchor_account)
+                .map_err(|e| format!("could not read rollback anchors: {e}"))?
+                .unwrap_or_default(),
             AnchorBackend::DegradedFile => {
                 let path = self.anchors_path();
                 if path.exists() {
@@ -316,9 +450,10 @@ impl Store {
     fn save_anchor_set_locked(&self, set: &AnchorSet) -> StoreResult<()> {
         let bytes = filesec_core::codec::to_vec(set).map_err(err)?;
         match self.anchor_backend {
-            AnchorBackend::SecureStorage => {
-                crate::autounlock::save_state_anchors(&self.anchor_account, &bytes).map_err(err)
-            }
+            AnchorBackend::SecureStorage => self
+                .secure_storage()?
+                .save(&self.anchor_account, &bytes)
+                .map_err(|e| format!("could not save rollback anchors: {e}")),
             AnchorBackend::DegradedFile => {
                 let final_path = self.anchors_path();
                 let tmp = self.data_dir.join(".state-anchors.tmp");
@@ -556,14 +691,17 @@ impl Store {
         self.commit_state(&state)
     }
 
-    fn load_protected_blob<T: DeserializeOwned + Serialize>(
+    /// Read, decrypt and authenticate one protected record **without** any
+    /// anchor check. A record bound to another identity/object/suite, or whose
+    /// payload does not match its committed hash, is an error.
+    fn read_protected_record<T: DeserializeOwned + Serialize>(
         &self,
         identity: &Identity,
         path: &Path,
         entry_name: &str,
         object_type: StateObjectType,
         object_id: &str,
-    ) -> StoreResult<Option<T>> {
+    ) -> StoreResult<Option<ProtectedState<T>>> {
         let Some((bytes, suite)) = self.load_blob(identity, path, entry_name)? else {
             return Ok(None);
         };
@@ -584,16 +722,34 @@ impl Store {
             || record.state.object_id != object_id
             || record.state.suite_id != suite.to_u16()
         {
-            let _ = self.quarantine(path);
             return Err(format!(
                 "state-anchor mismatch for {object_type} {object_id}"
             ));
         }
         let payload_bytes = filesec_core::codec::to_vec(&record.payload).map_err(err)?;
-        if let Err(e) = record.state.verify_payload(&payload_bytes) {
-            let _ = self.quarantine(path);
-            return Err(err(e));
-        }
+        record.state.verify_payload(&payload_bytes).map_err(err)?;
+        Ok(Some(record))
+    }
+
+    fn load_protected_blob<T: DeserializeOwned + Serialize>(
+        &self,
+        identity: &Identity,
+        path: &Path,
+        entry_name: &str,
+        object_type: StateObjectType,
+        object_id: &str,
+    ) -> StoreResult<Option<T>> {
+        let record =
+            match self.read_protected_record(identity, path, entry_name, object_type, object_id) {
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    if e.starts_with("state-anchor mismatch") {
+                        let _ = self.quarantine(path);
+                    }
+                    return Err(e);
+                }
+            };
         self.accept_state(&record.state, path)?;
         Ok(Some(record.payload))
     }
@@ -822,6 +978,24 @@ impl Store {
             return self.open_vault(identity, id);
         }
         Err(format!("vault not found: {id}"))
+    }
+
+    /// Every committed v2 vault directory, as `(vault id, path)`. Scratch and
+    /// tombstone directories (`.partial`, `.old`, ...) are not vaults.
+    fn v2_vaults(&self) -> Vec<(String, PathBuf)> {
+        let mut vaults = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(id) = name.strip_suffix(".fsv2") {
+                    if entry.path().is_dir() {
+                        vaults.push((id.to_string(), entry.path()));
+                    }
+                }
+            }
+        }
+        vaults.sort();
+        vaults
     }
 
     /// Best-effort cleanup, on unlock, of interrupted vault-migration scratch
@@ -1244,44 +1418,162 @@ impl Store {
     }
 }
 
-fn select_anchor_backend(data_dir: &Path, account: &str) -> StoreResult<AnchorBackend> {
-    let marker = data_dir.join(ANCHORS_BACKEND_FILE);
-    let remembered = std::fs::read_to_string(&marker).ok();
-    let (backend, secure_anchor_exists) = match remembered.as_deref().map(str::trim) {
-        Some("secure-v1") => {
-            // A store that established secure anchors must fail closed if the
-            // platform keychain later becomes unavailable. Silently switching to
-            // a new empty file anchor would make every rollback look like genesis.
-            let exists = crate::autounlock::load_state_anchors(account)
-                .map_err(err)?
-                .is_some();
-            (AnchorBackend::SecureStorage, Some(exists))
-        }
-        Some("degraded-v1") => (AnchorBackend::DegradedFile, None),
-        Some(_) => return Err("unsupported state anchor backend marker".into()),
-        None => match crate::autounlock::load_state_anchors(account) {
-            Ok(anchors) => (AnchorBackend::SecureStorage, Some(anchors.is_some())),
-            Err(_) => (AnchorBackend::DegradedFile, None),
-        },
-    };
-    if backend == AnchorBackend::SecureStorage
-        && secure_anchor_exists == Some(false)
-        && keystore_is_v3(&data_dir.join(KEYSTORE_FILE))
-    {
-        return Err(
-            "rollback-protection anchors are missing from OS secure storage; refusing to trust existing v3 state"
-                .into(),
-        );
+/// What the OS secure storage says about a store's anchor namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecureProbe {
+    /// It answered and holds this store's anchor record: the store is
+    /// secure-anchored, whatever the data directory claims.
+    Established,
+    /// It answered and holds nothing for this store.
+    Empty,
+    /// It is absent from this build, unreachable, or failed.
+    Unreachable,
+}
+
+fn probe_secure(secure: Option<&dyn SecureAnchorStorage>, account: &str) -> SecureProbe {
+    match secure.map(|s| s.load(account)) {
+        Some(Ok(Some(_))) => SecureProbe::Established,
+        Some(Ok(None)) => SecureProbe::Empty,
+        Some(Err(_)) | None => SecureProbe::Unreachable,
     }
-    if remembered.is_none() {
-        let value = match backend {
-            AnchorBackend::SecureStorage => b"secure-v1\n".as_slice(),
-            AnchorBackend::DegradedFile => b"degraded-v1\n".as_slice(),
-        };
-        let tmp = data_dir.join(".state-anchor-backend.tmp");
-        write_private_atomic(&tmp, &marker, value)?;
+}
+
+/// The unauthenticated `.state-anchor-backend` hint, as found on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendMarker {
+    Secure,
+    Degraded,
+    Malformed,
+}
+
+fn read_backend_marker(path: &Path) -> Option<BackendMarker> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_BACKEND_MARKER_LEN {
+        return Some(BackendMarker::Malformed);
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Some(BackendMarker::Malformed);
+    };
+    Some(match text.trim() {
+        BACKEND_MARKER_SECURE => BackendMarker::Secure,
+        BACKEND_MARKER_DEGRADED => BackendMarker::Degraded,
+        _ => BackendMarker::Malformed,
+    })
+}
+
+fn write_backend_marker(data_dir: &Path, backend: AnchorBackend) -> StoreResult<()> {
+    let value = match backend {
+        AnchorBackend::SecureStorage => BACKEND_MARKER_SECURE,
+        AnchorBackend::DegradedFile => BACKEND_MARKER_DEGRADED,
+    };
+    let tmp = data_dir.join(".state-anchor-backend.tmp");
+    write_private_atomic(
+        &tmp,
+        &data_dir.join(ANCHORS_BACKEND_FILE),
+        format!("{value}\n").as_bytes(),
+    )
+}
+
+/// Decide where this store's rollback anchors live.
+///
+/// The `.state-anchor-backend` marker sits in the very directory an attacker is
+/// assumed able to roll back, so it is only ever a **hint**. The rules (FS-01):
+///
+/// * If OS secure storage answers and holds this store's anchor record, the
+///   store is secure-anchored — full stop. A marker claiming `degraded`, a
+///   missing marker, a malformed one, or a planted `.state-anchors` file cannot
+///   downgrade it to file anchors; the marker is repaired instead.
+/// * A store that selects secure storage **establishes** its record there
+///   immediately (an empty anchor set), so the provenance lives outside the
+///   tamperable directory from the very first launch, before any state exists.
+/// * A `degraded` marker is honored only when secure storage either holds
+///   nothing for this store (it was deliberately file-backed from creation) or
+///   cannot be consulted at all. In the latter case the marker cannot be
+///   authenticated; that is the documented limit of degraded mode, and the GUI
+///   keeps showing the degraded-mode warning.
+/// * Every other ambiguity with protected state already on disk fails closed
+///   with [`ANCHOR_RECOVERY_REQUIRED`]; moving an established store to another
+///   backend takes the explicit, passphrase-authenticated
+///   [`Store::recover_rollback_anchors`].
+fn select_anchor_backend(
+    data_dir: &Path,
+    account: &str,
+    secure: Option<&dyn SecureAnchorStorage>,
+) -> StoreResult<AnchorBackend> {
+    let marker = read_backend_marker(&data_dir.join(ANCHORS_BACKEND_FILE));
+    let protected_state = keystore_is_v3(&data_dir.join(KEYSTORE_FILE));
+    let file_anchors = data_dir.join(ANCHORS_FILE).exists();
+    let probe = probe_secure(secure, account);
+    let backend = match (probe, marker) {
+        (SecureProbe::Established, _) => AnchorBackend::SecureStorage,
+        (_, Some(BackendMarker::Malformed)) => {
+            return Err(format!(
+                "{ANCHOR_RECOVERY_REQUIRED}: the anchor backend marker is malformed"
+            ))
+        }
+        (SecureProbe::Empty, Some(BackendMarker::Secure)) if protected_state => {
+            return Err(format!(
+                "{ANCHOR_RECOVERY_REQUIRED}: the anchors are missing from OS secure storage; refusing to trust existing protected state"
+            ))
+        }
+        (SecureProbe::Unreachable, Some(BackendMarker::Secure)) => {
+            return Err(format!(
+                "{ANCHOR_RECOVERY_REQUIRED}: OS secure storage holding this store's anchors is unavailable"
+            ))
+        }
+        (SecureProbe::Empty, Some(BackendMarker::Secure)) => AnchorBackend::SecureStorage,
+        (_, Some(BackendMarker::Degraded)) => AnchorBackend::DegradedFile,
+        // No marker: only a store's very first launch writes one, so protected
+        // state without it means the marker was lost or removed.
+        (_, None) if file_anchors => AnchorBackend::DegradedFile,
+        (SecureProbe::Empty, None) => AnchorBackend::SecureStorage,
+        (SecureProbe::Unreachable, None) if protected_state => {
+            return Err(format!(
+                "{ANCHOR_RECOVERY_REQUIRED}: the anchor backend marker is missing and OS secure storage is unavailable"
+            ))
+        }
+        (SecureProbe::Unreachable, None) => AnchorBackend::DegradedFile,
+    };
+    let backend = if backend == AnchorBackend::SecureStorage && probe == SecureProbe::Empty {
+        establish_secure_anchor_record(secure, account, protected_state)?
+    } else {
+        backend
+    };
+    let wanted = match backend {
+        AnchorBackend::SecureStorage => BackendMarker::Secure,
+        AnchorBackend::DegradedFile => BackendMarker::Degraded,
+    };
+    if marker != Some(wanted) {
+        write_backend_marker(data_dir, backend)?;
     }
     Ok(backend)
+}
+
+/// Write an empty anchor set to secure storage so the store's backend is
+/// recorded outside the data directory before any protected state exists. A
+/// fresh store whose secure storage refuses the write falls back to degraded
+/// file anchors (exactly as if secure storage were absent); with protected
+/// state already present that fallback would be a silent downgrade, so it fails.
+fn establish_secure_anchor_record(
+    secure: Option<&dyn SecureAnchorStorage>,
+    account: &str,
+    protected_state: bool,
+) -> StoreResult<AnchorBackend> {
+    let empty = AnchorSet {
+        version: ANCHORS_VERSION,
+        anchors: Vec::new(),
+    };
+    let bytes = filesec_core::codec::to_vec(&empty).map_err(err)?;
+    match secure.map(|s| s.save(account, &bytes)) {
+        Some(Ok(())) => Ok(AnchorBackend::SecureStorage),
+        Some(Err(_)) | None if !protected_state => Ok(AnchorBackend::DegradedFile),
+        Some(Err(e)) => Err(format!(
+            "{ANCHOR_RECOVERY_REQUIRED}: could not record anchors in OS secure storage: {e}"
+        )),
+        None => Err(format!(
+            "{ANCHOR_RECOVERY_REQUIRED}: OS secure storage is not available"
+        )),
+    }
 }
 
 fn keystore_is_v3(path: &Path) -> bool {

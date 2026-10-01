@@ -208,6 +208,17 @@ using the explicit recovery APIs (`recover_legacy_keystore`,
 `recover_legacy_vault`). Never fix a rollback warning by copying an old anchor
 file over the current one.
 
+The `.state-anchor-backend` file in the data directory is only a hint. When the
+OS secure store answers and holds this data directory's anchor record, FileSec
+uses it no matter what that file says, and repairs the file; a new data
+directory records itself in the secure store on first launch, before any state
+exists. If the anchors cannot be trusted as found (the secure store was reset,
+is unavailable for a directory that used it, or the data directory moved to
+another machine), FileSec opens a *Rollback protection needs attention* screen
+instead of the vaults. Its only action is an explicit, passphrase-authenticated
+re-anchoring (`Store::recover_rollback_anchors`) that trusts the files currently
+on disk as the newest state; run it only for the copy you intend to keep.
+
 ### Threat model — what is *not* protected
 
 FileSec protects data **in transit and at rest**. It explicitly does **not**

@@ -30,7 +30,10 @@ use filesec_core::SuiteId;
 use crate::autounlock;
 use crate::passkey;
 use crate::prefs::ThemeChoice;
-use crate::store::{new_vault_id, write_private_export, Registry, Store, StoreResult, VaultMeta};
+use crate::store::{
+    new_vault_id, write_private_export, Registry, Store, StoreResult, VaultMeta,
+    ANCHOR_RECOVERY_REQUIRED,
+};
 
 use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
 use crate::wipe::{WipeHandle, Wiper};
@@ -105,9 +108,30 @@ struct Toast {
 
 enum State {
     Fatal(String),
+    /// The rollback-anchor backend could not be trusted as found; the only way
+    /// forward is the explicit, passphrase-authenticated re-anchoring.
+    AnchorRecovery(AnchorRecovery),
     FirstRun(FirstRun),
     Unlock(Unlock),
     Unlocked(Box<Session>),
+}
+
+/// The "re-establish rollback protection" screen (see
+/// [`Store::recover_rollback_anchors`]). It never runs implicitly: the user must
+/// read why, confirm that the data directory is the copy to keep, and
+/// authenticate with the passphrase.
+#[derive(Default)]
+struct AnchorRecovery {
+    reason: String,
+    pass: String,
+    confirmed: bool,
+    error: Option<String>,
+}
+
+impl Drop for AnchorRecovery {
+    fn drop(&mut self) {
+        self.pass.zeroize();
+    }
 }
 
 #[derive(Default)]
@@ -627,6 +651,8 @@ struct OfferView {
 
 /// Deferred mutations collected during rendering.
 enum Action {
+    /// Run the explicit, passphrase-authenticated rollback-anchor recovery.
+    RecoverAnchors,
     CreateIdentity,
     Unlock,
     Lock,
@@ -847,6 +873,9 @@ struct ImportData {
 /// State mutations applied on the UI thread when a job completes.
 enum Outcome {
     Noop,
+    /// Rollback anchors were re-established; continue to the unlock screen.
+    AnchorsRecovered(Box<Store>),
+    AnchorRecoveryFailed(String),
     Unlocked(Box<SessionInit>),
     FirstRunFailed(String),
     UnlockFailed(String),
@@ -940,6 +969,20 @@ impl App {
                     exit_wipe: None,
                 }
             }
+            Err(e) if e.starts_with(ANCHOR_RECOVERY_REQUIRED) => App {
+                store: None,
+                state: State::AnchorRecovery(AnchorRecovery {
+                    reason: e,
+                    pass: String::new(),
+                    confirmed: false,
+                    error: None,
+                }),
+                toast: None,
+                job: None,
+                auto_unlock_pending: false,
+                wiper: Wiper::new(),
+                exit_wipe: None,
+            },
             Err(e) => App {
                 store: None,
                 state: State::Fatal(e),
@@ -1014,6 +1057,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!busy, |ui| match &mut self.state {
                     State::Fatal(msg) => fatal_ui(msg, ui),
+                    State::AnchorRecovery(r) => anchor_recovery_ui(r, ui, &mut action),
                     State::FirstRun(f) => first_run_ui(f, ui, &mut action),
                     State::Unlock(u) => unlock_ui(u, ui, &mut action),
                     State::Unlocked(s) => session_ui(s, ui, &mut action),
@@ -1248,6 +1292,16 @@ impl App {
         }
         match report.outcome {
             Outcome::Noop => {}
+            Outcome::AnchorsRecovered(store) => {
+                let unlock = Unlock::for_store(&store);
+                self.store = Some(Arc::new(*store));
+                self.state = State::Unlock(unlock);
+            }
+            Outcome::AnchorRecoveryFailed(msg) => {
+                if let State::AnchorRecovery(r) = &mut self.state {
+                    r.error = Some(msg);
+                }
+            }
             Outcome::Unlocked(init) => {
                 let SessionInit {
                     identity,
@@ -1911,6 +1965,7 @@ impl App {
             // --- background jobs ---
             Action::CreateIdentity => self.spawn_create_identity(ctx),
             Action::Unlock => self.spawn_unlock(ctx),
+            Action::RecoverAnchors => self.spawn_recover_anchors(ctx),
             Action::UnlockWithPasskey => self.spawn_unlock_passkey(ctx),
             Action::AddPasskey => self.spawn_add_passkey(ctx),
             Action::RemovePasskey(i) => self.spawn_remove_passkey(ctx, i),
@@ -2179,6 +2234,48 @@ impl App {
                     "Unlocked."
                 },
             )
+        });
+    }
+
+    /// Re-establish rollback anchors from the current, passphrase-authenticated
+    /// on-disk state. Only reachable from the [`State::AnchorRecovery`] screen,
+    /// after the user explicitly confirmed this directory is the copy to keep.
+    fn spawn_recover_anchors(&mut self, ctx: &egui::Context) {
+        let pass = match &mut self.state {
+            State::AnchorRecovery(r) => {
+                r.error = None;
+                if !r.confirmed {
+                    r.error = Some(
+                        "Confirm that this data directory is the copy you intend to keep.".into(),
+                    );
+                    return;
+                }
+                if r.pass.is_empty() {
+                    r.error = Some("Enter your passphrase.".into());
+                    return;
+                }
+                Zeroizing::new(std::mem::take(&mut r.pass))
+            }
+            _ => return,
+        };
+        self.spawn_job(ctx, "Re-establishing rollback protection…", move || {
+            let result = Store::default_data_dir().and_then(|dir| {
+                Store::recover_rollback_anchors(
+                    dir,
+                    crate::anchors::platform_storage(),
+                    pass.as_bytes(),
+                )
+            });
+            match result {
+                Ok(store) => JobReport::ok(
+                    Outcome::AnchorsRecovered(Box::new(store)),
+                    "Rollback protection re-established from the current local state.",
+                ),
+                Err(e) => JobReport {
+                    outcome: Outcome::AnchorRecoveryFailed(e),
+                    toast: None,
+                },
+            }
         });
     }
 
@@ -5189,6 +5286,52 @@ fn fatal_ui(msg: &str, ui: &mut egui::Ui) {
         ui.heading("FileSec could not start");
         ui.add_space(8.0);
         ui.colored_label(ERR_RED, msg);
+    });
+}
+
+fn anchor_recovery_ui(r: &mut AnchorRecovery, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let c = theme::colors(ui);
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(480.0);
+        ui.label(theme::icon_text(theme::icon::LOCK_KEY, 40.0).color(c.warn));
+        ui.add_space(6.0);
+        ui.heading("Rollback protection needs attention");
+        ui.add_space(12.0);
+        theme::card(ui, |ui| {
+            ui.colored_label(c.err, &r.reason);
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "FileSec keeps a record of the newest version of your keystore, contacts, \
+                     registry, and vaults outside this data directory, so an older copy cannot \
+                     be swapped in unnoticed. That record could not be trusted as found.\n\n\
+                     If you did not expect this (no keychain reset, no move to a new machine), \
+                     stop here and check where this data directory came from. Recovering trusts \
+                     the files on disk now as the newest state: an older copy recovered here \
+                     becomes the new reference point. Nothing is deleted or re-encrypted.",
+                )
+                .color(c.text_muted),
+            );
+            ui.add_space(10.0);
+            ui.checkbox(
+                &mut r.confirmed,
+                "This data directory is the current copy I intend to keep",
+            );
+            ui.add_space(6.0);
+            let resp = theme::text_input(ui, &mut r.pass, "Passphrase", true);
+            let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(8.0);
+            if theme::primary_button_full(ui, "Re-establish rollback protection").clicked()
+                || submit
+            {
+                *action = Some(Action::RecoverAnchors);
+            }
+            if let Some(e) = &r.error {
+                ui.add_space(10.0);
+                ui.colored_label(c.err, e);
+            }
+        });
     });
 }
 

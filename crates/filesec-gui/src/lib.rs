@@ -4,6 +4,7 @@
 //! without spawning a window. The `filesec` binary is a thin entry point over
 //! [`app::App`].
 
+pub mod anchors;
 pub mod app;
 pub mod autounlock;
 #[cfg(feature = "net")]
