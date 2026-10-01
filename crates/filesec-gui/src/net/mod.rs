@@ -370,13 +370,17 @@ fn decode_symbol(c: char) -> Option<u8> {
         .map(|p| p as u8)
 }
 
-/// Decode a user-entered transfer code back to the raw 16-byte secret. Separators
-/// and whitespace are ignored; the payload must be exactly [`SECRET_SYMBOLS`]
-/// valid symbols or this returns `None`.
+/// Decode a user-entered transfer code back to the raw 16-byte secret.
+///
+/// Group separators (`-`) and whitespace are ignored; any other character is
+/// rejected rather than silently dropped. The payload must be exactly
+/// [`SECRET_SYMBOLS`] valid symbols, and the two bits the last symbol carries
+/// beyond the 128-bit secret must be zero, so every secret has exactly one
+/// canonical spelling (case and look-alike glyphs aside).
 fn decode_transfer_code(input: &str) -> Option<[u8; TRANSFER_SECRET_LEN]> {
     let symbols: Vec<u8> = input
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| *c != '-' && !c.is_whitespace())
         .map(decode_symbol)
         .collect::<Option<Vec<u8>>>()?;
     if symbols.len() != SECRET_SYMBOLS {
@@ -397,7 +401,9 @@ fn decode_transfer_code(input: &str) -> Option<[u8; TRANSFER_SECRET_LEN]> {
             }
         }
     }
-    (idx == TRANSFER_SECRET_LEN).then_some(out)
+    // 26 symbols carry 130 bits; the 2 left over are padding and must be zero.
+    let padding = buffer & ((1 << bits) - 1);
+    (idx == TRANSFER_SECRET_LEN && padding == 0).then_some(out)
 }
 
 /// Current Unix time in seconds (best-effort; 0 if the clock is before the epoch).
@@ -456,5 +462,38 @@ mod tests {
         let canon = encode_transfer_secret(&secret);
         assert_eq!(canon.len(), SECRET_SYMBOLS);
         assert!(canon.bytes().all(|b| CROCKFORD.contains(&b)));
+    }
+
+    /// Audit item: one canonical spelling per secret — non-zero padding bits
+    /// and stray characters are rejected, not ignored.
+    #[test]
+    fn decode_rejects_non_canonical_padding_and_stray_characters() {
+        let secret = [0x5au8; TRANSFER_SECRET_LEN];
+        let canon = encode_transfer_secret(&secret);
+        assert_eq!(decode_transfer_code(&canon), Some(secret));
+
+        // Same 128 bits, different (non-zero) padding in the last symbol.
+        let mut tampered: Vec<u8> = canon.bytes().collect();
+        let last = tampered.len() - 1;
+        let value = decode_symbol(char::from(tampered[last])).unwrap();
+        tampered[last] = CROCKFORD[usize::from(value ^ 0b01)];
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert_ne!(tampered, canon);
+        assert_eq!(decode_transfer_code(&tampered), None);
+
+        // Only '-' and whitespace separate groups.
+        let grouped = group_transfer_code(&canon);
+        assert_eq!(decode_transfer_code(&grouped), Some(secret));
+        assert_eq!(
+            decode_transfer_code(&grouped.replace('-', " ")),
+            Some(secret)
+        );
+        for stray in ['#', '.', '_', '/', '*'] {
+            assert_eq!(
+                decode_transfer_code(&grouped.replace('-', &stray.to_string())),
+                None,
+                "{stray:?} must not be ignored"
+            );
+        }
     }
 }
