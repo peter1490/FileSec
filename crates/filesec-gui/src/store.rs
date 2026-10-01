@@ -178,6 +178,26 @@ fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// How long a contended lock is retried before the store is reported in use.
+const LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Try the exclusive lock, retrying for [`LOCK_GRACE`]. A process that really
+/// holds the store keeps it far longer; the grace only absorbs transient holds —
+/// a previous FileSec instance that is still exiting, or a child process that
+/// briefly inherited the lock descriptor between fork and exec.
+fn try_lock_with_grace(file: &std::fs::File) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + LOCK_GRACE;
+    loop {
+        if fs4::fs_std::FileExt::try_lock_exclusive(file)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 fn acquire_store_lock(canonical: &Path) -> StoreResult<Arc<StoreLock>> {
     loop {
         let mut held = store_locks()
@@ -195,7 +215,7 @@ fn acquire_store_lock(canonical: &Path) -> StoreResult<Arc<StoreLock>> {
         }
         let file = open_lock_file(&canonical.join(LOCK_FILE))
             .map_err(|e| format!("could not open the data directory lock: {e}"))?;
-        match fs4::fs_std::FileExt::try_lock_exclusive(&file) {
+        match try_lock_with_grace(&file) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(format!(
