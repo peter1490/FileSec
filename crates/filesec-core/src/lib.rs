@@ -32,6 +32,7 @@ pub mod identity;
 pub mod kdf;
 pub mod kem;
 pub mod keystore;
+pub mod limits;
 pub mod manifest;
 #[cfg(feature = "pqc")]
 pub mod mldsa;

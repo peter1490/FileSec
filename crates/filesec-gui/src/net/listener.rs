@@ -415,6 +415,22 @@ fn run_transfer(
             "the offered transfer is too large to accept",
         ));
     }
+    // The received container lands in a temp and is then re-encrypted into the
+    // vault store, so both copies need room. Refuse before prompting the user
+    // (O-04): the size cap above bounds what a peer may declare, not what the
+    // disk can hold.
+    if let Err(e) = crate::store::ensure_free_space(
+        shared.store.checkout_dir(),
+        offer.size.saturating_mul(2),
+        "receiving this vault",
+    ) {
+        if let Ok(decline) = codec::to_vec(&DecisionMsg { accept: false }) {
+            if let Ok(frame) = session.seal_record(RecordType::OfferDecision, &decline) {
+                let _ = write_frame(stream, &frame);
+            }
+        }
+        return Err(ConnError::shown(e));
+    }
     shared.emitter.emit(NetEvent::Offer {
         filename: filesec_core::sanitize_display_name(&offer.filename),
         size: offer.size,

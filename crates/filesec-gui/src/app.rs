@@ -3218,6 +3218,16 @@ impl App {
                     "Nothing was extracted: {e}. Rename the entries or pick an empty folder."
                 ));
             }
+            let total: u64 = reader
+                .entries()
+                .iter()
+                .filter(|e| paths.binary_search(&e.path).is_ok())
+                .map(|e| e.size)
+                .sum();
+            if let Err(e) = crate::store::ensure_free_space(&dest, total, "extracting these files")
+            {
+                return JobReport::err(format!("Nothing was extracted: {e}."));
+            }
             let mut failed = 0usize;
             for path in &paths {
                 // Each file streams through the hardened writer: parents are made
@@ -3524,6 +3534,15 @@ impl App {
                     "Nothing was extracted: {e}. Rename the entries or pick an empty folder."
                 ));
             }
+            let total: u64 = reader
+                .entries()
+                .iter()
+                .filter(|e| e.kind == EntryKind::File && !is_trashed(&e.path))
+                .map(|e| e.size)
+                .sum();
+            if let Err(e) = crate::store::ensure_free_space(&dest, total, "extracting this vault") {
+                return JobReport::err(format!("Nothing was extracted: {e}."));
+            }
             let mut failed = 0usize;
             let mut files = 0usize;
             for (path, kind) in live {
@@ -3663,6 +3682,16 @@ impl App {
         self.spawn_job(ctx, "Opening…", move || {
             // Decrypt the one file into a private temp, then drop it to read-only.
             // The temp is named `<random>.<ext>` — never the vault's own filename.
+            let size = reader
+                .entries()
+                .iter()
+                .find(|e| e.path == path)
+                .map_or(0, |e| e.size);
+            if let Err(e) =
+                crate::store::ensure_free_space(store.checkout_dir(), size, "opening this file")
+            {
+                return JobReport::err(e);
+            }
             let temp_path = match store.create_private_checkout_file(&leaf) {
                 Ok(p) => p,
                 Err(e) => return JobReport::err(e),
@@ -3765,6 +3794,16 @@ impl App {
             // plaintext is left behind. The temp is named `<random>.<ext>`, so the
             // editor's title bar and the OS recent-items list never see the real
             // name — the in-app banner is where you see what you are editing.
+            let size = reader
+                .entries()
+                .iter()
+                .find(|e| e.path == path)
+                .map_or(0, |e| e.size);
+            if let Err(e) =
+                crate::store::ensure_free_space(store.checkout_dir(), size, "editing this file")
+            {
+                return JobReport::err(e);
+            }
             let temp_path = match store.create_private_checkout_file(&leaf) {
                 Ok(p) => p,
                 Err(e) => return JobReport::err(e),

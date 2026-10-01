@@ -102,6 +102,46 @@ pub const STORE_IN_USE: &str = "this FileSec data directory is already in use";
 /// state that is no longer current (another operation committed first).
 pub const STALE_STATE: &str = "this vault changed since it was opened";
 
+/// Stable prefix of the error returned when a write is refused up front for
+/// lack of disk space (O-04).
+pub const NOT_ENOUGH_SPACE: &str = "not enough free disk space";
+
+/// Free space kept in reserve beyond any preflighted write, so FileSec's own
+/// metadata (manifests, registry, anchors) can still be written afterwards.
+const DISK_HEADROOM: u64 = 64 * 1024 * 1024;
+
+/// Refuse up front a write of about `needed` bytes into `dir` when its volume
+/// lacks that much free space plus [`DISK_HEADROOM`] — instead of failing
+/// part-way through with a full disk (O-04). Size limits such as the 64 GiB
+/// inbound-transfer cap bound what a peer may *declare*; they are not a disk
+/// reservation. If free space cannot be determined the write proceeds; every
+/// write path still fails safely (atomic temp + rename) on a full disk.
+pub fn ensure_free_space(dir: &Path, needed: u64, what: &str) -> StoreResult<()> {
+    let Ok(available) = fs4::available_space(dir) else {
+        return Ok(());
+    };
+    let required = needed.saturating_add(DISK_HEADROOM);
+    if available < required {
+        return Err(format!(
+            "{NOT_ENOUGH_SPACE} for {what}: about {} needed, {} available",
+            human_bytes(required),
+            human_bytes(available)
+        ));
+    }
+    Ok(())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else {
+        format!("{:.1} MiB", b / MIB)
+    }
+}
+
 /// Advisory lock file marking the data directory as in use by one process.
 const LOCK_FILE: &str = ".lock";
 
@@ -1578,6 +1618,12 @@ impl Store {
             .map(|d| Add::Dir(d))
             .chain(added.iter().map(Add::File))
             .collect();
+        let incoming: u64 = added
+            .iter()
+            .filter_map(|f| std::fs::metadata(&f.source).ok())
+            .map(|meta| meta.len())
+            .sum();
+        ensure_free_space(&self.vaults_dir, incoming, "adding these files")?;
         self.in_txn(StateObjectType::VaultManifest, &object_id, || {
             self.ensure_current_vault(reader)?;
             let mut writer = reader.clone();
@@ -1682,6 +1728,11 @@ impl Store {
         id: &str,
         reader: &format::VaultReader,
     ) -> StoreResult<()> {
+        ensure_free_space(
+            &self.vaults_dir,
+            reader.total_size(),
+            "importing this vault",
+        )?;
         self.create_vault_dir(id, |partial| {
             VaultReaderV2::from_reader_v1_with_object_id(
                 partial,
@@ -2554,5 +2605,16 @@ mod tests {
         assert!(std::fs::symlink_metadata(&symlink).is_err());
         assert!(!hardlink.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn free_space_preflight_refuses_impossible_writes() {
+        let dir = tmp("free-space");
+        std::fs::create_dir_all(&dir).unwrap();
+        ensure_free_space(&dir, 0, "nothing").unwrap();
+        let error = ensure_free_space(&dir, u64::MAX / 2, "an absurd write").unwrap_err();
+        assert!(error.starts_with(NOT_ENOUGH_SPACE), "{error}");
+        assert!(error.contains("an absurd write"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

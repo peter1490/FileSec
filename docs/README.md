@@ -300,16 +300,26 @@ single edit rewrites only one blob plus its manifest. Only the keystore differs
 everything else. All four state families use the rollback anchors described
 above.
 
-**Lazy opening.** Opening a vault decrypts only the small, authenticated manifest
-(the folder tree and per-entry metadata) — *not* the file data — so opening a
-multi-gigabyte vault is cheap and uses negligible memory. Individual files are
-decrypted from disk **on demand** via random-access chunk decryption (only the
-chunks covering the requested file are read and decrypted). Extraction streams
-one file at a time, so peak memory is the size of the largest single file, not
-the whole vault. Operations that inherently need the full plaintext (re-encrypt
-after add/delete, or exporting to others) load it transiently on the worker
-thread and drop it immediately. Each chunk is individually AEAD-authenticated, so
+**Lazy opening and memory.** Opening a vault decrypts only its authenticated
+manifest (the folder tree and per-entry metadata) — *not* the file data.
+Individual files are decrypted from disk **on demand**, chunk by chunk, and
+adding, extracting, sending, receiving, and re-encrypting stream file content a
+chunk at a time (tests measure extraction and export of a 16 MiB file staying
+under 4 MiB of heap). What is *not* chunk-sized is metadata: an open vault holds
+its encrypted and decrypted manifest and the decoded entries, and the app keeps
+an index of them, so memory grows with the number of entries — a few MiB for
+thousands of files. Hard budgets bound the worst case: at most 1,000,000 entries
+and a 256 MiB encrypted manifest (`filesec_core::limits`), on the order of 1 GiB
+at the extreme. The quick editor and "read whole file" paths deliberately hold
+that one file in memory. Each chunk is individually AEAD-authenticated, so
 on-demand reads remain tamper-evident.
+
+**Disk space.** Adding files, importing or receiving a vault (a received
+container and its re-encrypted copy both need room), extracting, and opening a
+file for viewing or editing first check the destination volume's free space and
+refuse up front, with the amount needed, rather than failing part-way. The
+64 GiB inbound-transfer cap bounds what a peer may declare; it is not a disk
+reservation.
 
 Data lives in the per-OS application directory (override with the
 `FILESEC_DATA_DIR` environment variable):

@@ -43,21 +43,22 @@ const MAGIC: &[u8; 5] = b"FSEC\x1a";
 const FORMAT_VERSION: u16 = 1;
 /// Fixed preamble length: magic(5) + version(2) + header_len(4).
 const PREAMBLE_LEN: usize = 11;
-/// Upper bound on the CBOR header size (defends untrusted parsing).
-const MAX_HEADER_LEN: usize = 32 * 1024 * 1024;
+/// Upper bound on the CBOR header size (defends untrusted parsing). See
+/// [`crate::limits`] for how these budgets are sized (O-04).
+const MAX_HEADER_LEN: usize = crate::limits::MAX_CONTAINER_HEADER_LEN;
 /// Upper bound on the encrypted manifest size.
-const MAX_MANIFEST_LEN: u64 = 512 * 1024 * 1024;
+const MAX_MANIFEST_LEN: u64 = crate::limits::MAX_MANIFEST_LEN;
 /// Upper bound on the number of entries a manifest may declare. Bounds the
 /// per-entry work (and per-file allocation) a hostile manifest can drive, even
-/// when it fits inside [`MAX_MANIFEST_LEN`]. Ten million entries is far beyond
-/// any real vault yet keeps validation and reconstruction linear and bounded.
-const MAX_MANIFEST_ENTRIES: usize = 10_000_000;
+/// when it fits inside [`MAX_MANIFEST_LEN`].
+const MAX_MANIFEST_ENTRIES: usize = crate::limits::MAX_MANIFEST_ENTRIES;
 /// Upper bound on a whole container read fully into memory by
 /// [`import_vault_from_path`]. The streaming [`open_vault_from_path`] /
-/// [`verify_and_open`] paths carry no such limit (they hold only a chunk at a
-/// time); this bounds only the deliberately non-streaming, buffer-everything
-/// import so an attacker-sized file cannot force an unbounded allocation.
-const MAX_IN_MEMORY_CONTAINER_LEN: u64 = 2 * 1024 * 1024 * 1024;
+/// [`verify_and_open`] paths carry no such limit (file content streams a chunk
+/// at a time; their metadata is bounded by the limits above); this bounds only
+/// the deliberately non-streaming, buffer-everything import so an
+/// attacker-sized file cannot force an unbounded allocation.
+const MAX_IN_MEMORY_CONTAINER_LEN: u64 = crate::limits::MAX_IN_MEMORY_CONTAINER_LEN;
 
 /// Plaintext header. Everything here is bound as AAD and signed.
 ///
@@ -1740,6 +1741,10 @@ fn open_reader_inner(
     }
     if let Some(h) = hasher.as_mut() {
         h.update(&preamble);
+    }
+    // Never allocate for a header the file is too short to contain.
+    if (PREAMBLE_LEN as u64).saturating_add(header_len as u64) > file_len {
+        return Err(Error::Format("truncated header"));
     }
 
     let mut header_bytes = vec![0u8; header_len];

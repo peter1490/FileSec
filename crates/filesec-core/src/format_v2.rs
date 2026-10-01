@@ -72,13 +72,14 @@ const FORMAT_VERSION_V2: u16 = 2;
 /// directory format. The header remains v2 so existing blob AAD stays stable
 /// during explicit in-place recovery.
 const MANIFEST_ENVELOPE_VERSION: u16 = 3;
-/// Upper bound on the plaintext header / sealed manifest reads (untrusted-input guard).
-const MAX_HEADER_LEN: u64 = 16 * 1024 * 1024;
-const MAX_MANIFEST_LEN: u64 = 512 * 1024 * 1024;
+/// Upper bound on the plaintext header / sealed manifest reads (untrusted-input
+/// guard). See [`crate::limits`] for how these budgets are sized (O-04).
+const MAX_HEADER_LEN: u64 = crate::limits::MAX_VAULT_HEADER_LEN;
+const MAX_MANIFEST_LEN: u64 = crate::limits::MAX_MANIFEST_LEN;
 /// Upper bound on the number of entries a decrypted manifest may declare, so a
 /// manifest that fits inside [`MAX_MANIFEST_LEN`] still cannot drive unbounded
 /// per-entry work. Mirrors the v1 [`crate::format`] limit.
-const MAX_MANIFEST_ENTRIES: usize = 10_000_000;
+const MAX_MANIFEST_ENTRIES: usize = crate::limits::MAX_MANIFEST_ENTRIES;
 /// Exact length of a blob `file_id`: 32 lowercase-hex characters (16 random bytes).
 const BLOB_ID_LEN: usize = 32;
 
