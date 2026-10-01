@@ -37,11 +37,16 @@ fn open(dir: &Path, secure: &Arc<MemoryAnchorStorage>) -> Store {
 }
 
 /// Every file under `dir` with its bytes, for "nothing changed" assertions.
+///
+/// Skips the empty `.lock` file the open [`Store`] holds: it carries no state,
+/// and on Windows the lock is mandatory, so even this process cannot read it
+/// (os error 33) while the store is alive.
 fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     walkdir::WalkDir::new(dir)
         .into_iter()
         .flatten()
         .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path() != dir.join(".lock"))
         .map(|e| {
             (
                 e.path().strip_prefix(dir).unwrap().to_path_buf(),
