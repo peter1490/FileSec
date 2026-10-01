@@ -156,8 +156,9 @@ pub fn clear_device_token(account: &str) -> Result<(), AutoUnlockError> {
     }
 }
 
-/// Load the serialized high-water anchor set from OS secure storage. `None`
-/// means this data directory has not established its first anchor yet.
+/// Load one rollback-anchor record (a store's small root record, or a single
+/// object's anchor) from OS secure storage. `None` means nothing is stored
+/// under `account`.
 #[cfg(feature = "keyring")]
 pub fn load_state_anchors(account: &str) -> Result<Option<Vec<u8>>, AutoUnlockError> {
     match entry_for(ANCHOR_SERVICE, account)?.get_secret() {
@@ -169,7 +170,9 @@ pub fn load_state_anchors(account: &str) -> Result<Option<Vec<u8>>, AutoUnlockEr
     }
 }
 
-/// Persist the serialized high-water anchor set in OS secure storage.
+/// Persist one rollback-anchor record in OS secure storage. Records are kept
+/// small and bounded (one per object), well inside Windows Credential
+/// Manager's 2,560-byte credential limit.
 #[cfg(feature = "keyring")]
 pub fn save_state_anchors(account: &str, bytes: &[u8]) -> Result<(), AutoUnlockError> {
     entry_for(ANCHOR_SERVICE, account)?

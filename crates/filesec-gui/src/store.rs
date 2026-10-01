@@ -60,7 +60,22 @@ const MAX_SELF_BLOB_PLAINTEXT_LEN: u64 = 16 * 1024 * 1024;
 const PROTECTED_STATE_VERSION: u16 = 1;
 /// The keystore's fixed state object id (see `filesec_core::keystore`).
 const KEYSTORE_OBJECT_ID: &str = "identity-keystore";
+/// Version of the degraded `.state-anchors` file (and of the legacy single
+/// secure-storage record that held every anchor in one blob).
 const ANCHORS_VERSION: u16 = 1;
+/// Version of the per-store root record in secure storage. Its presence
+/// establishes the store as secure-anchored; anchors themselves live in one
+/// bounded record per object (FS-06).
+const ANCHOR_ROOT_VERSION: u16 = 2;
+/// Version of one per-object anchor record in secure storage.
+const OBJECT_ANCHOR_VERSION: u16 = 1;
+/// Upper bound for any single secure-storage record. Windows Credential
+/// Manager rejects a `CredentialBlob` over 2,560 bytes; one object anchor is
+/// roughly 250 bytes, so this leaves ample margin and turns any future growth
+/// into a clear error instead of a platform failure.
+const MAX_SECURE_ANCHOR_RECORD: usize = 2048;
+/// Longest object id accepted into an anchor (vault ids are 32 hex chars).
+const MAX_ANCHOR_OBJECT_ID: usize = 128;
 const ANCHORS_FILE: &str = ".state-anchors";
 const ANCHORS_BACKEND_FILE: &str = ".state-anchor-backend";
 const QUARANTINE_DIR: &str = "quarantine";
@@ -205,10 +220,59 @@ enum AnchorBackend {
     DegradedFile,
 }
 
+/// The degraded file's anchor set, and the legacy (pre-FS-06) secure-storage
+/// layout that kept every anchor in a single, unboundedly growing record.
 #[derive(Default, Serialize, Deserialize)]
 struct AnchorSet {
     version: u16,
     anchors: Vec<StateAnchor>,
+}
+
+/// The per-store root record in secure storage (`version` 2). Bounded: it
+/// never lists objects.
+#[derive(Serialize, Deserialize)]
+struct AnchorRoot {
+    version: u16,
+}
+
+/// Reads just the `version` of any anchor record, ignoring other fields.
+#[derive(Deserialize)]
+struct AnchorVersionProbe {
+    version: u16,
+}
+
+/// One object's high-water anchor in secure storage.
+#[derive(Serialize, Deserialize)]
+struct ObjectAnchorRecord {
+    version: u16,
+    anchor: StateAnchor,
+}
+
+fn object_tag(object_type: StateObjectType) -> &'static str {
+    match object_type {
+        StateObjectType::Keystore => "keystore",
+        StateObjectType::Contacts => "contacts",
+        StateObjectType::Registry => "registry",
+        StateObjectType::VaultManifest => "vault",
+    }
+}
+
+/// Secure-storage account for one object's anchor. Root accounts are absolute
+/// canonical paths, which never begin with `anchor:`, and neither the tag nor
+/// the hex id can contain `:` or `@`, so no two keys can collide.
+fn object_anchor_account(root: &str, object_type: StateObjectType, object_id: &str) -> String {
+    format!(
+        "anchor:{}:{}@{root}",
+        object_tag(object_type),
+        filesec_core::util::hex(object_id.as_bytes())
+    )
+}
+
+fn encode_root_record() -> StoreResult<Vec<u8>> {
+    filesec_core::codec::to_vec(&AnchorRoot {
+        version: ANCHOR_ROOT_VERSION,
+    })
+    .map_err(err)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -318,6 +382,7 @@ impl Store {
             &store.anchor_account,
             store.secure.as_deref(),
         )?;
+        store.upgrade_secure_anchor_layout()?;
         Ok(store)
     }
 
@@ -451,10 +516,21 @@ impl Store {
                 .anchors
                 .lock()
                 .map_err(|_| "state anchor lock is unavailable".to_string())?;
-            store.save_anchor_set_locked(&AnchorSet {
-                version: ANCHORS_VERSION,
-                anchors,
-            })?;
+            match store.anchor_backend {
+                AnchorBackend::SecureStorage => {
+                    for anchor in &anchors {
+                        store.put_anchor_locked(anchor)?;
+                    }
+                    store
+                        .secure_storage()?
+                        .save(&store.anchor_account, &encode_root_record()?)
+                        .map_err(|e| format!("could not save rollback anchors: {e}"))?;
+                }
+                AnchorBackend::DegradedFile => store.save_file_anchor_set_locked(&AnchorSet {
+                    version: ANCHORS_VERSION,
+                    anchors,
+                })?,
+            }
         }
         write_backend_marker(&store.data_dir, store.anchor_backend)?;
         Ok(store)
@@ -530,21 +606,13 @@ impl Store {
             .ok_or_else(|| "OS secure storage is not available in this build".to_string())
     }
 
-    fn load_anchor_set_locked(&self) -> StoreResult<AnchorSet> {
-        let bytes = match self.anchor_backend {
-            AnchorBackend::SecureStorage => self
-                .secure_storage()?
-                .load(&self.anchor_account)
-                .map_err(|e| format!("could not read rollback anchors: {e}"))?
-                .unwrap_or_default(),
-            AnchorBackend::DegradedFile => {
-                let path = self.anchors_path();
-                if path.exists() {
-                    read_bounded_file(&path, 4 * 1024 * 1024, "state anchor file")?
-                } else {
-                    Vec::new()
-                }
-            }
+    /// The degraded file's anchor set (caller holds `lock.anchors`).
+    fn load_file_anchor_set_locked(&self) -> StoreResult<AnchorSet> {
+        let path = self.anchors_path();
+        let bytes = if path.exists() {
+            read_bounded_file(&path, 4 * 1024 * 1024, "state anchor file")?
+        } else {
+            Vec::new()
         };
         if bytes.is_empty() {
             return Ok(AnchorSet {
@@ -559,18 +627,148 @@ impl Store {
         Ok(set)
     }
 
-    fn save_anchor_set_locked(&self, set: &AnchorSet) -> StoreResult<()> {
+    fn save_file_anchor_set_locked(&self, set: &AnchorSet) -> StoreResult<()> {
         let bytes = filesec_core::codec::to_vec(set).map_err(err)?;
+        let final_path = self.anchors_path();
+        let tmp = self.data_dir.join(".state-anchors.tmp");
+        write_private_atomic(&tmp, &final_path, &bytes)
+    }
+
+    /// Read one object's anchor, whichever backend holds it (caller holds
+    /// `lock.anchors`).
+    fn get_anchor_locked(
+        &self,
+        object_type: StateObjectType,
+        object_id: &str,
+    ) -> StoreResult<Option<StateAnchor>> {
+        match self.anchor_backend {
+            AnchorBackend::SecureStorage => {
+                let account = object_anchor_account(&self.anchor_account, object_type, object_id);
+                let Some(bytes) = self
+                    .secure_storage()?
+                    .load(&account)
+                    .map_err(|e| format!("could not read rollback anchors: {e}"))?
+                else {
+                    return Ok(None);
+                };
+                let record: ObjectAnchorRecord =
+                    filesec_core::codec::from_slice(&bytes).map_err(err)?;
+                if record.version != OBJECT_ANCHOR_VERSION
+                    || record.anchor.object_type != object_type
+                    || record.anchor.object_id != object_id
+                {
+                    return Err(format!(
+                        "malformed rollback anchor record for {object_type} {object_id}"
+                    ));
+                }
+                Ok(Some(record.anchor))
+            }
+            AnchorBackend::DegradedFile => Ok(self
+                .load_file_anchor_set_locked()?
+                .anchors
+                .into_iter()
+                .find(|a| a.object_type == object_type && a.object_id == object_id)),
+        }
+    }
+
+    /// Create or replace one object's anchor (caller holds `lock.anchors`).
+    fn put_anchor_locked(&self, anchor: &StateAnchor) -> StoreResult<()> {
+        if anchor.object_id.len() > MAX_ANCHOR_OBJECT_ID {
+            return Err("state object id is too long to anchor".into());
+        }
+        match self.anchor_backend {
+            AnchorBackend::SecureStorage => {
+                let bytes = filesec_core::codec::to_vec(&ObjectAnchorRecord {
+                    version: OBJECT_ANCHOR_VERSION,
+                    anchor: anchor.clone(),
+                })
+                .map_err(err)?;
+                if bytes.len() > MAX_SECURE_ANCHOR_RECORD {
+                    return Err("rollback anchor record exceeds the secure-storage limit".into());
+                }
+                let account = object_anchor_account(
+                    &self.anchor_account,
+                    anchor.object_type,
+                    &anchor.object_id,
+                );
+                self.secure_storage()?
+                    .save(&account, &bytes)
+                    .map_err(|e| format!("could not save rollback anchors: {e}"))
+            }
+            AnchorBackend::DegradedFile => {
+                let mut set = self.load_file_anchor_set_locked()?;
+                match set.anchors.iter_mut().find(|a| {
+                    a.object_type == anchor.object_type && a.object_id == anchor.object_id
+                }) {
+                    Some(existing) => *existing = anchor.clone(),
+                    None => set.anchors.push(anchor.clone()),
+                }
+                self.save_file_anchor_set_locked(&set)
+            }
+        }
+    }
+
+    /// Remove one object's anchor (caller holds `lock.anchors`).
+    #[cfg_attr(not(feature = "pqc"), allow(dead_code))]
+    fn delete_anchor_locked(
+        &self,
+        object_type: StateObjectType,
+        object_id: &str,
+    ) -> StoreResult<()> {
         match self.anchor_backend {
             AnchorBackend::SecureStorage => self
                 .secure_storage()?
-                .save(&self.anchor_account, &bytes)
-                .map_err(|e| format!("could not save rollback anchors: {e}")),
+                .delete(&object_anchor_account(
+                    &self.anchor_account,
+                    object_type,
+                    object_id,
+                ))
+                .map_err(|e| format!("could not update rollback anchors: {e}")),
             AnchorBackend::DegradedFile => {
-                let final_path = self.anchors_path();
-                let tmp = self.data_dir.join(".state-anchors.tmp");
-                write_private_atomic(&tmp, &final_path, &bytes)
+                let mut set = self.load_file_anchor_set_locked()?;
+                set.anchors
+                    .retain(|a| a.object_type != object_type || a.object_id != object_id);
+                self.save_file_anchor_set_locked(&set)
             }
+        }
+    }
+
+    /// Convert a store whose secure storage still holds the legacy layout (one
+    /// record with every anchor, which outgrows Windows Credential Manager's
+    /// 2,560-byte limit after a handful of vaults) into one bounded record per
+    /// object plus a small root record. Idempotent: an interruption leaves the
+    /// legacy root in place and the conversion simply runs again.
+    fn upgrade_secure_anchor_layout(&self) -> StoreResult<()> {
+        if self.anchor_backend != AnchorBackend::SecureStorage {
+            return Ok(());
+        }
+        let _guard = self
+            .lock
+            .anchors
+            .lock()
+            .map_err(|_| "state anchor lock is unavailable".to_string())?;
+        let storage = self.secure_storage()?;
+        let Some(bytes) = storage
+            .load(&self.anchor_account)
+            .map_err(|e| format!("could not read rollback anchors: {e}"))?
+        else {
+            return Err(format!(
+                "{ANCHOR_RECOVERY_REQUIRED}: the anchor root record disappeared from OS secure storage"
+            ));
+        };
+        let probe: AnchorVersionProbe = filesec_core::codec::from_slice(&bytes).map_err(err)?;
+        match probe.version {
+            ANCHOR_ROOT_VERSION => Ok(()),
+            ANCHORS_VERSION => {
+                let legacy: AnchorSet = filesec_core::codec::from_slice(&bytes).map_err(err)?;
+                for anchor in &legacy.anchors {
+                    self.put_anchor_locked(anchor)?;
+                }
+                storage
+                    .save(&self.anchor_account, &encode_root_record()?)
+                    .map_err(|e| format!("could not save rollback anchors: {e}"))
+            }
+            _ => Err("unsupported state anchor format".into()),
         }
     }
 
@@ -658,17 +856,11 @@ impl Store {
             .anchors
             .lock()
             .map_err(|_| "state anchor lock is unavailable".to_string())?;
-        let set = self.load_anchor_set_locked()?;
-        let any = set
-            .anchors
-            .iter()
-            .find(|a| a.object_type == object_type && a.object_id == object_id);
-        match any {
+        match self.get_anchor_locked(object_type, object_id)? {
             Some(anchor) if anchor.identity_fingerprint != identity_fingerprint => Err(format!(
                 "state-anchor mismatch for {object_type} {object_id}: it belongs to a different identity"
             )),
-            Some(anchor) => Ok(Some(anchor.clone())),
-            None => Ok(None),
+            other => Ok(other),
         }
     }
 
@@ -679,23 +871,12 @@ impl Store {
                 .anchors
                 .lock()
                 .map_err(|_| "state anchor lock is unavailable".to_string())?;
-            let mut set = self.load_anchor_set_locked()?;
-            let position = set
-                .anchors
-                .iter()
-                .position(|a| a.object_type == state.object_type && a.object_id == state.object_id);
-            let should_update = match position {
-                Some(i) => set.anchors[i].check_candidate(state).map_err(err)?,
+            let should_update = match self.get_anchor_locked(state.object_type, &state.object_id)? {
+                Some(anchor) => anchor.check_candidate(state).map_err(err)?,
                 None => true,
             };
             if should_update {
-                let anchor = StateAnchor::from_metadata(state);
-                if let Some(i) = position {
-                    set.anchors[i] = anchor;
-                } else {
-                    set.anchors.push(anchor);
-                }
-                self.save_anchor_set_locked(&set)?;
+                self.put_anchor_locked(&StateAnchor::from_metadata(state))?;
             }
             Ok(())
         })();
@@ -711,12 +892,7 @@ impl Store {
             .anchors
             .lock()
             .map_err(|_| "state anchor lock is unavailable".to_string())?;
-        let set = self.load_anchor_set_locked()?;
-        if let Some(anchor) = set
-            .anchors
-            .iter()
-            .find(|a| a.object_type == state.object_type && a.object_id == state.object_id)
-        {
+        if let Some(anchor) = self.get_anchor_locked(state.object_type, &state.object_id)? {
             anchor.check_candidate(state).map_err(err)?;
         }
         Ok(())
@@ -1044,8 +1220,16 @@ impl Store {
             .map_err(err)?;
             let state = reader
                 .state_metadata()
+                .cloned()
                 .ok_or_else(|| "new vault has no rollback-protection metadata".to_string())?;
-            self.commit_state(state)
+            drop(reader);
+            // A vault whose anchor could not be recorded was never created as
+            // far as the caller knows; don't leave an unanchored directory.
+            if let Err(e) = self.commit_state(&state) {
+                wipe_vault_dir(&dir);
+                return Err(e);
+            }
+            Ok(())
         })
     }
 
@@ -1380,7 +1564,12 @@ impl Store {
                     return Err(err(e));
                 }
             };
-            self.commit_vault_reader(&imported)
+            if let Err(e) = self.commit_vault_reader(&imported) {
+                drop(imported);
+                wipe_vault_dir(&dir);
+                return Err(e);
+            }
+            Ok(())
         })
     }
 
@@ -1572,10 +1761,24 @@ impl Store {
             .anchors
             .lock()
             .map_err(|_| "state anchor lock is unavailable".to_string())?;
-        let mut set = self.load_anchor_set_locked()?;
-        set.anchors
-            .retain(|anchor| anchor.identity_fingerprint != old.fingerprint());
-        self.save_anchor_set_locked(&set)
+        let mut objects = vec![
+            (StateObjectType::Keystore, KEYSTORE_OBJECT_ID.to_string()),
+            (StateObjectType::Contacts, "contacts".to_string()),
+            (StateObjectType::Registry, "registry".to_string()),
+        ];
+        objects.extend(
+            self.v2_vaults()
+                .into_iter()
+                .map(|(id, _)| (StateObjectType::VaultManifest, id)),
+        );
+        for (object_type, object_id) in objects {
+            if let Some(anchor) = self.get_anchor_locked(object_type, &object_id)? {
+                if anchor.identity_fingerprint == old.fingerprint() {
+                    self.delete_anchor_locked(object_type, &object_id)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Migrate a classical identity to a hybrid (post-quantum) one, re-encrypting
@@ -1783,7 +1986,7 @@ fn select_anchor_backend(
     Ok(backend)
 }
 
-/// Write an empty anchor set to secure storage so the store's backend is
+/// Write the root record to secure storage so the store's backend is
 /// recorded outside the data directory before any protected state exists. A
 /// fresh store whose secure storage refuses the write falls back to degraded
 /// file anchors (exactly as if secure storage were absent); with protected
@@ -1793,11 +1996,7 @@ fn establish_secure_anchor_record(
     account: &str,
     protected_state: bool,
 ) -> StoreResult<AnchorBackend> {
-    let empty = AnchorSet {
-        version: ANCHORS_VERSION,
-        anchors: Vec::new(),
-    };
-    let bytes = filesec_core::codec::to_vec(&empty).map_err(err)?;
+    let bytes = encode_root_record()?;
     match secure.map(|s| s.save(account, &bytes)) {
         Some(Ok(())) => Ok(AnchorBackend::SecureStorage),
         Some(Err(_)) | None if !protected_state => Ok(AnchorBackend::DegradedFile),

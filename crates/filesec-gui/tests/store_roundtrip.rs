@@ -7,13 +7,38 @@ use filesec_core::kdf::KdfParams;
 use filesec_core::keystore::{KeystoreFile, PasskeyEnrollment, DEVICE_TOKEN_LEN, HMAC_SECRET_LEN};
 use filesec_core::state::{StateAnchor, StateObjectType};
 use filesec_core::vault::Vault;
+use filesec_gui::anchors::{MemoryAnchorStorage, SecureAnchorStorage};
 use filesec_gui::prefs::{Prefs, ThemeChoice};
 use filesec_gui::store::{
     extract_vault, make_readonly, new_vault_id, secure_wipe, Registry, Store, VaultMeta,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use zeroize::Zeroizing;
+
+/// One in-memory "OS keychain" per data directory, shared by every reopen of
+/// that directory in this test process — so rollback anchors persist across
+/// `Store` instances exactly as they would in a real keychain, without writing
+/// test records into the developer's login keychain.
+fn keychain_for(dir: &Path) -> Arc<MemoryAnchorStorage> {
+    static KEYCHAINS: OnceLock<Mutex<HashMap<PathBuf, Arc<MemoryAnchorStorage>>>> = OnceLock::new();
+    std::fs::create_dir_all(dir).unwrap();
+    let key = std::fs::canonicalize(dir).unwrap();
+    KEYCHAINS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+fn store_at(dir: &Path) -> Store {
+    let secure: Arc<dyn SecureAnchorStorage> = keychain_for(dir);
+    Store::at_with_secure_storage(dir, Some(secure)).unwrap()
+}
 
 fn tmp() -> PathBuf {
     let suffix = filesec_core::util::hex(&filesec_core::secret::random_vec(8).unwrap());
@@ -68,44 +93,35 @@ fn quarantine_has(dir: &std::path::Path, prefix: &str) -> bool {
 }
 
 #[derive(Serialize, Deserialize)]
-struct TestAnchorSet {
+struct TestObjectAnchorRecord {
     version: u16,
-    anchors: Vec<StateAnchor>,
+    anchor: StateAnchor,
 }
 
-fn corrupt_anchor_hash(dir: &std::path::Path, object_type: StateObjectType) {
-    let path = dir.join(".state-anchors");
-    let from_file = path.exists();
-    let anchor_account = std::fs::canonicalize(dir)
-        .unwrap_or_else(|_| dir.to_path_buf())
-        .display()
-        .to_string();
-    let bytes = if from_file {
-        std::fs::read(&path).unwrap()
-    } else {
-        filesec_gui::autounlock::load_state_anchors(&anchor_account)
-            .unwrap()
-            .expect("secure object anchors")
-    };
-    let mut set: TestAnchorSet = filesec_core::codec::from_slice(&bytes).unwrap();
-    let anchor = set
-        .anchors
-        .iter_mut()
-        .find(|anchor| anchor.object_type == object_type)
-        .expect("object anchor");
-    anchor.current_state_hash[0] ^= 1;
-    let bytes = filesec_core::codec::to_vec(&set).unwrap();
-    if from_file {
-        std::fs::write(path, bytes).unwrap();
-    } else {
-        filesec_gui::autounlock::save_state_anchors(&anchor_account, &bytes).unwrap();
+/// Flip one bit of the anchored hash for `object_type`, in the per-object
+/// secure-storage record that holds it.
+fn corrupt_anchor_hash(dir: &Path, object_type: StateObjectType) {
+    let keychain = keychain_for(dir);
+    for (account, bytes) in keychain.snapshot() {
+        let Ok(mut record) = filesec_core::codec::from_slice::<TestObjectAnchorRecord>(&bytes)
+        else {
+            continue;
+        };
+        if record.anchor.object_type == object_type {
+            record.anchor.current_state_hash[0] ^= 1;
+            keychain
+                .save(&account, &filesec_core::codec::to_vec(&record).unwrap())
+                .unwrap();
+            return;
+        }
     }
+    panic!("no anchor for {object_type}");
 }
 
 #[test]
 fn full_persistence_roundtrip() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     assert!(!store.keystore_exists());
 
     // Keystore create / load / unlock.
@@ -157,7 +173,7 @@ fn full_persistence_roundtrip() {
 
     // A fresh store yields empty defaults.
     let dir2 = tmp();
-    let store2 = Store::at(&dir2).unwrap();
+    let store2 = store_at(&dir2);
     assert_eq!(store2.load_registry(&id).unwrap().vaults.len(), 0);
     assert!(store2.load_contacts(&id).unwrap().contacts.is_empty());
 
@@ -180,7 +196,7 @@ fn full_persistence_roundtrip() {
 #[test]
 fn keystore_rollback_is_rejected_and_quarantined() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let identity = Identity::generate("Alice", 0).unwrap();
     let passphrase = b"correct horse battery staple";
     let mut keystore = KeystoreFile::create(&identity, passphrase, fast_kdf()).unwrap();
@@ -206,7 +222,7 @@ fn keystore_rollback_is_rejected_and_quarantined() {
 #[test]
 fn device_token_roundtrips_through_the_store_and_is_rollback_protected() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let id = Identity::generate("Alice", 0).unwrap();
     let pass = b"correct horse battery staple";
     let mut ks = KeystoreFile::create(&id, pass, fast_kdf()).unwrap();
@@ -253,7 +269,7 @@ fn device_token_roundtrips_through_the_store_and_is_rollback_protected() {
 #[test]
 fn contact_trust_rollback_is_rejected_and_quarantined() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let owner = Identity::generate("Owner", 0).unwrap();
     let contact = Identity::generate("Contact", 0).unwrap();
     let fingerprint = contact.fingerprint();
@@ -276,7 +292,7 @@ fn contact_trust_rollback_is_rejected_and_quarantined() {
 #[test]
 fn registry_rollback_is_rejected_and_quarantined() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let owner = Identity::generate("Owner", 0).unwrap();
     let mut registry = Registry::default();
     registry.upsert(VaultMeta {
@@ -303,7 +319,7 @@ fn registry_rollback_is_rejected_and_quarantined() {
 #[test]
 fn vault_manifest_rollback_is_rejected_and_quarantined() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let owner = Identity::generate("Owner", 0).unwrap();
     let vault_id = new_vault_id().unwrap();
     let mut vault = Vault::new("Docs", 1);
@@ -345,7 +361,7 @@ fn vault_manifest_rollback_is_rejected_and_quarantined() {
 fn same_epoch_hash_mismatches_fail_for_every_anchored_object() {
     // Keystore.
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let owner = Identity::generate("Owner", 0).unwrap();
     store
         .save_keystore(&KeystoreFile::create(&owner, b"strong passphrase", fast_kdf()).unwrap())
@@ -357,7 +373,7 @@ fn same_epoch_hash_mismatches_fail_for_every_anchored_object() {
 
     // Contacts.
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     store
         .save_contacts(&owner, &ContactBook::default())
         .unwrap();
@@ -368,7 +384,7 @@ fn same_epoch_hash_mismatches_fail_for_every_anchored_object() {
 
     // Registry.
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     store.save_registry(&owner, &Registry::default()).unwrap();
     corrupt_anchor_hash(&dir, StateObjectType::Registry);
     let error = store.load_registry(&owner).err().unwrap();
@@ -377,7 +393,7 @@ fn same_epoch_hash_mismatches_fail_for_every_anchored_object() {
 
     // Vault manifest.
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let vault_id = new_vault_id().unwrap();
     store
         .save_vault(&owner, &vault_id, &Vault::new("Docs", 0))
@@ -391,7 +407,7 @@ fn same_epoch_hash_mismatches_fail_for_every_anchored_object() {
 #[test]
 fn legacy_local_v1_vault_opens_only_through_explicit_recovery() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let owner = Identity::generate("Owner", 0).unwrap();
     let vault_id = new_vault_id().unwrap();
     let mut vault = Vault::new("Legacy", 1);
@@ -423,7 +439,7 @@ fn legacy_local_v1_vault_opens_only_through_explicit_recovery() {
 #[test]
 fn valid_vault_directory_cannot_be_substituted_at_another_vault_id() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let owner = Identity::generate("Owner", 0).unwrap();
     let first_id = new_vault_id().unwrap();
     let second_id = new_vault_id().unwrap();
@@ -447,7 +463,7 @@ fn valid_vault_directory_cannot_be_substituted_at_another_vault_id() {
 #[test]
 fn replace_file_in_vault_roundtrip() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let id = Identity::generate("Alice", 0).unwrap();
     let vid = new_vault_id().unwrap();
     let mut v = Vault::new("Docs", 10);
@@ -512,7 +528,7 @@ fn secure_wipe_handles_readonly_view_temp() {
 #[test]
 fn create_private_checkout_file_is_hardened_and_keeps_only_the_extension() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let path = store.create_private_checkout_file("notes.md").unwrap();
     assert!(path.exists());
     assert!(path.starts_with(store.checkout_dir()));
@@ -536,7 +552,7 @@ fn create_private_checkout_file_is_hardened_and_keeps_only_the_extension() {
 #[test]
 fn clean_checkout_dir_removes_stale_files() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let stale = store.create_private_checkout_file("leftover.txt").unwrap();
     std::fs::write(&stale, b"orphaned plaintext").unwrap();
     assert!(stale.exists());
@@ -564,7 +580,7 @@ fn migrate_classical_store_to_post_quantum() {
     use filesec_core::SuiteId;
 
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let pass = b"correct horse battery staple";
 
     // Start with a classical identity and a populated, classical-at-rest store.
@@ -644,7 +660,7 @@ fn migrate_classical_store_to_post_quantum() {
 #[test]
 fn prefs_default_when_absent_and_survive_a_restart() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
 
     // Nothing written yet: follow the system, as every build before this did.
     assert_eq!(store.load_prefs(), Prefs::default());
@@ -658,7 +674,7 @@ fn prefs_default_when_absent_and_survive_a_restart() {
         .unwrap();
 
     // A *fresh* Store proves this came off disk rather than out of memory.
-    let reopened = Store::at(&dir).unwrap();
+    let reopened = store_at(&dir);
     assert_eq!(reopened.load_prefs().theme, ThemeChoice::Dark);
 
     #[cfg(unix)]
@@ -677,7 +693,7 @@ fn prefs_default_when_absent_and_survive_a_restart() {
 #[test]
 fn every_theme_choice_survives_a_restart() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     for choice in ThemeChoice::ALL {
         store
             .save_prefs(&Prefs {
@@ -686,7 +702,7 @@ fn every_theme_choice_survives_a_restart() {
             })
             .unwrap();
         assert_eq!(
-            Store::at(&dir).unwrap().load_prefs().theme,
+            store_at(&dir).load_prefs().theme,
             choice,
             "{choice:?} did not survive"
         );
@@ -697,7 +713,7 @@ fn every_theme_choice_survives_a_restart() {
 #[test]
 fn corrupt_or_future_prefs_fall_back_to_defaults() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
 
     // Not CBOR at all.
     std::fs::write(dir.join(".prefs"), b"this is not cbor").unwrap();
@@ -732,7 +748,7 @@ fn corrupt_or_future_prefs_fall_back_to_defaults() {
 #[test]
 fn oversized_prefs_are_rejected_without_reading_them() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     std::fs::write(dir.join(".prefs"), vec![0u8; 128 * 1024]).unwrap();
     assert_eq!(store.load_prefs(), Prefs::default());
     let _ = std::fs::remove_dir_all(&dir);
@@ -741,7 +757,7 @@ fn oversized_prefs_are_rejected_without_reading_them() {
 #[test]
 fn corrupt_v2_vault_does_not_destroy_the_legacy_recovery_copy() {
     let dir = tmp();
-    let store = Store::at(&dir).unwrap();
+    let store = store_at(&dir);
     let identity = Identity::generate("Owner", 1).unwrap();
     let id = new_vault_id().unwrap();
     let mut vault = Vault::new("Recovery", 1);

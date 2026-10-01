@@ -193,7 +193,10 @@ signed by the identity; contacts/registry live inside authenticated self-encrypt
 containers; v2 manifest state is bound into its manifest AEAD.
 
 FileSec stores the latest accepted high-water anchors in the OS secure store
-when the `keyring` feature/backend is available. An older valid state, a
+when the `keyring` feature/backend is available, as one small record per
+protected object plus a root record per data directory (so the number of vaults
+is not limited by a per-credential size cap such as Windows Credential
+Manager's 2,560 bytes). An older valid state, a
 different hash at the same epoch, or a broken successor chain is rejected and
 moved into the data directory's `quarantine/` folder instead of opening. Legacy
 state is never migrated silently: the unlock screen presents a clearly marked

@@ -260,3 +260,110 @@ fn recovery_without_secure_storage_falls_back_to_degraded_file_anchors() {
     assert_eq!(store.load_contacts(&identity).unwrap().contacts.len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn many_vaults_fit_a_capacity_limited_secure_store() {
+    // Windows Credential Manager caps one credential blob at 2,560 bytes; the
+    // old single-record layout overflowed it after about ten vaults (FS-06).
+    const WINDOWS_CREDENTIAL_BLOB_LIMIT: usize = 2560;
+    let dir = tmp();
+    let secure = Arc::new(MemoryAnchorStorage::with_record_capacity(
+        WINDOWS_CREDENTIAL_BLOB_LIMIT,
+    ));
+    let store = open(&dir, &secure).unwrap();
+    let identity = Identity::generate("Alice", 0).unwrap();
+    store
+        .save_keystore(&KeystoreFile::create(&identity, PASS, fast_kdf()).unwrap())
+        .unwrap();
+    store
+        .save_contacts(&identity, &ContactBook::default())
+        .unwrap();
+    let mut registry = Registry::default();
+    for n in 0..64 {
+        let id = new_vault_id().unwrap();
+        store
+            .save_vault(&identity, &id, &Vault::new(format!("Vault {n}"), 1))
+            .unwrap();
+        registry.upsert(VaultMeta {
+            id,
+            name: format!("Vault {n}"),
+            created_at: 1,
+            modified_at: 1,
+            file_count: 0,
+            total_size: 0,
+        });
+    }
+    store.save_registry(&identity, &registry).unwrap();
+    assert!(secure.len() >= 64 + 4);
+    assert!(secure.largest_record() <= WINDOWS_CREDENTIAL_BLOB_LIMIT);
+    drop(store);
+
+    let store = open(&dir, &secure).unwrap();
+    store.load_keystore().unwrap();
+    for meta in &store.load_registry(&identity).unwrap().vaults {
+        store.open_vault(&identity, &meta.id).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_anchor_commit_leaves_no_unanchored_vault_directory() {
+    let dir = tmp();
+    let secure = Arc::new(MemoryAnchorStorage::new());
+    let store = open(&dir, &secure).unwrap();
+    let identity = Identity::generate("Alice", 0).unwrap();
+    let id = new_vault_id().unwrap();
+    secure.set_fail_saves(true);
+    assert!(store
+        .save_vault(&identity, &id, &Vault::new("Docs", 1))
+        .is_err());
+    secure.set_fail_saves(false);
+    assert!(!dir.join("vaults").join(format!("{id}.fsv2")).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_single_record_secure_layout_is_upgraded_in_place() {
+    #[derive(serde::Serialize)]
+    struct LegacyAnchorSet {
+        version: u16,
+        anchors: Vec<filesec_core::state::StateAnchor>,
+    }
+
+    // Build state with file anchors, then move them into secure storage in
+    // the pre-FS-06 layout: one record holding every anchor.
+    let dir = tmp();
+    let store = Store::at_with_secure_storage(&dir, None).unwrap();
+    let identity = Identity::generate("Alice", 0).unwrap();
+    let mut ks = KeystoreFile::create(&identity, PASS, fast_kdf()).unwrap();
+    store.save_keystore(&ks).unwrap();
+    let stale = std::fs::read(dir.join("keystore.fsk")).unwrap();
+    ks.set_device_token(PASS, &[3u8; 32]).unwrap();
+    store.save_keystore(&ks).unwrap();
+    drop(store);
+    let account = std::fs::canonicalize(&dir).unwrap().display().to_string();
+    let legacy = LegacyAnchorSet {
+        version: 1,
+        anchors: vec![filesec_core::state::StateAnchor::from_metadata(
+            ks.state_metadata().unwrap(),
+        )],
+    };
+    let secure = Arc::new(MemoryAnchorStorage::new());
+    secure
+        .save(&account, &filesec_core::codec::to_vec(&legacy).unwrap())
+        .unwrap();
+    std::fs::remove_file(dir.join(".state-anchors")).unwrap();
+    std::fs::write(dir.join(".state-anchor-backend"), b"secure-v1\n").unwrap();
+
+    let store = open(&dir, &secure).unwrap();
+    assert_eq!(store.anchor_protection(), AnchorProtection::SecureStorage);
+    assert_eq!(secure.len(), 2, "root + one object record");
+    store.load_keystore().unwrap();
+    std::fs::write(dir.join("keystore.fsk"), &stale).unwrap();
+    let error = store
+        .load_keystore()
+        .err()
+        .expect("rollback must be detected");
+    assert!(error.contains("rollback detected"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
