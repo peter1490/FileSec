@@ -85,6 +85,37 @@ const BASE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Idle time after which a peer's failure record is forgotten.
 const FORGET_AFTER: Duration = Duration::from_secs(300);
+/// Hard ceiling on tracked peers (FS-17). Time-based pruning alone bounds how
+/// long a record lives, not how many exist: a sustained churn of real source
+/// addresses could otherwise grow the map with the arrival rate. A record is
+/// ~64 bytes, so this caps the table at a few hundred KiB.
+const MAX_TRACKED_PEERS: usize = 4096;
+
+/// The unit a failure is charged to. IPv4 addresses (and IPv4-mapped IPv6)
+/// count individually; IPv6 addresses are aggregated to their /64, the block a
+/// single host or customer is typically assigned — otherwise one machine could
+/// rotate through 2^64 addresses to dodge its backoff and flood the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PeerKey {
+    V4(std::net::Ipv4Addr),
+    V6Prefix64([u8; 8]),
+}
+
+impl PeerKey {
+    fn of(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::V4(v4),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => Self::V4(v4),
+                None => {
+                    let mut prefix = [0u8; 8];
+                    prefix.copy_from_slice(&v6.octets()[..8]);
+                    Self::V6Prefix64(prefix)
+                }
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Record {
@@ -100,7 +131,7 @@ struct Record {
 /// peer's record; repeated failures back it off exponentially.
 #[derive(Default)]
 pub struct RateLimiter {
-    peers: HashMap<IpAddr, Record>,
+    peers: HashMap<PeerKey, Record>,
 }
 
 impl RateLimiter {
@@ -110,7 +141,7 @@ impl RateLimiter {
 
     /// Whether a connection from `ip` should be accepted right now.
     pub fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
-        match self.peers.get(&ip) {
+        match self.peers.get(&PeerKey::of(ip)) {
             Some(rec) => match rec.blocked_until {
                 Some(until) => now >= until,
                 None => true,
@@ -121,7 +152,11 @@ impl RateLimiter {
 
     /// Record a failed handshake from `ip`, extending its backoff.
     pub fn record_failure(&mut self, ip: IpAddr, now: Instant) {
-        let rec = self.peers.entry(ip).or_insert(Record {
+        let key = PeerKey::of(ip);
+        if !self.peers.contains_key(&key) && self.peers.len() >= MAX_TRACKED_PEERS {
+            self.make_room(now);
+        }
+        let rec = self.peers.entry(key).or_insert(Record {
             failures: 0,
             blocked_until: None,
             last_seen: now,
@@ -141,7 +176,31 @@ impl RateLimiter {
 
     /// Clear a peer's record after a successful, authenticated handshake.
     pub fn record_success(&mut self, ip: IpAddr) {
-        self.peers.remove(&ip);
+        self.peers.remove(&PeerKey::of(ip));
+    }
+
+    /// Free room at the cardinality ceiling: forget expired records first,
+    /// then, if the table is still full, the least recently seen eighth — in
+    /// one pass, so a churn of new addresses costs amortized O(log n) each.
+    fn make_room(&mut self, now: Instant) {
+        self.prune(now);
+        if self.peers.len() < MAX_TRACKED_PEERS {
+            return;
+        }
+        let mut by_age: Vec<(Instant, PeerKey)> = self
+            .peers
+            .iter()
+            .map(|(key, rec)| (rec.last_seen, *key))
+            .collect();
+        by_age.sort_unstable_by_key(|(seen, _)| *seen);
+        for (_, key) in by_age.into_iter().take(MAX_TRACKED_PEERS / 8) {
+            self.peers.remove(&key);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.peers.len()
     }
 
     /// Drop records for peers not seen within [`FORGET_AFTER`], so the map cannot
@@ -153,7 +212,10 @@ impl RateLimiter {
 
     #[cfg(test)]
     fn failure_count(&self, ip: IpAddr) -> u32 {
-        self.peers.get(&ip).map(|r| r.failures).unwrap_or(0)
+        self.peers
+            .get(&PeerKey::of(ip))
+            .map(|r| r.failures)
+            .unwrap_or(0)
     }
 }
 
@@ -236,5 +298,47 @@ mod tests {
         rl.record_failure(ip(3), t0);
         rl.prune(t0 + FORGET_AFTER + Duration::from_secs(1));
         assert_eq!(rl.failure_count(ip(3)), 0);
+    }
+
+    /// FS-17: a sustained churn of distinct source addresses cannot grow the
+    /// table past its ceiling, and the newest offenders stay tracked.
+    #[test]
+    fn unique_address_churn_is_bounded() {
+        let mut rl = RateLimiter::new();
+        let t0 = Instant::now();
+        for n in 0..50_000u32 {
+            let addr = IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + n));
+            rl.record_failure(addr, t0 + Duration::from_micros(u64::from(n)));
+            assert!(rl.len() <= MAX_TRACKED_PEERS);
+        }
+        assert!(rl.len() > MAX_TRACKED_PEERS / 2);
+        let newest = IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + 49_999));
+        assert_eq!(rl.failure_count(newest), 1, "recent peers are kept");
+        let oldest = IpAddr::V4(Ipv4Addr::from(0x0A00_0000u32));
+        assert_eq!(rl.failure_count(oldest), 0, "the least recent was evicted");
+    }
+
+    #[test]
+    fn ipv6_is_aggregated_to_its_slash_64_and_mapped_v4_to_v4() {
+        use std::net::Ipv6Addr;
+        let mut rl = RateLimiter::new();
+        let t0 = Instant::now();
+        for host in 0..FAILURE_THRESHOLD as u16 {
+            let addr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, host + 1));
+            rl.record_failure(addr, t0);
+        }
+        // A fresh host in the same /64 inherits the block; another /64 does not.
+        let same = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 9, 9, 9, 9));
+        let other = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1));
+        assert!(!rl.allow(same, t0));
+        assert!(rl.allow(other, t0));
+        assert_eq!(rl.len(), 1);
+
+        let mapped = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped());
+        rl.record_failure(mapped, t0);
+        assert_eq!(
+            rl.failure_count(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+            1
+        );
     }
 }
