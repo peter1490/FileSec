@@ -124,25 +124,67 @@ fn build_bundle(identity: &Identity) -> SecretBundle {
 }
 
 /// Reconstruct an [`Identity`] from a decrypted bundle, then wipe the bundle.
-fn bundle_into_identity(mut bundle: SecretBundle) -> Identity {
-    // Re-pair each PQC public with its seed; a half-present pair (which a
-    // well-formed keystore never produces) degrades to a classical identity.
-    let pair = |public: &Option<Vec<u8>>, seed: &Option<Vec<u8>>| match (public, seed) {
-        (Some(p), Some(s)) => Some((p.clone(), s.clone())),
-        _ => None,
-    };
-    let mldsa = pair(&bundle.mldsa_public, &bundle.mldsa_seed);
-    let mlkem = pair(&bundle.mlkem_public, &bundle.mlkem_seed);
-    let identity = Identity::from_parts(
-        bundle.name.clone(),
-        bundle.created_at,
-        bundle.sign_secret,
-        bundle.kem_secret,
-        mldsa,
-        mlkem,
-    );
+///
+/// Each post-quantum key must be complete and self-consistent: a public key
+/// without its seed (or the reverse), a public key that does not match the
+/// one its seed derives, or only one of the two post-quantum algorithms is
+/// rejected with [`Error::Format`]. Such a bundle can only come from a crafted
+/// (still authenticated) backup or keystore; silently dropping or accepting the
+/// mismatched half would yield an identity that later fails hybrid operations.
+fn bundle_into_identity(mut bundle: SecretBundle) -> Result<Identity> {
+    let checked = check_pqc_pairs(&bundle);
+    let result = checked.map(|(mldsa, mlkem)| {
+        Identity::from_parts(
+            bundle.name.clone(),
+            bundle.created_at,
+            bundle.sign_secret,
+            bundle.kem_secret,
+            mldsa,
+            mlkem,
+        )
+    });
     bundle.zeroize();
-    identity
+    result
+}
+
+type PqcPair = Option<(Vec<u8>, Vec<u8>)>;
+
+/// Validate the bundle's post-quantum key pairs; see [`bundle_into_identity`].
+fn check_pqc_pairs(bundle: &SecretBundle) -> Result<(PqcPair, PqcPair)> {
+    let pair = |public: &Option<Vec<u8>>, seed: &Option<Vec<u8>>| match (public, seed) {
+        (Some(p), Some(s)) => Ok(Some((p.clone(), s.clone()))),
+        (None, None) => Ok(None),
+        _ => Err(Error::Format(
+            "incomplete post-quantum key pair in identity",
+        )),
+    };
+    let mldsa = pair(&bundle.mldsa_public, &bundle.mldsa_seed)?;
+    let mlkem = pair(&bundle.mlkem_public, &bundle.mlkem_seed)?;
+    if mldsa.is_some() != mlkem.is_some() {
+        return Err(Error::Format(
+            "identity carries only one of the two post-quantum keys",
+        ));
+    }
+    #[cfg(feature = "pqc")]
+    {
+        let derives = |public: &[u8], derived: Result<Vec<u8>>| -> Result<()> {
+            let derived = derived?;
+            if crate::secret::ct_eq(&derived, public) {
+                Ok(())
+            } else {
+                Err(Error::Format(
+                    "post-quantum public key does not match its secret seed",
+                ))
+            }
+        };
+        if let Some((public, seed)) = &mldsa {
+            derives(public, crate::mldsa::public_from_seed(seed))?;
+        }
+        if let Some((public, seed)) = &mlkem {
+            derives(public, crate::mlkem::public_from_seed(seed))?;
+        }
+    }
+    Ok((mldsa, mlkem))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +323,7 @@ fn encrypt_bundle(dek: &SymKey, identity: &Identity) -> Result<(Vec<u8>, Vec<u8>
 fn decrypt_bundle(dek: &SymKey, nonce: &[u8], ciphertext: &[u8]) -> Result<Identity> {
     let plaintext = Zeroizing::new(aead::open(dek, nonce, AAD_BUNDLE_V2, ciphertext)?);
     let bundle: SecretBundle = codec::from_slice(&plaintext)?;
-    Ok(bundle_into_identity(bundle))
+    bundle_into_identity(bundle)
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +366,7 @@ impl KeystoreV1 {
                 .map_err(|_| Error::BadPassphrase)?,
         );
         let bundle: SecretBundle = codec::from_slice(&plaintext)?;
-        Ok(bundle_into_identity(bundle))
+        bundle_into_identity(bundle)
     }
 }
 
@@ -456,7 +498,7 @@ pub fn import_identity_armored(text: &str, passphrase: &[u8]) -> Result<Identity
             .map_err(|_| Error::BadPassphrase)?,
     );
     let bundle: SecretBundle = codec::from_slice(&plaintext)?;
-    Ok(bundle_into_identity(bundle))
+    bundle_into_identity(bundle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,5 +1544,72 @@ mod tests {
             reopened.state_metadata().unwrap().identity_fingerprint,
             successor.fingerprint()
         );
+    }
+
+    /// Lower-priority audit item: an authenticated bundle whose post-quantum
+    /// keys are incomplete or inconsistent is rejected, not silently degraded
+    /// or accepted.
+    #[cfg(feature = "pqc")]
+    #[test]
+    fn inconsistent_post_quantum_pairs_are_rejected() {
+        let hybrid = Identity::generate("Alice", 0)
+            .unwrap()
+            .upgraded_to_hybrid()
+            .unwrap();
+        let other = Identity::generate("Mallory", 0)
+            .unwrap()
+            .upgraded_to_hybrid()
+            .unwrap();
+        assert!(bundle_into_identity(build_bundle(&hybrid)).is_ok());
+
+        let mut half = build_bundle(&hybrid);
+        half.mlkem_seed = None;
+        assert!(matches!(bundle_into_identity(half), Err(Error::Format(_))));
+
+        let mut one_algorithm = build_bundle(&hybrid);
+        one_algorithm.mlkem_seed = None;
+        one_algorithm.mlkem_public = None;
+        assert!(matches!(
+            bundle_into_identity(one_algorithm),
+            Err(Error::Format(_))
+        ));
+
+        let mut swapped = build_bundle(&hybrid);
+        swapped.mldsa_public = other.mldsa_public().map(<[u8]>::to_vec);
+        assert!(matches!(
+            bundle_into_identity(swapped),
+            Err(Error::Format(_))
+        ));
+
+        // End to end: a correctly passphrase-sealed backup carrying a swapped
+        // ML-KEM public key does not import.
+        let mut bundle = build_bundle(&hybrid);
+        bundle.mlkem_public = other.mlkem_public().map(<[u8]>::to_vec);
+        let params = fast_params();
+        let salt = secret::random_vec(SALT_LEN).unwrap();
+        let master = kdf::derive_master_key(b"pw", &salt, params).unwrap();
+        let nonce = secret::random_vec(aead::NONCE_LEN).unwrap();
+        let ciphertext = aead::seal(
+            &master,
+            &nonce,
+            AAD_BACKUP_V1,
+            &codec::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+        let backup = IdentityBackupV1 {
+            version: VERSION_BACKUP_V1,
+            kdf: params,
+            salt,
+            nonce,
+            ciphertext,
+        };
+        let mut framed = MAGIC_BACKUP.to_vec();
+        framed.extend_from_slice(&VERSION_BACKUP_V1.to_be_bytes());
+        framed.extend_from_slice(&codec::to_vec(&backup).unwrap());
+        let armored = data_encoding::BASE64.encode(&framed);
+        assert!(matches!(
+            import_identity_armored(&armored, b"pw"),
+            Err(Error::Format(_))
+        ));
     }
 }
