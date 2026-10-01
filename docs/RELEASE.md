@@ -40,6 +40,29 @@ detect and upgrade its predecessor.
 Never edit the version by hand: `scripts/bump-version.sh` also refreshes
 `Cargo.lock`, without which every `cargo build --locked` in CI fails.
 
+### Release gates
+
+A tag cannot publish on the strength of its build alone:
+
+- **CI for the tagged commit.** The release workflow calls the whole
+  [`ci.yml`](../.github/workflows/ci.yml) (`validate` job) for exactly the tagged
+  commit: formatting, clippy, the classical **and the shipped feature graph**
+  (`--all-features`) tests on Linux, macOS, and Windows, `cargo deny` +
+  `cargo audit`, and actionlint. `publish` needs `validate`, so a
+  commit whose CI failed — or never ran, e.g. a tag pushed off a branch — is not
+  released.
+- **Pinned toolchain and runners.** CI and releases build with one pinned Rust
+  toolchain (`RUST_TOOLCHAIN` in both workflows; bump them together) on pinned
+  runner images (`ubuntu-24.04`, `macos-15`, `windows-2025`), and the WiX
+  toolset is installed at a pinned version. `stable`/`*-latest` would let the
+  same commit build differently on a re-run.
+- **Protected `release` environment.** The `publish` job runs in the `release`
+  environment. In *Settings → Environments → release*, require at least one
+  reviewer and restrict deployments to `v*` tags; in *Settings → Rules*, protect
+  `v*` tags against update/deletion by anyone but maintainers. These are
+  repository settings, so they must be configured once by a maintainer; the
+  workflow cannot enforce them on its own.
+
 ### What gets published
 
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) is the

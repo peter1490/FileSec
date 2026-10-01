@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 7 * * 1'
+  # The release workflow calls this whole workflow for the tagged commit and
+  # will not publish unless every job here passes (FS-14).
+  workflow_call:
 
 permissions:
   contents: read
@@ -18,6 +21,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # One pinned toolchain for CI and releases (bump it in release.yml together).
+  # A floating `stable` let new lints and compiler behavior change what a
+  # given commit builds into.
+  RUST_TOOLCHAIN: 1.97.0
 
 # Supply-chain note: every third-party GitHub Action is pinned by commit SHA with
 # the human-readable version in a trailing comment, so a moved or compromised tag
@@ -25,9 +32,10 @@ env:
 # when upgrading an action. Installed cargo tools are likewise pinned by version.
 
 jobs:
-  # Classical (default) build + tests + lint on all three OSes. The bare cargo
-  # commands operate on the default workspace members (filesec-core, filesec-gui),
-  # i.e. the dependency-light classical path — filesec-pqc is excluded.
+  # Classical (default) build + tests + lint on all three OSes, then the exact
+  # shipped feature graph on all three. The bare cargo commands operate on the
+  # default workspace members (filesec-core, filesec-gui), i.e. the
+  # dependency-light classical path — filesec-pqc is excluded from those.
   test:
     timeout-minutes: 45
     name: test (${{ matrix.os }})
@@ -35,7 +43,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Pinned runner images (not *-latest) so a re-run builds on the same
+        # baseline the commit was validated on.
+        os: [ubuntu-24.04, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -46,14 +56,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
+            libudev-dev
 
       # Linux needs rustc >= 1.87 (rfd/directories -> zbus); macOS/Windows build
-      # on the 1.86 MSRV. `stable` satisfies all and the locked deps still apply.
-      # Pinned by SHA, so the toolchain channel must be named explicitly.
+      # on the 1.86 MSRV. The pinned RUST_TOOLCHAIN
+      # satisfies all and the locked deps still apply. The action is pinned by
+      # SHA, so the toolchain must be named explicitly.
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
@@ -70,6 +82,15 @@ jobs:
       - name: Test (classical)
         run: cargo test --locked
 
+      # The shipped binaries enable pqc + keyring + passkey (+ net for
+      # filesec-pqc). Test exactly that graph on every OS we ship for, not only
+      # on macOS (FS-14).
+      - name: Clippy (shipped features)
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+      - name: Test (shipped features)
+        run: cargo test --workspace --all-features --locked
+
   # Opt-in feature builds, exercised on a single OS to keep CI fast. These gate
   # the exact feature combinations that ship in the release binaries (see
   # .github/workflows/release.yml): the `filesec` binary is built with
@@ -81,12 +102,12 @@ jobs:
   features:
     timeout-minutes: 45
     name: features (release feature sets)
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
@@ -127,16 +148,16 @@ jobs:
   # deny.toml); cargo-audit is the canonical RustSec scanner run as a cross-check
   # (config in .cargo/audit.toml). Both tools are pinned by version, and their
   # accepted-advisory ignore lists are kept in lockstep. Neither reads the
-  # workspace's MSRV, so they build with the CI `stable` toolchain.
+  # workspace's MSRV, so they build with the pinned CI toolchain.
   supply-chain:
     timeout-minutes: 30
     name: supply-chain (audit, deny)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
 
       - name: Install pinned supply-chain tools
@@ -161,7 +182,7 @@ jobs:
   # structural workflow checks are the ones that matter here.
   workflows:
     name: lint workflows (actionlint)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       ACTIONLINT_VERSION: 1.7.12
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
