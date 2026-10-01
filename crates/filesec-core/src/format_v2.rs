@@ -694,10 +694,12 @@ impl VaultReaderV2 {
 
     // ----- mutations (O(change): touch one blob + reseal the manifest) -----
 
-    /// Re-serialize, re-seal (fresh nonce), and atomically rewrite the manifest,
-    /// then refresh the v1-shaped view. The single commit point of any mutation.
-    fn reseal_manifest(&mut self) -> Result<()> {
-        let pt = Zeroizing::new(codec::to_vec(&self.manifest)?);
+    /// Seal `manifest` as the successor of the current state (fresh nonce) and
+    /// atomically write it. Does **not** touch `self`: the caller adopts the
+    /// returned state only after this succeeded. An error means the rename never
+    /// happened, so the previous manifest is still the one on disk.
+    fn seal_and_write(&self, manifest: &ManifestV2) -> Result<StateMetadata> {
+        let pt = Zeroizing::new(codec::to_vec(manifest)?);
         let previous = self.state.as_ref().map(StateAnchor::from_metadata);
         let object_id = vault_object_id(&self.header_bytes)?;
         let state = StateMetadata::next(
@@ -718,6 +720,30 @@ impl VaultReaderV2 {
             ciphertext: ct,
         })?;
         write_atomic(&self.dir.join(MANIFEST_FILE), &buf)?;
+        Ok(state)
+    }
+
+    /// Re-seal and rewrite `self.manifest` in place. Only for building a fresh
+    /// vault (or re-enveloping a recovered one), where a failure discards the
+    /// whole reader anyway; mutations of an existing vault go through
+    /// [`Self::commit_edit`].
+    fn reseal_manifest(&mut self) -> Result<()> {
+        let state = self.seal_and_write(&self.manifest)?;
+        self.state = Some(state);
+        self.view = view_of(&self.manifest);
+        Ok(())
+    }
+
+    /// The single commit point of every mutation (FS-08): apply `edit` to a
+    /// **copy** of the manifest, seal and write that copy, and only then adopt
+    /// it — manifest, state, and view together. If the edit or the write fails,
+    /// the reader is exactly as it was, so a later successful mutation can
+    /// never persist an operation that was reported as failed.
+    fn commit_edit(&mut self, edit: impl FnOnce(&mut ManifestV2) -> Result<()>) -> Result<()> {
+        let mut candidate = self.manifest.clone();
+        edit(&mut candidate)?;
+        let state = self.seal_and_write(&candidate)?;
+        self.manifest = candidate;
         self.state = Some(state);
         self.view = view_of(&self.manifest);
         Ok(())
@@ -725,37 +751,13 @@ impl VaultReaderV2 {
 
     /// Push directory entries for each missing ancestor of `norm` (in memory).
     fn ensure_dirs(&mut self, norm: &str) {
-        let comps: Vec<&str> = norm.split('/').collect();
-        let mut acc = String::new();
-        for comp in comps.iter().take(comps.len().saturating_sub(1)) {
-            if !acc.is_empty() {
-                acc.push('/');
-            }
-            acc.push_str(comp);
-            if !self.manifest.entries.iter().any(|e| e.path == acc) {
-                self.manifest.entries.push(dir_entry(acc.clone()));
-            }
-        }
+        ensure_dirs_in(&mut self.manifest, norm);
     }
 
-    /// Encrypt a new blob and stage the entry **in memory** (no reseal). Returns
-    /// the old blob's `file_id` if this overwrote an existing file, so the caller
-    /// can delete it after the manifest commit. Errors (leaving memory unchanged)
-    /// if a directory already occupies `norm`.
-    fn stage_file<R: Read>(
-        &mut self,
-        norm: String,
-        blake3: [u8; 32],
-        size: u64,
-        source: R,
-        mtime: Option<i64>,
-        mode: Option<u32>,
-    ) -> Result<Option<String>> {
-        if let Some(e) = self.manifest.entries.iter().find(|e| e.path == norm) {
-            if e.kind == EntryKind::Dir {
-                return Err(Error::Vault(format!("a directory exists at {norm}")));
-            }
-        }
+    /// Encrypt `source` into a fresh, not yet referenced blob, verifying that
+    /// the bytes actually encrypted match `blake3`/`size`. On a mismatch the
+    /// blob is removed and [`Error::Auth`] returned.
+    fn write_blob<R: Read>(&self, blake3: [u8; 32], size: u64, source: R) -> Result<StagedBlob> {
         let file_id = new_file_id()?;
         let key = SymKey::random()?;
         let nonce = crate::secret::random_vec(self.suite.aead_alg().stream_nonce_len())?;
@@ -776,25 +778,70 @@ impl VaultReaderV2 {
             let _ = fs_err::remove_file(self.blob_path(&file_id));
             return Err(Error::Auth);
         }
-        // Disk write succeeded; now mutate the in-memory manifest.
-        let old = match self.manifest.entries.iter().position(|e| e.path == norm) {
-            Some(pos) => self.manifest.entries.remove(pos).file_id,
-            None => None,
-        };
-        self.ensure_dirs(&norm);
-        self.manifest.entries.push(EntryV2 {
-            path: norm,
-            kind: EntryKind::File,
+        Ok(StagedBlob {
+            file_id,
+            key: BlobKey(*key.as_bytes()),
+            nonce,
+        })
+    }
+
+    /// Encrypt a new blob and stage the entry **in memory** (no reseal). Returns
+    /// the old blob's `file_id` if this overwrote an existing file, so the caller
+    /// can delete it after the manifest commit. Errors (leaving memory unchanged)
+    /// if a directory already occupies `norm`. Used by the fresh-vault builders.
+    fn stage_file<R: Read>(
+        &mut self,
+        norm: String,
+        blake3: [u8; 32],
+        size: u64,
+        source: R,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<Option<String>> {
+        reject_dir_at(&self.manifest, &norm)?;
+        let blob = self.write_blob(blake3, size, source)?;
+        Ok(place_file(
+            &mut self.manifest,
+            norm,
+            blob,
+            blake3,
             size,
             mtime,
             mode,
-            blake3,
-            file_id: Some(file_id),
-            key: Some(BlobKey(*key.as_bytes())),
-            nonce: Some(nonce),
-            chunk_size: aead::DEFAULT_CHUNK_SIZE as u32,
+        ))
+    }
+
+    /// Commit a staged blob as the file at `norm`; on failure delete the blob
+    /// (it was never referenced) and leave the reader unchanged. On success
+    /// delete the blob it replaced, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_file(
+        &mut self,
+        norm: String,
+        blob: StagedBlob,
+        blake3: [u8; 32],
+        size: u64,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        let new_id = blob.file_id.clone();
+        let mut replaced = None;
+        let result = self.commit_edit(|m| {
+            replaced = place_file(m, norm, blob, blake3, size, mtime, mode);
+            Ok(())
         });
-        Ok(old)
+        match result {
+            Ok(()) => {
+                if let Some(old_id) = replaced {
+                    let _ = fs_err::remove_file(self.blob_path(&old_id));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = fs_err::remove_file(self.blob_path(&new_id));
+                Err(e)
+            }
+        }
     }
 
     /// Add or replace the file at `vault_path` from a file on disk. Rewrites only
@@ -807,14 +854,11 @@ impl VaultReaderV2 {
         mode: Option<u32>,
     ) -> Result<()> {
         let norm = normalize_path(vault_path)?;
+        reject_dir_at(&self.manifest, &norm)?;
         let (blake3, size) = hash_path(source)?;
         let reader = BufReader::new(fs_err::File::open(source)?);
-        let old = self.stage_file(norm, blake3, size, reader, mtime, mode)?;
-        self.reseal_manifest()?;
-        if let Some(old_id) = old {
-            let _ = fs_err::remove_file(self.blob_path(&old_id));
-        }
-        Ok(())
+        let blob = self.write_blob(blake3, size, reader)?;
+        self.commit_file(norm, blob, blake3, size, mtime, mode)
     }
 
     /// Add or replace the file at `vault_path` from an in-memory buffer.
@@ -826,20 +870,11 @@ impl VaultReaderV2 {
         mode: Option<u32>,
     ) -> Result<()> {
         let norm = normalize_path(vault_path)?;
+        reject_dir_at(&self.manifest, &norm)?;
         let blake3 = *blake3::hash(bytes).as_bytes();
-        let old = self.stage_file(
-            norm,
-            blake3,
-            bytes.len() as u64,
-            Cursor::new(bytes),
-            mtime,
-            mode,
-        )?;
-        self.reseal_manifest()?;
-        if let Some(old_id) = old {
-            let _ = fs_err::remove_file(self.blob_path(&old_id));
-        }
-        Ok(())
+        let size = bytes.len() as u64;
+        let blob = self.write_blob(blake3, size, Cursor::new(bytes))?;
+        self.commit_file(norm, blob, blake3, size, mtime, mode)
     }
 
     /// Create an (empty) directory, plus any missing ancestors. A no-op if the
@@ -853,9 +888,11 @@ impl VaultReaderV2 {
                 Err(Error::Vault(format!("a file exists at {norm}")))
             };
         }
-        self.ensure_dirs(&norm);
-        self.manifest.entries.push(dir_entry(norm));
-        self.reseal_manifest()
+        self.commit_edit(|m| {
+            ensure_dirs_in(m, &norm);
+            m.entries.push(dir_entry(norm));
+            Ok(())
+        })
     }
 
     /// Remove the entry at `vault_path` and, if it is a directory, its whole
@@ -863,25 +900,23 @@ impl VaultReaderV2 {
     pub fn remove_path(&mut self, vault_path: &str) -> Result<()> {
         let norm = normalize_path(vault_path)?;
         let prefix = format!("{norm}/");
-        let before = self.manifest.entries.len();
-        let mut removed_ids = Vec::new();
-        let mut kept = Vec::with_capacity(before);
-        for e in std::mem::take(&mut self.manifest.entries) {
-            if e.path == norm || e.path.starts_with(&prefix) {
-                if let Some(id) = e.file_id {
-                    removed_ids.push(id);
-                }
-            } else {
-                kept.push(e);
-            }
+        let matches = |path: &str| path == norm || path.starts_with(&prefix);
+        if !self.manifest.entries.iter().any(|e| matches(&e.path)) {
+            return Ok(());
         }
-        let changed = kept.len() != before;
-        self.manifest.entries = kept;
-        if changed {
-            self.reseal_manifest()?;
-            for id in removed_ids {
-                let _ = fs_err::remove_file(self.blob_path(&id));
-            }
+        let removed_ids: Vec<String> = self
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| matches(&e.path))
+            .filter_map(|e| e.file_id.clone())
+            .collect();
+        self.commit_edit(|m| {
+            m.entries.retain(|e| !matches(&e.path));
+            Ok(())
+        })?;
+        for id in removed_ids {
+            let _ = fs_err::remove_file(self.blob_path(&id));
         }
         Ok(())
     }
@@ -905,15 +940,17 @@ impl VaultReaderV2 {
         if self.manifest.entries.iter().any(|e| e.path == to) {
             return Err(Error::Vault(format!("path already exists: {to}")));
         }
-        self.ensure_dirs(&to);
-        for e in &mut self.manifest.entries {
-            if e.path == from {
-                e.path = to.clone();
-            } else if let Some(rest) = e.path.strip_prefix(&from_prefix) {
-                e.path = format!("{to}/{rest}");
+        self.commit_edit(|m| {
+            ensure_dirs_in(m, &to);
+            for e in &mut m.entries {
+                if e.path == from {
+                    e.path = to.clone();
+                } else if let Some(rest) = e.path.strip_prefix(&from_prefix) {
+                    e.path = format!("{to}/{rest}");
+                }
             }
-        }
-        self.reseal_manifest()
+            Ok(())
+        })
     }
 
     /// Update an entry's advisory mtime/mode (manifest-only).
@@ -924,15 +961,16 @@ impl VaultReaderV2 {
         mode: Option<u32>,
     ) -> Result<()> {
         let norm = normalize_path(vault_path)?;
-        let e = self
-            .manifest
-            .entries
-            .iter_mut()
-            .find(|e| e.path == norm)
-            .ok_or_else(|| Error::Vault(format!("not found: {norm}")))?;
-        e.mtime = mtime;
-        e.mode = mode;
-        self.reseal_manifest()
+        self.commit_edit(|m| {
+            let e = m
+                .entries
+                .iter_mut()
+                .find(|e| e.path == norm)
+                .ok_or_else(|| Error::Vault(format!("not found: {norm}")))?;
+            e.mtime = mtime;
+            e.mode = mode;
+            Ok(())
+        })
     }
 
     /// Build a fresh v2 vault at `dir` from an opened, verified v1 [`VaultReader`]
@@ -1281,6 +1319,70 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
 
 /// Atomically write `bytes` to `path`: temp + fsync + rename (+ best-effort dir
 /// fsync), hardened to 0600 on Unix.
+/// A freshly encrypted blob that no manifest references yet.
+struct StagedBlob {
+    file_id: String,
+    key: BlobKey,
+    nonce: Vec<u8>,
+}
+
+/// Push directory entries for each missing ancestor of `norm`.
+fn ensure_dirs_in(manifest: &mut ManifestV2, norm: &str) {
+    let comps: Vec<&str> = norm.split('/').collect();
+    let mut acc = String::new();
+    for comp in comps.iter().take(comps.len().saturating_sub(1)) {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(comp);
+        if !manifest.entries.iter().any(|e| e.path == acc) {
+            manifest.entries.push(dir_entry(acc.clone()));
+        }
+    }
+}
+
+/// Refuse to put a file where a directory already is.
+fn reject_dir_at(manifest: &ManifestV2, norm: &str) -> Result<()> {
+    match manifest.entries.iter().find(|e| e.path == norm) {
+        Some(e) if e.kind == EntryKind::Dir => {
+            Err(Error::Vault(format!("a directory exists at {norm}")))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Record `blob` as the file at `norm` (creating missing parent directories),
+/// returning the `file_id` of the blob it replaces, if any.
+fn place_file(
+    manifest: &mut ManifestV2,
+    norm: String,
+    blob: StagedBlob,
+    blake3: [u8; 32],
+    size: u64,
+    mtime: Option<i64>,
+    mode: Option<u32>,
+) -> Option<String> {
+    let old = manifest
+        .entries
+        .iter()
+        .position(|e| e.path == norm)
+        .and_then(|pos| manifest.entries.remove(pos).file_id);
+    ensure_dirs_in(manifest, &norm);
+    manifest.entries.push(EntryV2 {
+        path: norm,
+        kind: EntryKind::File,
+        size,
+        mtime,
+        mode,
+        blake3,
+        file_id: Some(blob.file_id),
+        key: Some(blob.key),
+        nonce: Some(blob.nonce),
+        chunk_size: aead::DEFAULT_CHUNK_SIZE as u32,
+    });
+    old
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut writer = crate::safe_io::SafeFileWriter::create(path)?;
     writer.write_all(bytes)?;
@@ -1573,6 +1675,90 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let suffix = crate::util::hex(&crate::secret::random_array::<8>().unwrap());
         std::env::temp_dir().join(format!("filesec-v2-bounds-{suffix}-{name}"))
+    }
+
+    /// Make the next manifest commit fail by putting a non-empty directory
+    /// where the manifest file is renamed to.
+    fn break_manifest_writes(dir: &Path) {
+        fs_err::rename(dir.join(MANIFEST_FILE), dir.join("manifest.saved")).unwrap();
+        fs_err::create_dir(dir.join(MANIFEST_FILE)).unwrap();
+        fs_err::write(dir.join(MANIFEST_FILE).join("occupied"), b"x").unwrap();
+    }
+
+    fn restore_manifest_writes(dir: &Path) {
+        fs_err::remove_dir_all(dir.join(MANIFEST_FILE)).unwrap();
+        fs_err::rename(dir.join("manifest.saved"), dir.join(MANIFEST_FILE)).unwrap();
+    }
+
+    fn listing(reader: &VaultReaderV2) -> Vec<(String, u64, Option<i64>)> {
+        let mut out: Vec<_> = reader
+            .entries()
+            .iter()
+            .map(|e| (e.path.clone(), e.size, e.mtime))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// FS-08: a mutation whose manifest commit fails leaves the reader, the
+    /// disk, and the blob directory exactly as before, and a later successful
+    /// mutation on the same reader does not persist the failed one.
+    #[test]
+    fn a_failed_commit_leaves_reader_and_disk_unchanged_for_every_mutation() {
+        let ops = [
+            "put_file_bytes",
+            "overwrite",
+            "put_file",
+            "mkdir",
+            "remove_path",
+            "rename",
+            "set_attr",
+        ];
+        for op in ops {
+            let dir = tmp(&format!("failed-{op}"));
+            let identity = Identity::generate("Owner", 0).unwrap();
+            let mut reader =
+                VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+            reader
+                .put_file_bytes("docs/keep.txt", b"keep", Some(5), None)
+                .unwrap();
+            let source = dir.with_extension("source");
+            fs_err::write(&source, b"from disk").unwrap();
+            let before = listing(&reader);
+            let state_before = reader.state_metadata().cloned();
+            let blobs_before = fs_err::read_dir(dir.join(BLOBS_DIR)).unwrap().count();
+
+            break_manifest_writes(&dir);
+            let result = match op {
+                "put_file_bytes" => reader.put_file_bytes("new.txt", b"new", None, None),
+                "overwrite" => reader.put_file_bytes("docs/keep.txt", b"changed", None, None),
+                "put_file" => reader.put_file("new.txt", &source, None, None),
+                "mkdir" => reader.mkdir("fresh/dir"),
+                "remove_path" => reader.remove_path("docs"),
+                "rename" => reader.rename("docs", "moved"),
+                _ => reader.set_attr("docs/keep.txt", Some(99), None),
+            };
+            restore_manifest_writes(&dir);
+            assert!(result.is_err(), "{op} must report the failed commit");
+            assert_eq!(listing(&reader), before, "{op}: reader changed");
+            assert_eq!(reader.state_metadata().cloned(), state_before, "{op}");
+            assert_eq!(
+                fs_err::read_dir(dir.join(BLOBS_DIR)).unwrap().count(),
+                blobs_before,
+                "{op}: staged blob leaked or committed blob deleted"
+            );
+            assert_eq!(&*reader.read_entry("docs/keep.txt").unwrap(), b"keep");
+
+            reader.mkdir("later").unwrap();
+            let reopened = VaultReaderV2::open(&dir, &identity).unwrap();
+            let mut expected = before.clone();
+            expected.push(("later".into(), 0, None));
+            expected.sort();
+            assert_eq!(listing(&reopened), expected, "{op}: failed op persisted");
+            assert_eq!(listing(&reader), expected, "{op}");
+            fs_err::remove_dir_all(&dir).unwrap();
+            let _ = fs_err::remove_file(&source);
+        }
     }
 
     #[test]
