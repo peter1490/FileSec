@@ -11,6 +11,7 @@ All project guides and audit documents are in [`docs/`](docs/).
 | Document | Contents |
 |---|---|
 | [Application guide](docs/README.md) | Features, setup, building, testing, and usage |
+| [Full project audit](docs/AUDIT_2026-10-01.md) | Security findings, optimization measurements, published artifact review, and remediation priorities |
 | [Security review](docs/SECURITY_AUDIT.md) | Implemented fixes, performance measurements, validation, and remaining risks |
 | [Threat model](docs/THREAT_MODEL.md) | Security boundaries, assumptions, and limitations |
 | [Release guide](docs/RELEASE.md) | Packaging, signing, and release process |
