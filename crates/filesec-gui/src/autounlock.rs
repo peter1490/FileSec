@@ -155,6 +155,25 @@ pub fn is_saved(account: &str) -> bool {
 // the D-Bus Secret Service on Linux), so each OS pulls only its own backend.
 // ---------------------------------------------------------------------------
 
+/// Every OS-keychain call in the process goes through this lock, one at a time.
+/// keyring documents that the Windows Credential Manager (and the Secret
+/// Service) do not reliably serialize calls made from different threads: CI
+/// caught a just-written anchor root record reading back as missing while other
+/// threads wrote their own credentials. Calls are rare and short, so holding a
+/// single lock costs nothing that matters.
+#[cfg(feature = "keyring")]
+static KEYCHAIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "keyring")]
+fn serialized<T>(call: impl FnOnce() -> T) -> T {
+    // A poisoned lock only means another keychain call panicked; the keychain
+    // itself holds no state this guard protects.
+    let _guard = KEYCHAIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    call()
+}
+
 #[cfg(feature = "keyring")]
 fn entry(account: &str) -> Result<keyring::Entry, AutoUnlockError> {
     entry_for(SERVICE, account)
@@ -171,34 +190,36 @@ fn entry_for(service: &str, account: &str) -> Result<keyring::Entry, AutoUnlockE
 /// this module persists.
 #[cfg(feature = "keyring")]
 pub fn save_device_token(account: &str, token: &[u8]) -> Result<(), AutoUnlockError> {
-    entry(account)?
-        .set_secret(token)
-        .map_err(|e| AutoUnlockError::new(format!("could not save to the OS keychain: {e}")))
+    serialized(|| {
+        entry(account)?
+            .set_secret(token)
+            .map_err(|e| AutoUnlockError::new(format!("could not save to the OS keychain: {e}")))
+    })
 }
 
 /// Load the saved device token for `account`, or `None` if nothing is stored. The
 /// token is returned in a zeroizing buffer so it is wiped after use.
 #[cfg(feature = "keyring")]
 pub fn load_device_token(account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, AutoUnlockError> {
-    match entry(account)?.get_secret() {
+    serialized(|| match entry(account)?.get_secret() {
         Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(AutoUnlockError::new(format!(
             "could not read the OS keychain: {e}"
         ))),
-    }
+    })
 }
 
 /// Remove the saved device token for `account`. Succeeds (idempotently) if there
 /// was nothing stored.
 #[cfg(feature = "keyring")]
 pub fn clear_device_token(account: &str) -> Result<(), AutoUnlockError> {
-    match entry(account)?.delete_credential() {
+    serialized(|| match entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(AutoUnlockError::new(format!(
             "could not update the OS keychain: {e}"
         ))),
-    }
+    })
 }
 
 /// Load one rollback-anchor record (a store's small root record, or a single
@@ -206,13 +227,13 @@ pub fn clear_device_token(account: &str) -> Result<(), AutoUnlockError> {
 /// under `account`.
 #[cfg(feature = "keyring")]
 pub fn load_state_anchors(account: &str) -> Result<Option<Vec<u8>>, AutoUnlockError> {
-    match entry_for(ANCHOR_SERVICE, account)?.get_secret() {
+    serialized(|| match entry_for(ANCHOR_SERVICE, account)?.get_secret() {
         Ok(bytes) => Ok(Some(bytes)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(AutoUnlockError::new(format!(
             "could not read rollback anchors from the OS keychain: {e}"
         ))),
-    }
+    })
 }
 
 /// Persist one rollback-anchor record in OS secure storage. Records are kept
@@ -220,25 +241,29 @@ pub fn load_state_anchors(account: &str) -> Result<Option<Vec<u8>>, AutoUnlockEr
 /// Manager's 2,560-byte credential limit.
 #[cfg(feature = "keyring")]
 pub fn save_state_anchors(account: &str, bytes: &[u8]) -> Result<(), AutoUnlockError> {
-    entry_for(ANCHOR_SERVICE, account)?
-        .set_secret(bytes)
-        .map_err(|e| {
-            AutoUnlockError::new(format!(
-                "could not save rollback anchors to the OS keychain: {e}"
-            ))
-        })
+    serialized(|| {
+        entry_for(ANCHOR_SERVICE, account)?
+            .set_secret(bytes)
+            .map_err(|e| {
+                AutoUnlockError::new(format!(
+                    "could not save rollback anchors to the OS keychain: {e}"
+                ))
+            })
+    })
 }
 
 /// Remove an anchor record from OS secure storage. Succeeds (idempotently) if
 /// nothing was stored.
 #[cfg(feature = "keyring")]
 pub fn delete_state_anchors(account: &str) -> Result<(), AutoUnlockError> {
-    match entry_for(ANCHOR_SERVICE, account)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(AutoUnlockError::new(format!(
-            "could not remove rollback anchors from the OS keychain: {e}"
-        ))),
-    }
+    serialized(
+        || match entry_for(ANCHOR_SERVICE, account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(AutoUnlockError::new(format!(
+                "could not remove rollback anchors from the OS keychain: {e}"
+            ))),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
