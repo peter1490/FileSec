@@ -221,6 +221,15 @@ instead of the vaults. Its only action is an explicit, passphrase-authenticated
 re-anchoring (`Store::recover_rollback_anchors`) that trusts the files currently
 on disk as the newest state; run it only for the copy you intend to keep.
 
+Only one FileSec process may use a data directory at a time. The first one
+takes an exclusive OS lock on `.lock` in the data directory for as long as it
+runs, and a second window (including the other build — `filesec` and
+`filesec-pqc` share the same data directory) is refused with a clear message
+instead of interleaving writes. Inside the process, each protected object is
+read, re-checked against its anchor, committed, and re-anchored as one
+transaction, and a vault change based on an out-of-date view is refused rather
+than overwriting a newer commit.
+
 ### Threat model — what is *not* protected
 
 FileSec protects data **in transit and at rest**. It explicitly does **not**

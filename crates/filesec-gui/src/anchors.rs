@@ -70,6 +70,7 @@ pub fn platform_storage() -> Option<Arc<dyn SecureAnchorStorage>> {
 pub struct MemoryAnchorStorage {
     records: Mutex<HashMap<String, Vec<u8>>>,
     unavailable: AtomicBool,
+    fail_saves: AtomicBool,
     capacity: Option<usize>,
     lookups: AtomicUsize,
 }
@@ -93,6 +94,12 @@ impl MemoryAnchorStorage {
     /// Make every subsequent call fail (`true`) or succeed again (`false`).
     pub fn set_unavailable(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::SeqCst);
+    }
+
+    /// Make every subsequent `save` fail while reads keep working — an
+    /// interruption between a state-file commit and its anchor update.
+    pub fn set_fail_saves(&self, fail: bool) {
+        self.fail_saves.store(fail, Ordering::SeqCst);
     }
 
     /// How many `load` calls have been made so far.
@@ -158,6 +165,9 @@ impl SecureAnchorStorage for MemoryAnchorStorage {
 
     fn save(&self, account: &str, bytes: &[u8]) -> Result<(), String> {
         self.check_available()?;
+        if self.fail_saves.load(Ordering::SeqCst) {
+            return Err("secure storage write failed".into());
+        }
         if let Some(capacity) = self.capacity {
             if bytes.len() > capacity {
                 return Err(format!(

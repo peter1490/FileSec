@@ -90,6 +90,11 @@ eframe = "0.32.3"
 egui = "0.32.3"
 egui_extras = "0.32.3"
 filesec-core = { path = "../filesec-core" }
+# Cross-process advisory file locks (flock / LockFileEx) and free-space
+# queries. Enforces a single active writer per data directory (audit FS-05).
+# Pure Rust over rustix 1.x / windows-sys 0.59, both already in the graph;
+# declares a 1.75 MSRV, so it stays within the 1.86 toolchain.
+fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 walkdir = "2.5.0"

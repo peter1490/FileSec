@@ -6,8 +6,9 @@
 //! contents. Files are created with restrictive permissions where the OS
 //! supports it.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,8 @@ const MAX_KEYSTORE_FILE_LEN: u64 = 16 * 1024 * 1024;
 const MAX_SELF_BLOB_CONTAINER_LEN: u64 = 64 * 1024 * 1024;
 const MAX_SELF_BLOB_PLAINTEXT_LEN: u64 = 16 * 1024 * 1024;
 const PROTECTED_STATE_VERSION: u16 = 1;
+/// The keystore's fixed state object id (see `filesec_core::keystore`).
+const KEYSTORE_OBJECT_ID: &str = "identity-keystore";
 const ANCHORS_VERSION: u16 = 1;
 const ANCHORS_FILE: &str = ".state-anchors";
 const ANCHORS_BACKEND_FILE: &str = ".state-anchor-backend";
@@ -70,6 +73,115 @@ const MAX_BACKEND_MARKER_LEN: u64 = 64;
 /// [`Store::recover_rollback_anchors`] flow". The GUI matches on it to offer
 /// that recovery instead of a dead-end error screen.
 pub const ANCHOR_RECOVERY_REQUIRED: &str = "rollback-protection anchors need recovery";
+
+/// Stable prefix of the error returned when another FileSec process already has
+/// this data directory open (FS-05: one active writer per store).
+pub const STORE_IN_USE: &str = "this FileSec data directory is already in use";
+
+/// Stable prefix of the error returned when a mutation was based on a vault
+/// state that is no longer current (another operation committed first).
+pub const STALE_STATE: &str = "this vault changed since it was opened";
+
+/// Advisory lock file marking the data directory as in use by one process.
+const LOCK_FILE: &str = ".lock";
+
+/// Store locks currently held by this process, by canonical data directory.
+/// Several [`Store`] values for one directory share one OS lock and one set of
+/// transaction locks; a second process is refused.
+static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreLock>>>> = OnceLock::new();
+
+fn store_locks() -> &'static Mutex<HashMap<PathBuf, Weak<StoreLock>>> {
+    STORE_LOCKS.get_or_init(Default::default)
+}
+
+/// The single-writer guard for one data directory (audit FS-05).
+///
+/// The OS-level exclusive lock on [`LOCK_FILE`] is held for as long as any
+/// `Store` for the directory lives in this process, so two FileSec processes
+/// (for example the standard and the post-quantum build, which share a data
+/// directory) can never interleave reads, state-file commits, and anchor
+/// updates. Within the process, each protected object has its own transaction
+/// lock held across the whole read → candidate → file commit → anchor update
+/// sequence, and anchor storage itself is read-modify-written under `anchors`.
+struct StoreLock {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    anchors: Mutex<()>,
+    objects: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // Release the OS lock and forget the entry atomically with respect to
+        // `acquire_store_lock`, so a store reopened right after the last one
+        // closes never races its own predecessor's file handle.
+        let held = store_locks().lock();
+        drop(self.file.take());
+        if let Ok(mut held) = held {
+            if held
+                .get(&self.path)
+                .is_some_and(|weak| weak.strong_count() == 0)
+            {
+                held.remove(&self.path);
+            }
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn acquire_store_lock(canonical: &Path) -> StoreResult<Arc<StoreLock>> {
+    loop {
+        let mut held = store_locks()
+            .lock()
+            .map_err(|_| "store lock registry is unavailable".to_string())?;
+        if let Some(weak) = held.get(canonical) {
+            if let Some(lock) = weak.upgrade() {
+                return Ok(lock);
+            }
+            // The last `Store` is mid-drop; its `Drop` removes the entry under
+            // this mutex. Let it finish rather than racing its file handle.
+            drop(held);
+            std::thread::yield_now();
+            continue;
+        }
+        let file = open_lock_file(&canonical.join(LOCK_FILE))
+            .map_err(|e| format!("could not open the data directory lock: {e}"))?;
+        match fs4::fs_std::FileExt::try_lock_exclusive(&file) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "{STORE_IN_USE} by another FileSec window ({}). Close it first; two \
+                     processes writing the same store could fork its rollback-protected state.",
+                    canonical.display()
+                ))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not lock the data directory {}: {e}",
+                    canonical.display()
+                ))
+            }
+        }
+        let lock = Arc::new(StoreLock {
+            path: canonical.to_path_buf(),
+            file: Some(file),
+            anchors: Mutex::new(()),
+            objects: Mutex::new(HashMap::new()),
+        });
+        held.insert(canonical.to_path_buf(), Arc::downgrade(&lock));
+        return Ok(lock);
+    }
+}
 /// Unencrypted UI preferences. Dot-prefixed like the other non-container files.
 /// See [`crate::prefs`] for why this one is deliberately not encrypted.
 const PREFS_FILE: &str = ".prefs";
@@ -162,7 +274,7 @@ pub struct Store {
     anchor_backend: AnchorBackend,
     anchor_account: String,
     secure: Option<Arc<dyn SecureAnchorStorage>>,
-    anchor_lock: Mutex<()>,
+    lock: Arc<StoreLock>,
 }
 
 impl Store {
@@ -221,10 +333,9 @@ impl Store {
         harden_dir(&data_dir);
         harden_dir(&vaults_dir);
         harden_dir(&checkout_dir);
-        let anchor_account = std::fs::canonicalize(&data_dir)
-            .unwrap_or_else(|_| data_dir.clone())
-            .display()
-            .to_string();
+        let canonical = std::fs::canonicalize(&data_dir).map_err(err)?;
+        let lock = acquire_store_lock(&canonical)?;
+        let anchor_account = canonical.display().to_string();
         Ok(Self {
             data_dir,
             vaults_dir,
@@ -232,7 +343,7 @@ impl Store {
             anchor_backend: AnchorBackend::DegradedFile,
             anchor_account,
             secure,
-            anchor_lock: Mutex::new(()),
+            lock,
         })
     }
 
@@ -336,7 +447,8 @@ impl Store {
         };
         {
             let _guard = store
-                .anchor_lock
+                .lock
+                .anchors
                 .lock()
                 .map_err(|_| "state anchor lock is unavailable".to_string())?;
             store.save_anchor_set_locked(&AnchorSet {
@@ -462,6 +574,79 @@ impl Store {
         }
     }
 
+    /// Run `f` as one transaction on a protected object: the object's lock is
+    /// held across reading its anchor, computing the candidate, committing the
+    /// state file, and updating the anchor (FS-05). Never nest two objects'
+    /// transactions; anchor storage access inside `f` takes the short
+    /// `anchors` lock on its own.
+    fn in_txn<R>(
+        &self,
+        object_type: StateObjectType,
+        object_id: &str,
+        f: impl FnOnce() -> StoreResult<R>,
+    ) -> StoreResult<R> {
+        let txn = {
+            let mut objects = self
+                .lock
+                .objects
+                .lock()
+                .map_err(|_| "state transaction table is unavailable".to_string())?;
+            objects
+                .entry(format!("{object_type}/{object_id}"))
+                .or_default()
+                .clone()
+        };
+        let _guard = txn
+            .lock()
+            .map_err(|_| "state transaction lock is unavailable".to_string())?;
+        f()
+    }
+
+    /// Compare-and-swap precondition for a vault mutation: `reader` must be the
+    /// vault's current anchored state. A reader left behind by a mutation that
+    /// another operation already committed is refused instead of forking the
+    /// manifest chain or silently discarding that other change.
+    fn ensure_current_vault(&self, reader: &VaultReaderV2) -> StoreResult<()> {
+        let state = reader
+            .state_metadata()
+            .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+        match self.current_anchor(
+            state.identity_fingerprint,
+            state.object_type,
+            &state.object_id,
+        )? {
+            Some(anchor)
+                if anchor.epoch != state.epoch
+                    || anchor.current_state_hash != state.current_state_hash =>
+            {
+                Err(format!(
+                    "{STALE_STATE}; reopen it and try again (vault {})",
+                    state.object_id
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Run a mutation of an open vault as one transaction: check that `reader`
+    /// is current, apply `mutate` to a clone, and commit the resulting state.
+    fn mutate_vault(
+        &self,
+        reader: &VaultReaderV2,
+        mutate: impl FnOnce(&mut VaultReaderV2) -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        let object_id = reader
+            .state_metadata()
+            .map(|state| state.object_id.clone())
+            .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+        self.in_txn(StateObjectType::VaultManifest, &object_id, || {
+            self.ensure_current_vault(reader)?;
+            let mut writer = reader.clone();
+            mutate(&mut writer)?;
+            self.commit_vault_reader(&writer)
+        })
+    }
+
     fn current_anchor(
         &self,
         identity_fingerprint: [u8; 32],
@@ -469,7 +654,8 @@ impl Store {
         object_id: &str,
     ) -> StoreResult<Option<StateAnchor>> {
         let _guard = self
-            .anchor_lock
+            .lock
+            .anchors
             .lock()
             .map_err(|_| "state anchor lock is unavailable".to_string())?;
         let set = self.load_anchor_set_locked()?;
@@ -489,7 +675,8 @@ impl Store {
     fn accept_state(&self, state: &StateMetadata, suspect_path: &Path) -> StoreResult<()> {
         let result = (|| {
             let _guard = self
-                .anchor_lock
+                .lock
+                .anchors
                 .lock()
                 .map_err(|_| "state anchor lock is unavailable".to_string())?;
             let mut set = self.load_anchor_set_locked()?;
@@ -520,7 +707,8 @@ impl Store {
 
     fn check_state_transition(&self, state: &StateMetadata) -> StoreResult<()> {
         let _guard = self
-            .anchor_lock
+            .lock
+            .anchors
             .lock()
             .map_err(|_| "state anchor lock is unavailable".to_string())?;
         let set = self.load_anchor_set_locked()?;
@@ -575,29 +763,32 @@ impl Store {
         let state = ks.state_metadata().ok_or_else(|| {
             "legacy keystore must be recovered before it can be saved".to_string()
         })?;
-        self.check_state_transition(state)?;
-        let bytes = ks.to_bytes().map_err(err)?;
-        let final_path = self.keystore_path();
-        let tmp = self.data_dir.join("keystore.fsk.tmp");
-        write_private_atomic(&tmp, &final_path, &bytes)?;
-        harden_file(&final_path);
-        self.commit_state(state)?;
-        Ok(())
+        self.in_txn(state.object_type, &state.object_id, || {
+            self.check_state_transition(state)?;
+            let bytes = ks.to_bytes().map_err(err)?;
+            let final_path = self.keystore_path();
+            let tmp = self.data_dir.join("keystore.fsk.tmp");
+            write_private_atomic(&tmp, &final_path, &bytes)?;
+            harden_file(&final_path);
+            self.commit_state(state)
+        })
     }
 
     /// Load the keystore (still encrypted — call `unlock`).
     pub fn load_keystore(&self) -> StoreResult<KeystoreFile> {
-        let bytes = read_bounded_file(
-            &self.keystore_path(),
-            MAX_KEYSTORE_FILE_LEN,
-            "keystore file",
-        )?;
-        let ks = KeystoreFile::from_bytes(&bytes).map_err(err)?;
-        let state = ks
-            .state_metadata()
-            .ok_or_else(|| "keystore has no rollback-protection metadata".to_string())?;
-        self.accept_state(state, &self.keystore_path())?;
-        Ok(ks)
+        self.in_txn(StateObjectType::Keystore, KEYSTORE_OBJECT_ID, || {
+            let bytes = read_bounded_file(
+                &self.keystore_path(),
+                MAX_KEYSTORE_FILE_LEN,
+                "keystore file",
+            )?;
+            let ks = KeystoreFile::from_bytes(&bytes).map_err(err)?;
+            let state = ks
+                .state_metadata()
+                .ok_or_else(|| "keystore has no rollback-protection metadata".to_string())?;
+            self.accept_state(state, &self.keystore_path())?;
+            Ok(ks)
+        })
     }
 
     /// Explicit one-time recovery for a valid pre-anchor keystore. The supplied
@@ -671,24 +862,26 @@ impl Store {
         payload: &T,
     ) -> StoreResult<()> {
         let payload_bytes = filesec_core::codec::to_vec(payload).map_err(err)?;
-        let previous = self.current_anchor(identity.fingerprint(), object_type, object_id)?;
-        let state = StateMetadata::next(
-            identity.fingerprint(),
-            object_type,
-            object_id,
-            self_suite(identity).to_u16(),
-            previous.as_ref(),
-            &payload_bytes,
-        )
-        .map_err(err)?;
-        let record = ProtectedState {
-            version: PROTECTED_STATE_VERSION,
-            state: state.clone(),
-            payload,
-        };
-        let bytes = filesec_core::codec::to_vec(&record).map_err(err)?;
-        self.save_blob(identity, path, entry_name, &bytes)?;
-        self.commit_state(&state)
+        self.in_txn(object_type, object_id, || {
+            let previous = self.current_anchor(identity.fingerprint(), object_type, object_id)?;
+            let state = StateMetadata::next(
+                identity.fingerprint(),
+                object_type,
+                object_id,
+                self_suite(identity).to_u16(),
+                previous.as_ref(),
+                &payload_bytes,
+            )
+            .map_err(err)?;
+            let record = ProtectedState {
+                version: PROTECTED_STATE_VERSION,
+                state: state.clone(),
+                payload,
+            };
+            let bytes = filesec_core::codec::to_vec(&record).map_err(err)?;
+            self.save_blob(identity, path, entry_name, &bytes)?;
+            self.commit_state(&state)
+        })
     }
 
     /// Read, decrypt and authenticate one protected record **without** any
@@ -739,8 +932,14 @@ impl Store {
         object_type: StateObjectType,
         object_id: &str,
     ) -> StoreResult<Option<T>> {
-        let record =
-            match self.read_protected_record(identity, path, entry_name, object_type, object_id) {
+        self.in_txn(object_type, object_id, || {
+            let record = match self.read_protected_record(
+                identity,
+                path,
+                entry_name,
+                object_type,
+                object_id,
+            ) {
                 Ok(Some(record)) => record,
                 Ok(None) => return Ok(None),
                 Err(e) => {
@@ -750,8 +949,9 @@ impl Store {
                     return Err(e);
                 }
             };
-        self.accept_state(&record.state, path)?;
-        Ok(Some(record.payload))
+            self.accept_state(&record.state, path)?;
+            Ok(Some(record.payload))
+        })
     }
 
     /// Load the contact book (empty if none yet).
@@ -829,23 +1029,24 @@ impl Store {
     /// Persist a (typically new) vault to its local v2 store directory, encrypted
     /// to the identity itself under the identity's at-rest suite.
     pub fn save_vault(&self, identity: &Identity, id: &str, vault: &Vault) -> StoreResult<()> {
-        let dir = self.vault_dir_v2(id);
-        if dir.exists() {
-            return Err("vault already exists; use the rollback-aware mutation APIs".into());
-        }
-        let reader = VaultReaderV2::from_vault_with_object_id(
-            &dir,
-            identity,
-            self_suite(identity),
-            vault,
-            id,
-        )
-        .map_err(err)?;
-        let state = reader
-            .state_metadata()
-            .ok_or_else(|| "new vault has no rollback-protection metadata".to_string())?;
-        self.commit_state(state)?;
-        Ok(())
+        self.in_txn(StateObjectType::VaultManifest, id, || {
+            let dir = self.vault_dir_v2(id);
+            if dir.exists() {
+                return Err("vault already exists; use the rollback-aware mutation APIs".into());
+            }
+            let reader = VaultReaderV2::from_vault_with_object_id(
+                &dir,
+                identity,
+                self_suite(identity),
+                vault,
+                id,
+            )
+            .map_err(err)?;
+            let state = reader
+                .state_metadata()
+                .ok_or_else(|| "new vault has no rollback-protection metadata".to_string())?;
+            self.commit_state(state)
+        })
     }
 
     /// Load a vault fully into memory (used by tests and any caller needing the
@@ -857,6 +1058,12 @@ impl Store {
     /// Lazily open a rollback-protected vault (metadata only; file contents
     /// decrypt on demand). Legacy state returns a recovery-required error.
     pub fn open_vault(&self, identity: &Identity, id: &str) -> StoreResult<VaultReaderV2> {
+        self.in_txn(StateObjectType::VaultManifest, id, || {
+            self.open_vault_locked(identity, id)
+        })
+    }
+
+    fn open_vault_locked(&self, identity: &Identity, id: &str) -> StoreResult<VaultReaderV2> {
         let v2 = self.vault_dir_v2(id);
         if v2.exists() {
             // A crash after the migration commit but before the old file was
@@ -934,6 +1141,16 @@ impl Store {
         identity: &Identity,
         id: &str,
     ) -> StoreResult<VaultReaderV2> {
+        self.in_txn(StateObjectType::VaultManifest, id, || {
+            self.recover_legacy_vault_locked(identity, id)
+        })
+    }
+
+    fn recover_legacy_vault_locked(
+        &self,
+        identity: &Identity,
+        id: &str,
+    ) -> StoreResult<VaultReaderV2> {
         let v2 = self.vault_dir_v2(id);
         if v2.exists() {
             let legacy = match VaultReaderV2::recover_legacy(&v2, identity) {
@@ -971,11 +1188,11 @@ impl Store {
             }
             wipe_vault_dir(&old);
             self.commit_state(&state)?;
-            return self.open_vault(identity, id);
+            return self.open_vault_locked(identity, id);
         }
         if self.vault_path(id).exists() {
             self.migrate_vault_v1_to_v2(identity, id)?;
-            return self.open_vault(identity, id);
+            return self.open_vault_locked(identity, id);
         }
         Err(format!("vault not found: {id}"))
     }
@@ -1035,18 +1252,25 @@ impl Store {
         // v2 is O(change): each new file becomes its own blob and the manifest is
         // resealed — no whole-vault rewrite. The reader is cloned (it carries the
         // manifest key); the caller re-opens afterwards to pick up the new state.
-        let mut writer = reader.clone();
-        for d in added_dirs {
-            writer.mkdir(d).map_err(err)?;
-            self.commit_vault_reader(&writer)?;
-        }
-        for f in added {
-            writer
-                .put_file(&f.vault_path, &f.source, f.mtime, f.mode)
-                .map_err(err)?;
-            self.commit_vault_reader(&writer)?;
-        }
-        Ok(())
+        let object_id = reader
+            .state_metadata()
+            .map(|state| state.object_id.clone())
+            .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+        self.in_txn(StateObjectType::VaultManifest, &object_id, || {
+            self.ensure_current_vault(reader)?;
+            let mut writer = reader.clone();
+            for d in added_dirs {
+                writer.mkdir(d).map_err(err)?;
+                self.commit_vault_reader(&writer)?;
+            }
+            for f in added {
+                writer
+                    .put_file(&f.vault_path, &f.source, f.mtime, f.mode)
+                    .map_err(err)?;
+                self.commit_vault_reader(&writer)?;
+            }
+            Ok(())
+        })
     }
 
     /// Remove paths (each entry plus, for a directory, its subtree) from an
@@ -1059,12 +1283,13 @@ impl Store {
         reader: &VaultReaderV2,
         remove: &[String],
     ) -> StoreResult<()> {
-        let mut writer = reader.clone();
-        for p in remove {
-            writer.remove_path(p).map_err(err)?;
-            self.commit_vault_reader(&writer)?;
-        }
-        Ok(())
+        self.mutate_vault(reader, |writer| {
+            for p in remove {
+                writer.remove_path(p).map_err(err)?;
+                self.commit_vault_reader(writer)?;
+            }
+            Ok(())
+        })
     }
 
     /// Apply a batch of manifest-only renames (`from` -> `to`) to an existing v2
@@ -1079,12 +1304,13 @@ impl Store {
         reader: &VaultReaderV2,
         pairs: &[(String, String)],
     ) -> StoreResult<()> {
-        let mut writer = reader.clone();
-        for (from, to) in pairs {
-            writer.rename(from, to).map_err(err)?;
-            self.commit_vault_reader(&writer)?;
-        }
-        Ok(())
+        self.mutate_vault(reader, |writer| {
+            for (from, to) in pairs {
+                writer.rename(from, to).map_err(err)?;
+                self.commit_vault_reader(writer)?;
+            }
+            Ok(())
+        })
     }
 
     /// Write `bytes` to `vault_path` inside an existing v2 vault (creating or
@@ -1099,12 +1325,11 @@ impl Store {
         bytes: &[u8],
         mtime: Option<i64>,
     ) -> StoreResult<()> {
-        let mut writer = reader.clone();
-        writer
-            .put_file_bytes(vault_path, bytes, mtime, None)
-            .map_err(err)?;
-        self.commit_vault_reader(&writer)?;
-        Ok(())
+        self.mutate_vault(reader, |writer| {
+            writer
+                .put_file_bytes(vault_path, bytes, mtime, None)
+                .map_err(err)
+        })
     }
 
     /// Replace a single file's contents inside an existing v2 vault: the new file
@@ -1123,12 +1348,11 @@ impl Store {
     ) -> StoreResult<()> {
         // Overwrite is just a `put_file`: a fresh blob replaces the old one and
         // the manifest is resealed (the old blob is unlinked).
-        let mut writer = reader.clone();
-        writer
-            .put_file(vault_path, new_source, mtime, mode)
-            .map_err(err)?;
-        self.commit_vault_reader(&writer)?;
-        Ok(())
+        self.mutate_vault(reader, |writer| {
+            writer
+                .put_file(vault_path, new_source, mtime, mode)
+                .map_err(err)
+        })
     }
 
     /// Transcode a just-verified incoming v1 container into a fresh local v2 store
@@ -1140,37 +1364,40 @@ impl Store {
         id: &str,
         reader: &format::VaultReader,
     ) -> StoreResult<()> {
-        let dir = self.vault_dir_v2(id);
-        let _ = std::fs::remove_dir_all(&dir);
-        let imported = match VaultReaderV2::from_reader_v1_with_object_id(
-            &dir,
-            identity,
-            self_suite(identity),
-            reader,
-            id,
-        ) {
-            Ok(reader) => reader,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(err(e));
-            }
-        };
-        self.commit_vault_reader(&imported)?;
-        Ok(())
+        self.in_txn(StateObjectType::VaultManifest, id, || {
+            let dir = self.vault_dir_v2(id);
+            let _ = std::fs::remove_dir_all(&dir);
+            let imported = match VaultReaderV2::from_reader_v1_with_object_id(
+                &dir,
+                identity,
+                self_suite(identity),
+                reader,
+                id,
+            ) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(err(e));
+                }
+            };
+            self.commit_vault_reader(&imported)
+        })
     }
 
     /// Delete a vault's encrypted store, securely wiping its contents. Handles
     /// both the v2 directory and any leftover legacy v1 `.fsec` file.
     pub fn delete_vault_file(&self, id: &str) -> StoreResult<()> {
-        let dir = self.vault_dir_v2(id);
-        if dir.exists() {
-            wipe_vault_dir(&dir);
-        }
-        let v1 = self.vault_path(id);
-        if v1.exists() {
-            let _ = secure_wipe(&v1);
-        }
-        Ok(())
+        self.in_txn(StateObjectType::VaultManifest, id, || {
+            let dir = self.vault_dir_v2(id);
+            if dir.exists() {
+                wipe_vault_dir(&dir);
+            }
+            let v1 = self.vault_path(id);
+            if v1.exists() {
+                let _ = secure_wipe(&v1);
+            }
+            Ok(())
+        })
     }
 
     /// The hardened directory holding checked-out plaintext temp files.
@@ -1341,7 +1568,8 @@ impl Store {
             return Err("identity migration changed the classical identity keys".into());
         }
         let _guard = self
-            .anchor_lock
+            .lock
+            .anchors
             .lock()
             .map_err(|_| "state anchor lock is unavailable".to_string())?;
         let mut set = self.load_anchor_set_locked()?;
