@@ -23,7 +23,7 @@ Bump it with the script, then tag to match:
 
 ```sh
 scripts/bump-version.sh 0.4.4
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock fuzz/Cargo.lock
 git commit -m 'Release v0.4.4'
 git tag v0.4.4
 git push origin main v0.4.4
@@ -38,7 +38,9 @@ version contradicted their own filename — which also meant the MSI could never
 detect and upgrade its predecessor.
 
 Never edit the version by hand: `scripts/bump-version.sh` also refreshes
-`Cargo.lock`, without which every `cargo build --locked` in CI fails.
+`Cargo.lock`, without which every `cargo build --locked` in CI fails, and the
+fuzz crate's tracked `fuzz/Cargo.lock`, which records `filesec-core`'s version
+and is checked with `--locked` by the fuzz workflow.
 
 ### Release gates
 

@@ -70,10 +70,15 @@ updated="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].ver
 # every `cargo build --locked` in CI fails.
 cargo update --workspace --offline >/dev/null
 
-echo "Bumped $current -> $new_version (Cargo.toml + Cargo.lock)."
+# The fuzz crate is a detached workspace with its own tracked lockfile, which
+# records filesec-core's version as well. The fuzz workflow checks it with
+# --locked, so a bump that skipped it would fail every later fuzz run.
+cargo update -p filesec-core --offline --manifest-path fuzz/Cargo.toml >/dev/null
+
+echo "Bumped $current -> $new_version (Cargo.toml + Cargo.lock + fuzz/Cargo.lock)."
 echo
 echo "Next:"
-echo "  git add Cargo.toml Cargo.lock"
+echo "  git add Cargo.toml Cargo.lock fuzz/Cargo.lock"
 echo "  git commit -m 'Release v$new_version'"
 echo "  git tag v$new_version"
 echo "  git push origin main v$new_version"
