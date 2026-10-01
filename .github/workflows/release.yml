@@ -105,6 +105,13 @@ jobs:
             "target/aarch64-apple-darwin/release/$BIN" \
             "target/x86_64-apple-darwin/release/$BIN"
 
+      # License notices for everything linked into the binary; shipped inside
+      # the .app, the .dmg and the portable archive (FS-18).
+      - name: Third-party notices
+        run: |
+          python3 scripts/third_party_notices.py --package "$PKG" \
+            --target aarch64-apple-darwin --out dist/THIRD_PARTY_NOTICES.txt
+
       - name: Import signing certificate
         if: env.MACOS_CERT_P12_BASE64 != ''
         run: |
@@ -142,10 +149,11 @@ jobs:
       - name: Signed/notarized .dmg + signed standalone executable
         run: |
           BIN_PATH="dist/$BIN" OUT_DMG="dist/$ARTIFACT_BASE.dmg" \
+            NOTICES_PATH=dist/THIRD_PARTY_NOTICES.txt \
             bash packaging/macos/package_macos.sh
 
       - name: Portable archive (of the signed executable)
-        run: ( cd dist && tar -czf "$ARTIFACT_BASE.tar.gz" "$BIN" )
+        run: ( cd dist && tar -czf "$ARTIFACT_BASE.tar.gz" "$BIN" THIRD_PARTY_NOTICES.txt )
 
       # Verify every macOS distribution format as shipped, not just the DMG.
       - name: Verify macOS distributions
@@ -204,6 +212,14 @@ jobs:
         shell: pwsh
         run: ./packaging/windows/verify_resources.ps1 -File "target/release/$env:BIN.exe"
 
+      # License notices for everything linked into the binary; shipped in the
+      # zip, the NSIS installer and the MSI (FS-18).
+      - name: Third-party notices
+        shell: bash
+        run: |
+          python scripts/third_party_notices.py --package "$PKG" \
+            --target x86_64-pc-windows-msvc --out target/release/THIRD_PARTY_NOTICES.txt
+
       - name: Require Windows signing for official tags
         if: env.RELEASE_SIGNING_REQUIRED == '1'
         shell: pwsh
@@ -221,7 +237,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          ( cd target/release && 7z a "$GITHUB_WORKSPACE/dist/$ARTIFACT_BASE.zip" "$BIN.exe" )
+          ( cd target/release && 7z a "$GITHUB_WORKSPACE/dist/$ARTIFACT_BASE.zip" "$BIN.exe" THIRD_PARTY_NOTICES.txt )
 
       - name: NSIS installer
         shell: bash
@@ -234,6 +250,7 @@ jobs:
           # Backslashes in SRC_EXE: NSIS's File command wants the native sep.
           makensis -NOCD -DAPP_NAME="$APP_NAME" -DAPP_EXE="$BIN.exe" -DAPP_VERSION="$VERSION" \
             -DSRC_EXE="target\\release\\$BIN.exe" -DOUT_FILE="$OUT" -DREG_KEY="$REG_KEY" \
+            -DSRC_NOTICES="target\\release\\THIRD_PARTY_NOTICES.txt" \
             packaging/windows/filesec.nsi
 
       # MSI via cargo-wix, built from the committed WiX source
@@ -296,10 +313,17 @@ jobs:
       - name: Build
         run: cargo build --locked --release $BUILD_ARGS
 
+      # License notices for everything linked into the binary; shipped in the
+      # tarball and installed by the .deb under /usr/share/doc (FS-18).
+      - name: Third-party notices
+        run: |
+          python3 scripts/third_party_notices.py --package "$PKG" \
+            --target x86_64-unknown-linux-gnu --out target/release/THIRD_PARTY_NOTICES.txt
+
       - name: Portable tarball
         run: |
           mkdir -p dist
-          ( cd target/release && tar -czf "$GITHUB_WORKSPACE/dist/$ARTIFACT_BASE.tar.gz" "$BIN" )
+          ( cd target/release && tar -czf "$GITHUB_WORKSPACE/dist/$ARTIFACT_BASE.tar.gz" "$BIN" THIRD_PARTY_NOTICES.txt )
 
       # cargo-deb's own default name is `<crate>_<ver>-<rev>_<arch>.deb`, which is
       # the correct Debian idiom but the odd one out among our artifacts — and the

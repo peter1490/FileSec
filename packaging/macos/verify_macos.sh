@@ -68,6 +68,11 @@ if [[ "$found" -eq 0 ]]; then
   echo "ERROR: no executable in $archive" >&2
   exit 1
 fi
+# Third-party notices must travel with every format (FS-18) — always required.
+if [[ ! -s "$work/archive/THIRD_PARTY_NOTICES.txt" ]]; then
+  echo "ERROR: $archive lacks THIRD_PARTY_NOTICES.txt" >&2
+  status=1
+fi
 
 # 2. The .dmg signature and its stapled notarization ticket.
 codesign --verify --verbose=2 "$dmg" || problem "dmg: code signature does not verify"
@@ -82,6 +87,10 @@ if [[ -z "$app" ]]; then
   exit 1
 fi
 check_signed "app bundle $(basename "$app")" "$app"
+if [[ ! -s "$app/Contents/Resources/THIRD_PARTY_NOTICES.txt" ]]; then
+  echo "ERROR: $(basename "$app") lacks Contents/Resources/THIRD_PARTY_NOTICES.txt" >&2
+  status=1
+fi
 spctl --assess --type execute --verbose=2 "$app" || problem "app bundle: rejected by Gatekeeper"
 
 if [[ "$status" -eq 0 ]]; then

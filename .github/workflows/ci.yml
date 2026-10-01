@@ -87,6 +87,17 @@ jobs:
       - name: Test (classical)
         run: cargo test --locked
 
+      # The release ships a generated THIRD_PARTY_NOTICES.txt in every package;
+      # make sure the generator keeps working for both binaries (FS-18).
+      - name: Third-party notices
+        if: runner.os == 'Linux'
+        run: |
+          for pkg in filesec-gui filesec-pqc; do
+            python3 scripts/third_party_notices.py --package "$pkg" \
+              --target x86_64-unknown-linux-gnu --out "target/notices/$pkg.txt"
+            grep -q 'SIL OPEN FONT LICENSE' "target/notices/$pkg.txt"
+          done
+
       # The shipped binaries enable pqc + keyring + passkey (+ net for
       # filesec-pqc). Test exactly that graph on every OS we ship for, not only
       # on macOS (FS-14).

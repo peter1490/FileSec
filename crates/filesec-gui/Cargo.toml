@@ -53,6 +53,9 @@ priority = "optional"
 # dir; other paths are relative to this crate's directory.
 assets = [
     ["target/release/filesec", "usr/bin/", "755"],
+    # Third-party license notices, generated into the release dir by
+    # scripts/third_party_notices.py before `cargo deb --no-build` (FS-18).
+    ["target/release/THIRD_PARTY_NOTICES.txt", "usr/share/doc/filesec/", "644"],
     ["packaging/filesec.desktop", "usr/share/applications/", "644"],
     # Hicolor icon set so the .desktop's `Icon=filesec` resolves in app menus.
     ["assets/icon/icon-16.png", "usr/share/icons/hicolor/16x16/apps/filesec.png", "644"],

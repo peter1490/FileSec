@@ -23,13 +23,19 @@
 #   BUNDLE_ID     CFBundleIdentifier (e.g. dev.FileSec.FileSec)
 #   VERSION       version string (e.g. 0.1.0)
 #   OUT_DMG       output .dmg path
+#   NOTICES_PATH  THIRD_PARTY_NOTICES.txt (scripts/third_party_notices.py); bundled
+#                 into the .app and the .dmg so the license terms travel with them
 # Optional (signing): MACOS_SIGN_IDENTITY  (Developer ID Application: ... (TEAMID))
 # Optional (notarization, pick ONE method):
 #   API key:  AC_API_KEY_PATH  AC_API_KEY_ID  AC_API_ISSUER
 #   Apple ID: AC_APPLE_ID      AC_APP_PASSWORD AC_TEAM_ID
 set -euo pipefail
 
-: "${BIN_PATH:?}" "${APP_NAME:?}" "${BUNDLE_ID:?}" "${VERSION:?}" "${OUT_DMG:?}"
+: "${BIN_PATH:?}" "${APP_NAME:?}" "${BUNDLE_ID:?}" "${VERSION:?}" "${OUT_DMG:?}" "${NOTICES_PATH:?}"
+if [[ ! -s "$NOTICES_PATH" ]]; then
+  echo "ERROR: third-party notices not found at $NOTICES_PATH" >&2
+  exit 1
+fi
 
 signing_required="${RELEASE_SIGNING_REQUIRED:-}"
 
@@ -73,6 +79,8 @@ else
   echo "WARNING: app icon not found at $icon_src — bundling without an icon." >&2
 fi
 
+cp "$NOTICES_PATH" "$app/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+
 cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -115,6 +123,7 @@ fi
 stage="$(mktemp -d)"
 trap 'rm -rf "$workdir" "$stage"' EXIT
 cp -R "$app" "$stage/"
+cp "$NOTICES_PATH" "$stage/THIRD_PARTY_NOTICES.txt"
 ln -s /Applications "$stage/Applications"
 rm -f "$OUT_DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$stage" -ov -format UDZO "$OUT_DMG"

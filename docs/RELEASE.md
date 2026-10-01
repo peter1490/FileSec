@@ -289,3 +289,27 @@ Windows jobs then read the manifest back out of each final `.exe`
 (`packaging/windows/verify_resources.ps1`). For a check-only cross build from a
 host without a Windows resource compiler, set
 `FILESEC_ALLOW_MISSING_WINDOWS_RESOURCES=1` — never for a binary that will run.
+
+## Third-party notices
+
+Every distribution carries `THIRD_PARTY_NOTICES.txt`, generated per binary and
+target by [`scripts/third_party_notices.py`](../scripts/third_party_notices.py)
+from the locked dependency graph: each linked crate with its version, SPDX
+expression, and the full text of every license/notice file it ships (including
+nested ones such as egui's bundled font licenses), plus the Inter and Phosphor
+font licenses. Identical texts are printed once and referenced by id; a crate
+that ships no license file is pointed at a standard text of its license.
+
+| Format | Where the notices are |
+|--------|-----------------------|
+| macOS `.tar.gz` / `.dmg` | next to the executable / at the image root, and `FileSec.app/Contents/Resources/` |
+| Windows `.zip` / NSIS / MSI | next to `filesec.exe` (the MSI's previously disabled license component is now enabled) |
+| Linux `.tar.gz` / `.deb` | next to the binary / `/usr/share/doc/<package>/` |
+
+The app shows the embedded font licenses under *Settings → About → Open-source
+notices*. Run the generator after `cargo build` (it reads the crate sources from
+the local registry); `cargo deb` and the WiX source expect it at
+`target/release/THIRD_PARTY_NOTICES.txt`. `cargo deny` only checks that licenses
+are allowed — this bundle is what carries their redistribution terms; have it
+reviewed before relying on it for a legal determination.
+

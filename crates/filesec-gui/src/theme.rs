@@ -174,6 +174,21 @@ pub fn current_choice(ctx: &egui::Context) -> ThemeChoice {
     }
 }
 
+/// License notices for the assets compiled into the app (the Inter typeface
+/// and the Phosphor icon font), shown under *Settings → About* (FS-18). The
+/// complete bundle for every linked crate ships next to the binary as
+/// `THIRD_PARTY_NOTICES.txt` (scripts/third_party_notices.py).
+pub const EMBEDDED_ASSET_NOTICES: &[(&str, &str)] = &[
+    (
+        "Inter typeface — SIL Open Font License 1.1",
+        include_str!("../assets/fonts/Inter-LICENSE.txt"),
+    ),
+    (
+        "Phosphor Icons — MIT License",
+        include_str!("../assets/fonts/Phosphor-LICENSE.txt"),
+    ),
+];
+
 fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontFamily};
     // Start from the default set so egui's emoji/symbol fallbacks are preserved.

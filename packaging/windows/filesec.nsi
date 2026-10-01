@@ -31,6 +31,9 @@ Unicode true
 !ifndef SRC_EXE
   !error "SRC_EXE must be defined (path to the built .exe)"
 !endif
+!ifndef SRC_NOTICES
+  !error "SRC_NOTICES must be defined (path to THIRD_PARTY_NOTICES.txt; see scripts/third_party_notices.py)"
+!endif
 !ifndef OUT_FILE
   !define OUT_FILE "FileSec-setup.exe"
 !endif
@@ -67,6 +70,8 @@ SetCompressor /SOLID lzma
 Section "Install"
   SetOutPath "$INSTDIR"
   File "/oname=${APP_EXE}" "${SRC_EXE}"
+  ; Third-party license notices for everything linked into the executable.
+  File "/oname=THIRD_PARTY_NOTICES.txt" "${SRC_NOTICES}"
   ; The .exe normally carries its own embedded icon (see build.rs), but also
   ; ship the .ico and point the shortcut / Add-Remove entry at it as a
   ; belt-and-suspenders fallback for the case where embedding was skipped (it is
@@ -86,6 +91,7 @@ SectionEnd
 
 Section "Uninstall"
   Delete "$INSTDIR\${APP_EXE}"
+  Delete "$INSTDIR\THIRD_PARTY_NOTICES.txt"
   Delete "$INSTDIR\app.ico"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$SMPROGRAMS\${APP_NAME}.lnk"

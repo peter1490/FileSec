@@ -7320,6 +7320,33 @@ fn settings_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                     );
                     ui.end_row();
                 });
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("Open-source notices")
+                .id_salt("settings_notices")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "FileSec is licensed under MIT OR Apache-2.0. It embeds the \
+                             typefaces below; the license notices of every library linked \
+                             into this app ship next to it as THIRD_PARTY_NOTICES.txt (in the \
+                             installation folder, the .app's Resources, the download archive, \
+                             or /usr/share/doc on Linux).",
+                        )
+                        .color(cc.text_muted)
+                        .small(),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_notices_scroll")
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (title, text) in theme::EMBEDDED_ASSET_NOTICES {
+                                ui.label(RichText::new(*title).strong());
+                                ui.label(RichText::new(*text).monospace().small());
+                                ui.add_space(10.0);
+                            }
+                        });
+                });
         });
     });
 }
@@ -9251,6 +9278,18 @@ mod ui_smoke {
     /// available but not device-bound (Windows roaming credentials, Linux Secret
     /// Service), and stays silent when it is device-bound (macOS) or unsupported. Keeps the F09
     /// warning wired to the real platform property rather than hard-coded. (F09)
+    /// FS-18: the embedded assets' license texts are compiled in and shown.
+    #[test]
+    fn embedded_asset_notices_carry_the_license_texts() {
+        let all: String = theme::EMBEDDED_ASSET_NOTICES
+            .iter()
+            .map(|(_, text)| *text)
+            .collect();
+        assert!(all.contains("SIL OPEN FONT LICENSE Version 1.1"));
+        assert!(all.contains("Phosphor Icons"));
+        assert!(all.contains("Permission is hereby granted"));
+    }
+
     #[test]
     fn device_binding_warning_matches_platform_support() {
         let warning = autounlock::device_binding_warning();

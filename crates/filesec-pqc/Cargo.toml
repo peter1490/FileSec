@@ -33,6 +33,9 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/filesec-pqc", "usr/bin/", "755"],
+    # Third-party license notices, generated into the release dir by
+    # scripts/third_party_notices.py before `cargo deb --no-build` (FS-18).
+    ["target/release/THIRD_PARTY_NOTICES.txt", "usr/share/doc/filesec-pqc/", "644"],
     ["packaging/filesec-pqc.desktop", "usr/share/applications/", "644"],
     # Icons live in the filesec-gui crate; install them under the pqc name so the
     # .desktop's `Icon=filesec-pqc` resolves in app menus.
