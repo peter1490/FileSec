@@ -361,6 +361,10 @@ struct ActiveView {
 struct ExportForm {
     vault_id: String,
     selected: HashSet<String>,
+    /// Fingerprints (hex) of unverified recipients the user explicitly chose to
+    /// encrypt to *for this export only*. A warning alone is not consent, and
+    /// this never changes the contact's trust (audit: unverified export).
+    confirmed_unverified: HashSet<String>,
     include_self: bool,
     /// Algorithm suite to encrypt under (Classic by default; the post-quantum
     /// suites are offered only in a `pqc` build).
@@ -788,6 +792,9 @@ enum Action {
     CancelExport,
     DoExport,
     ToggleRecipient(String),
+    /// Explicitly allow (or withdraw) encrypting to one unverified recipient,
+    /// by hex fingerprint, for the export dialog that is open.
+    ConfirmUnverifiedRecipient(String, bool),
     ToggleIncludeSelf,
     /// Pick the algorithm suite to export under (pqc builds only).
     #[cfg(feature = "pqc")]
@@ -1883,11 +1890,23 @@ impl App {
             Action::BeginExport(id) => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.export = Some(ExportForm {
+                        confirmed_unverified: HashSet::new(),
                         vault_id: id,
                         selected: HashSet::new(),
                         include_self: false,
                         suite: SuiteId::default(),
                     });
+                }
+            }
+            Action::ConfirmUnverifiedRecipient(fpr, confirmed) => {
+                if let State::Unlocked(s) = &mut self.state {
+                    if let Some(e) = &mut s.export {
+                        if confirmed {
+                            e.confirmed_unverified.insert(fpr);
+                        } else {
+                            e.confirmed_unverified.remove(&fpr);
+                        }
+                    }
                 }
             }
             Action::ToggleRecipient(fpr) => {
@@ -4028,6 +4047,24 @@ impl App {
     }
 
     fn spawn_export(&mut self, ctx: &egui::Context) {
+        let unconfirmed = match &self.state {
+            State::Unlocked(s) => s
+                .export
+                .as_ref()
+                .map(|form| unconfirmed_unverified(form, &s.contacts))
+                .unwrap_or_default(),
+            _ => return,
+        };
+        if !unconfirmed.is_empty() {
+            self.set_toast(
+                format!(
+                    "Confirm each unverified recipient for this export (or verify them first): {}",
+                    unconfirmed.join(", ")
+                ),
+                true,
+            );
+            return;
+        }
         let gathered = if let State::Unlocked(s) = &self.state {
             s.export.as_ref().map(|form| {
                 let mut recipients = Vec::new();
@@ -7829,10 +7866,10 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
             }
         }
         ui.add_space(6.0);
-        // Downgrade/trust warning: spell out exactly which selected
-        // recipients have not been verified out-of-band, so sending to an
-        // unverified key is always a deliberate, informed choice.
-        let unverified: Vec<&str> = s
+        // Unverified recipients need an explicit, per-export confirmation that
+        // names the exact key (its safety number) — the export button refuses
+        // until each one is ticked. Verifying them in Contacts avoids this.
+        let unverified: Vec<(String, String, String)> = s
             .contacts
             .contacts
             .iter()
@@ -7840,25 +7877,34 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                 c.trust == Trust::Unverified && form.selected.contains(&hex(&c.fingerprint()))
             })
             .map(|c| {
-                if c.identity.name.is_empty() {
-                    "(unnamed)"
-                } else {
-                    c.identity.name.as_str()
-                }
+                (
+                    hex(&c.fingerprint()),
+                    c.identity.display_name(),
+                    c.identity.safety_number(),
+                )
             })
             .collect();
         if !unverified.is_empty() {
-            ui.colored_label(
-                ERR_RED,
-                format!("⚠ Unverified recipient(s): {}", unverified.join(", ")),
-            );
+            ui.colored_label(ERR_RED, "⚠ Unverified recipients");
             ui.label(
-                    RichText::new(
-                        "You haven't confirmed these keys out-of-band. Anyone could have supplied them.",
-                    )
-                    .color(MUTED)
-                    .small(),
-                );
+                RichText::new(
+                    "You haven't confirmed these keys out-of-band, so anyone could have \
+                     supplied them. Confirm each one for this export only, or verify it in \
+                     Contacts first.",
+                )
+                .color(MUTED)
+                .small(),
+            );
+            for (fpr, name, safety) in &unverified {
+                let mut confirmed = form.confirmed_unverified.contains(fpr);
+                if ui
+                    .checkbox(&mut confirmed, format!("Encrypt to {name} anyway"))
+                    .changed()
+                {
+                    *action = Some(Action::ConfirmUnverifiedRecipient(fpr.clone(), confirmed));
+                }
+                ui.label(RichText::new(safety).monospace().small().color(MUTED));
+            }
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -7873,6 +7919,21 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
     if close {
         *action = Some(Action::CancelExport);
     }
+}
+
+/// Display names of the selected recipients that are unverified and were not
+/// explicitly confirmed for this export.
+fn unconfirmed_unverified(form: &ExportForm, contacts: &ContactBook) -> Vec<String> {
+    contacts
+        .contacts
+        .iter()
+        .filter(|c| c.trust == Trust::Unverified)
+        .filter(|c| {
+            let fpr = hex(&c.fingerprint());
+            form.selected.contains(&fpr) && !form.confirmed_unverified.contains(&fpr)
+        })
+        .map(|c| c.identity.display_name())
+        .collect()
 }
 
 fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
@@ -9517,6 +9578,38 @@ mod ui_smoke {
         assert!(all.contains("SIL OPEN FONT LICENSE Version 1.1"));
         assert!(all.contains("Phosphor Icons"));
         assert!(all.contains("Permission is hereby granted"));
+    }
+
+    /// Audit item: an unverified recipient needs an explicit per-export
+    /// confirmation of that exact key; a warning alone is not consent.
+    #[test]
+    fn unverified_recipients_need_explicit_per_export_confirmation() {
+        let bob = Identity::generate("Bob", 0).unwrap();
+        let carol = Identity::generate("Carol", 0).unwrap();
+        let mut contacts = ContactBook::default();
+        contacts.upsert(bob.public(), 0);
+        contacts.upsert(carol.public(), 0);
+        contacts.set_trust(&carol.fingerprint(), Trust::Verified, 0);
+        let mut form = ExportForm {
+            vault_id: "v".into(),
+            selected: [hex(&bob.fingerprint()), hex(&carol.fingerprint())]
+                .into_iter()
+                .collect(),
+            confirmed_unverified: HashSet::new(),
+            include_self: false,
+            suite: SuiteId::default(),
+        };
+        assert_eq!(
+            unconfirmed_unverified(&form, &contacts),
+            vec!["Bob".to_string()]
+        );
+        form.confirmed_unverified.insert(hex(&bob.fingerprint()));
+        assert!(unconfirmed_unverified(&form, &contacts).is_empty());
+        // Confirming never changes trust.
+        assert_eq!(
+            contacts.find(&bob.fingerprint()).unwrap().trust,
+            Trust::Unverified
+        );
     }
 
     #[test]
