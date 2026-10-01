@@ -31,6 +31,12 @@ all-features = true
 # advisory (any ID not listed here) still fails the build — the gate stays live.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+# Each exception names an owner and a review-by date (at most a year out).
+# scripts/check_advisory_exceptions.py fails CI once a date passes or the list
+# drifts from .cargo/audit.toml, so an exception cannot silently become
+# permanent; docs/DEPENDENCIES.md tracks them and the upgrade plan that retires
+# them. CI also publishes an *unsuppressed* scan, so a green gate is never read
+# as "no known advisories".
 ignore = [
     # ttf-parser 0.25.1 — unmaintained (no vulnerability, no patch exists).
     # Reached only transitively through egui's text stack
@@ -38,7 +44,7 @@ ignore = [
     # pins it and there is no maintained drop-in. Nothing FileSec can change until
     # egui migrates its font backend (e.g. to skrifa). Drop this when the egui
     # upgrade that replaces ttf-parser lands.
-    "RUSTSEC-2026-0192",
+    { id = "RUSTSEC-2026-0192", reason = "owner: @peter1490; review-by: 2027-01-31; unmaintained ttf-parser via egui 0.32 text stack; drop with the egui upgrade (docs/DEPENDENCIES.md)" },
 
     # quick-xml 0.39.4 — two DoS advisories (quadratic attribute-duplicate check;
     # unbounded NsReader namespace allocation), both patched only in >= 0.41.0, a
@@ -48,8 +54,8 @@ ignore = [
     # remote-DoS scenario in the advisories does not apply to FileSec. Not
     # updatable without bumping the whole egui/accesskit stack (which would break
     # the 1.86 MSRV pin). Drop these when that stack moves to quick-xml >= 0.41.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    { id = "RUSTSEC-2026-0194", reason = "owner: @peter1490; review-by: 2027-01-31; quick-xml DoS, Linux AT-SPI bus only (no untrusted input); drop with the egui/accesskit upgrade" },
+    { id = "RUSTSEC-2026-0195", reason = "owner: @peter1490; review-by: 2027-01-31; quick-xml DoS, Linux AT-SPI bus only (no untrusted input); drop with the egui/accesskit upgrade" },
 
     # time 0.3.41 — stack-exhaustion DoS in the RFC 2822 date parser, patched only
     # in >= 0.3.47, which requires Rust 1.88 (above FileSec's 1.86 MSRV — every
@@ -58,7 +64,11 @@ ignore = [
     # validity dates, which asn1-rs builds from ASN.1 numeric components; the
     # vulnerable RFC 2822 string parser is never called on this path. Drop this
     # when the MSRV moves to >= 1.88 (then `cargo update -p time`).
-    "RUSTSEC-2026-0009",
+    { id = "RUSTSEC-2026-0009", reason = "owner: @peter1490; review-by: 2027-01-31; time RFC 2822 parser DoS, path unreached (passkey cert dates); drop with the MSRV 1.88 move" },
+    # (RUSTSEC-2024-0436, unmaintained `paste`, is in Cargo.lock only through
+    # wgpu-hal/metal, which no shipped target/feature set builds, so this graph
+    # never encounters it; it is accepted audit-only in .cargo/audit.toml.)
+
 ]
 
 [licenses]

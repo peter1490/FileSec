@@ -222,6 +222,11 @@ jobs:
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install cargo-audit --version 0.22.2 --locked
 
+      # Accepted advisories must name an owner and a review-by date that has not
+      # passed, and deny.toml and .cargo/audit.toml must list the same IDs.
+      - name: Advisory exceptions are owned, dated, and in sync
+        run: python3 scripts/check_advisory_exceptions.py
+
       # Fails the build on any advisory not explicitly accepted in deny.toml, on a
       # non-permissive license, or on a non-crates.io source.
       - name: cargo deny
@@ -230,6 +235,15 @@ jobs:
       # Canonical RustSec cross-check against Cargo.lock.
       - name: cargo audit
         run: cargo audit --deny unsound
+
+      # Report-only: the same scan run outside the repository, so no ignore list
+      # applies, published to the job summary. Keeps the accepted exceptions
+      # visible — a green gate is not "no known advisories".
+      - name: cargo audit (unsuppressed report)
+        run: |
+          cd "$RUNNER_TEMP"
+          cargo audit --file "$GITHUB_WORKSPACE/Cargo.lock" --json > unsuppressed.json || true
+          python3 "$GITHUB_WORKSPACE/scripts/advisory_report.py" unsuppressed.json >> "$GITHUB_STEP_SUMMARY"
 
   # Validate the GitHub Actions workflows themselves: action-reference format,
   # expression syntax, matrix/needs/permissions consistency, and the signing-gate
