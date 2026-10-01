@@ -18,7 +18,7 @@ use filesec_core::contacts::{ContactBook, Trust};
 use filesec_core::transport::{HelloReplayCache, RecordType, Responder};
 use filesec_core::{codec, format, Identity};
 
-use super::concurrency::{RateLimiter, Semaphore};
+use super::concurrency::{Permit, RateLimiter, Semaphore};
 use super::nat::PortMapping;
 use super::wire::{
     read_frame_until, read_handshake_frame_deadline, write_frame, MAX_FRAME, MAX_HANDSHAKE_FRAME,
@@ -241,8 +241,10 @@ pub fn run(
                 let _ = std::thread::Builder::new()
                     .name("filesec-net-conn".into())
                     .spawn(move || {
-                        let _permit = permit; // released when the worker exits
-                        service(&shared, stream, ip);
+                        // The handshake slot is handed to the connection, which
+                        // returns it as soon as the peer is authenticated and
+                        // admitted (or when it fails), not after the transfer.
+                        service(&shared, stream, ip, permit);
                     });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -266,8 +268,8 @@ fn forward_command(active_cmd: &Mutex<Option<mpsc::Sender<NetCommand>>>, cmd: Ne
 
 /// Worker-thread entry: run one connection to completion, then apply rate-limit
 /// bookkeeping and surface any user-facing error.
-fn service(shared: &Shared, stream: TcpStream, ip: IpAddr) {
-    match handle_conn(shared, stream, ip) {
+fn service(shared: &Shared, stream: TcpStream, ip: IpAddr, permit: Permit) {
+    match handle_conn(shared, stream, ip, permit) {
         Ok(()) => {}
         Err(err) => {
             if err.rate_limit {
@@ -283,7 +285,12 @@ fn service(shared: &Shared, stream: TcpStream, ip: IpAddr) {
 }
 
 /// Handle one accepted connection through to import (or a clean rejection/error).
-fn handle_conn(shared: &Shared, mut stream: TcpStream, ip: IpAddr) -> Result<(), ConnError> {
+fn handle_conn(
+    shared: &Shared,
+    mut stream: TcpStream,
+    ip: IpAddr,
+    handshake_slot: Permit,
+) -> Result<(), ConnError> {
     // Handshake phase: short per-read timeout so the deadline reader can enforce
     // the absolute HANDSHAKE_DEADLINE against a slow/dribbling peer.
     stream
@@ -340,6 +347,11 @@ fn handle_conn(shared: &Shared, mut stream: TcpStream, ip: IpAddr) -> Result<(),
         flag: &shared.transfer_active,
         active_cmd: &shared.active_cmd,
     };
+    // Authenticated and admitted: the bounded pool exists to cap concurrent
+    // *unauthenticated* handshakes, so hand the slot back now rather than
+    // holding it through the decision, receipt, and import. The single-transfer
+    // guard above keeps serializing transfers.
+    drop(handshake_slot);
     // Register a private decision channel; the accept loop forwards the user's
     // Accept/Reject/Cancel here. Done *before* the offer is emitted, so the UI's
     // reply can never race ahead of registration.
@@ -638,6 +650,77 @@ fn transfer_size_acceptable(size: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit item: the bounded pool caps concurrent *unauthenticated*
+    /// handshakes, so an admitted peer must hand its slot back instead of
+    /// holding it through the decision, receipt, and import.
+    #[test]
+    fn the_handshake_slot_is_returned_once_the_peer_is_admitted() {
+        use filesec_core::transport::Initiator;
+
+        let dir = std::env::temp_dir().join(format!(
+            "filesec-listener-slot-{}",
+            filesec_core::util::hex(&filesec_core::secret::random_array::<8>().unwrap())
+        ));
+        let store = Arc::new(Store::at_with_secure_storage(&dir, None).unwrap());
+        let bob = Arc::new(Identity::generate("Bob", 0).unwrap());
+        let alice = Identity::generate("Alice", 0).unwrap();
+        let mut contacts = ContactBook::default();
+        contacts.upsert(alice.public(), 0);
+        contacts.set_trust(&alice.fingerprint(), Trust::Verified, 0);
+        let (tx, events) = mpsc::channel();
+        let secret = [7u8; TRANSFER_SECRET_LEN];
+        let shared = Shared {
+            identity: bob.clone(),
+            store,
+            contacts: Arc::new(contacts),
+            emitter: super::super::Emitter {
+                tx,
+                ctx: egui::Context::default(),
+            },
+            secret: Arc::new(secret),
+            expected: Some(alice.fingerprint()),
+            stop: Arc::new(AtomicBool::new(false)),
+            transfer_active: Arc::new(AtomicBool::new(false)),
+            active_cmd: Arc::new(Mutex::new(None)),
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
+            replay_cache: Arc::new(HelloReplayCache::new(16)),
+        };
+        let slots = Semaphore::new(1);
+        let permit = slots.try_acquire().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker_shared = shared.clone();
+        let worker = std::thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            service(&worker_shared, stream, peer.ip(), permit);
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let initiator = Initiator::new(&alice, bob.fingerprint(), &secret).unwrap();
+        write_frame(&mut stream, &initiator.write_hello().unwrap()).unwrap();
+        let auth = super::super::wire::read_frame(&mut stream).unwrap();
+        let (confirm, _session) = initiator.read_auth_write_confirm(&auth).unwrap();
+        write_frame(&mut stream, &confirm).unwrap();
+
+        // Admission is announced with PeerConnected; the slot is free by then,
+        // while the transfer itself is still in progress (awaiting the offer).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(NetEvent::PeerConnected { .. }) => break,
+                Ok(_) => {}
+                Err(_) => assert!(Instant::now() < deadline, "peer never admitted"),
+            }
+        }
+        assert_eq!(slots.available(), 1, "slot still held after admission");
+        assert!(shared.transfer_active.load(Ordering::Acquire));
+
+        shared.stop.store(true, Ordering::Release);
+        drop(stream);
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn transfer_size_cap_rejects_above_ceiling() {
