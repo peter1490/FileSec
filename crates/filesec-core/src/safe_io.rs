@@ -110,7 +110,17 @@ impl SafeFileWriter {
     /// content *as it streamed* (per-chunk AEAD + a full-file BLAKE3 check); this
     /// method deliberately does not re-hash, so an upstream authentication failure
     /// surfaces before `commit` is ever reached and the temp is discarded.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.commit_durable().map(|_| ())
+    }
+
+    /// Like [`Self::commit`], but report whether the rename is **known
+    /// durable**: `Ok(true)` only if the containing directory was synced after
+    /// the rename. `Ok(false)` means the new content is in place but a crash
+    /// could still bring the previous directory entry back — so anything the
+    /// previous content referenced must not be deleted yet (FS-10). An `Err`
+    /// always means the rename did not happen.
+    pub fn commit_durable(mut self) -> Result<bool> {
         let mut file = self
             .file
             .take()
@@ -121,13 +131,12 @@ impl SafeFileWriter {
         // Guard against a symlink swapped in after creation (best-effort TOCTOU).
         reject_symlink(&self.dest)?;
         std::fs::rename(&self.tmp, &self.dest)?;
-        if let Some(parent) = self.dest.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
         self.committed = true;
-        Ok(())
+        let parent = match self.dest.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        Ok(sync_dir(&parent).is_ok())
     }
 }
 
@@ -155,6 +164,55 @@ impl Drop for SafeFileWriter {
             let _ = std::fs::remove_file(&self.tmp);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: make [`sync_dir`] fail, as on a platform or filesystem that
+    /// cannot make directory entries durable.
+    pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Flush a directory so the renames and unlinks inside it survive a crash.
+///
+/// Returns an error when the directory cannot be synced (an unsupported
+/// platform or filesystem, or an I/O failure); callers that delete data based
+/// on a rename must then treat that rename as not yet durable.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(std::cell::Cell::get) {
+        return Err(io::Error::other("injected directory sync failure"));
+    }
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        // A directory handle needs FILE_FLAG_BACKUP_SEMANTICS, and
+        // FlushFileBuffers needs write access to it.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Err(io::Error::other("directory sync is not supported here"))
+    }
+}
+
+/// Whether `name` is a temp file left by [`SafeFileWriter`] (its write never
+/// committed: an interrupted or crashed write).
+#[must_use]
+pub fn is_safe_writer_temp(name: &str) -> bool {
+    name.strip_prefix(".filesec-")
+        .and_then(|rest| rest.strip_suffix(".fstmp"))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Create every component of `dir` that lies beneath `root`, one level at a time,

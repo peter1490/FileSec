@@ -255,6 +255,10 @@ pub struct VaultReaderV2 {
     /// v1-shaped view of `manifest.entries` (kept in sync), so callers see the
     /// same [`Entry`] type a [`VaultReader`] exposes.
     view: Vec<Entry>,
+    /// Blobs superseded by a commit that is not yet known durable (FS-10). They
+    /// are unlinked only after a later commit whose directory sync succeeded,
+    /// because until then a crash could bring back a manifest that uses them.
+    pending_reclaim: Vec<String>,
 }
 
 fn view_of(manifest: &ManifestV2) -> Vec<Entry> {
@@ -371,6 +375,7 @@ impl VaultReaderV2 {
             owner_fingerprint: identity.fingerprint(),
             state: None,
             view: Vec::new(),
+            pending_reclaim: Vec::new(),
         };
         me.reseal_manifest()?;
         Ok(me)
@@ -420,6 +425,7 @@ impl VaultReaderV2 {
             owner_fingerprint: identity.fingerprint(),
             state: Some(envelope.state),
             view,
+            pending_reclaim: Vec::new(),
         })
     }
 
@@ -464,6 +470,7 @@ impl VaultReaderV2 {
             owner_fingerprint: identity.fingerprint(),
             state: None,
             view,
+            pending_reclaim: Vec::new(),
         };
         reader.reseal_manifest()?;
         Ok(reader)
@@ -708,7 +715,7 @@ impl VaultReaderV2 {
     /// atomically write it. Does **not** touch `self`: the caller adopts the
     /// returned state only after this succeeded. An error means the rename never
     /// happened, so the previous manifest is still the one on disk.
-    fn seal_and_write(&self, manifest: &ManifestV2) -> Result<StateMetadata> {
+    fn seal_and_write(&self, manifest: &ManifestV2) -> Result<(StateMetadata, bool)> {
         let pt = Zeroizing::new(codec::to_vec(manifest)?);
         let previous = self.state.as_ref().map(StateAnchor::from_metadata);
         let object_id = vault_object_id(&self.header_bytes)?;
@@ -729,8 +736,8 @@ impl VaultReaderV2 {
             nonce,
             ciphertext: ct,
         })?;
-        write_atomic(&self.dir.join(MANIFEST_FILE), &buf)?;
-        Ok(state)
+        let durable = write_atomic(&self.dir.join(MANIFEST_FILE), &buf)?;
+        Ok((state, durable))
     }
 
     /// Re-seal and rewrite `self.manifest` in place. Only for building a fresh
@@ -738,7 +745,7 @@ impl VaultReaderV2 {
     /// whole reader anyway; mutations of an existing vault go through
     /// [`Self::commit_edit`].
     fn reseal_manifest(&mut self) -> Result<()> {
-        let state = self.seal_and_write(&self.manifest)?;
+        let (state, _durable) = self.seal_and_write(&self.manifest)?;
         self.state = Some(state);
         self.view = view_of(&self.manifest);
         Ok(())
@@ -749,14 +756,68 @@ impl VaultReaderV2 {
     /// it — manifest, state, and view together. If the edit or the write fails,
     /// the reader is exactly as it was, so a later successful mutation can
     /// never persist an operation that was reported as failed.
-    fn commit_edit(&mut self, edit: impl FnOnce(&mut ManifestV2) -> Result<()>) -> Result<()> {
+    ///
+    /// Returns whether the commit is known durable (see
+    /// [`crate::safe_io::SafeFileWriter::commit_durable`]).
+    fn commit_edit(&mut self, edit: impl FnOnce(&mut ManifestV2) -> Result<()>) -> Result<bool> {
         let mut candidate = self.manifest.clone();
         edit(&mut candidate)?;
-        let state = self.seal_and_write(&candidate)?;
+        let (state, durable) = self.seal_and_write(&candidate)?;
         self.manifest = candidate;
         self.state = Some(state);
         self.view = view_of(&self.manifest);
-        Ok(())
+        Ok(durable)
+    }
+
+    /// Queue blobs the latest commit superseded, and unlink every queued blob
+    /// once a commit is known durable (FS-10). Until then a crash could bring
+    /// back the previous manifest, which still references them; deleting them
+    /// early would turn a lost rename into lost data.
+    fn reclaim(&mut self, superseded: Vec<String>, durable: bool) {
+        self.pending_reclaim.extend(superseded);
+        if durable {
+            for id in std::mem::take(&mut self.pending_reclaim) {
+                let _ = fs_err::remove_file(self.blob_path(&id));
+            }
+        }
+    }
+
+    /// Delete blobs (and interrupted-write temps) in this vault's blob
+    /// directory that the current manifest does not reference: leftovers of a
+    /// crash, or of a commit whose durability was never confirmed. Returns how
+    /// many files were removed.
+    ///
+    /// Runs only if the vault directory can be synced first, so the manifest
+    /// it judges by is durable; otherwise it removes nothing. The caller must
+    /// ensure no other writer is adding a blob to this vault at the same time
+    /// (the GUI store holds the vault's transaction lock).
+    pub fn collect_garbage(&mut self) -> Result<usize> {
+        if crate::safe_io::sync_dir(&self.dir).is_err()
+            || crate::safe_io::sync_dir(&self.dir.join(BLOBS_DIR)).is_err()
+        {
+            return Ok(0);
+        }
+        let referenced: std::collections::HashSet<&str> = self
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|e| e.file_id.as_deref())
+            .collect();
+        let mut removed = 0;
+        for entry in fs_err::read_dir(self.dir.join(BLOBS_DIR))? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let orphan_blob =
+                validate_blob_id(&name).is_ok() && !referenced.contains(name.as_str());
+            if (orphan_blob || crate::safe_io::is_safe_writer_temp(&name))
+                && entry.file_type()?.is_file()
+                && fs_err::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        self.pending_reclaim.clear();
+        Ok(removed)
     }
 
     /// Push directory entries for each missing ancestor of `norm` (in memory).
@@ -841,10 +902,8 @@ impl VaultReaderV2 {
             Ok(())
         });
         match result {
-            Ok(()) => {
-                if let Some(old_id) = replaced {
-                    let _ = fs_err::remove_file(self.blob_path(&old_id));
-                }
+            Ok(durable) => {
+                self.reclaim(replaced.into_iter().collect(), durable);
                 Ok(())
             }
             Err(e) => {
@@ -903,6 +962,7 @@ impl VaultReaderV2 {
             m.entries.push(dir_entry(norm));
             Ok(())
         })
+        .map(|durable| self.reclaim(Vec::new(), durable))
     }
 
     /// Remove the entry at `vault_path` and, if it is a directory, its whole
@@ -921,13 +981,11 @@ impl VaultReaderV2 {
             .filter(|e| matches(&e.path))
             .filter_map(|e| e.file_id.clone())
             .collect();
-        self.commit_edit(|m| {
+        let durable = self.commit_edit(|m| {
             m.entries.retain(|e| !matches(&e.path));
             Ok(())
         })?;
-        for id in removed_ids {
-            let _ = fs_err::remove_file(self.blob_path(&id));
-        }
+        self.reclaim(removed_ids, durable);
         Ok(())
     }
 
@@ -961,6 +1019,7 @@ impl VaultReaderV2 {
             }
             Ok(())
         })
+        .map(|durable| self.reclaim(Vec::new(), durable))
     }
 
     /// Update an entry's advisory mtime/mode (manifest-only).
@@ -981,6 +1040,7 @@ impl VaultReaderV2 {
             e.mode = mode;
             Ok(())
         })
+        .map(|durable| self.reclaim(Vec::new(), durable))
     }
 
     /// Build a fresh v2 vault at `dir` from an opened, verified v1 [`VaultReader`]
@@ -1393,10 +1453,12 @@ fn place_file(
     old
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Atomically write `bytes` to `path`; `Ok(true)` if the rename is known
+/// durable (see [`crate::safe_io::SafeFileWriter::commit_durable`]).
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<bool> {
     let mut writer = crate::safe_io::SafeFileWriter::create(path)?;
     writer.write_all(bytes)?;
-    writer.commit()
+    writer.commit_durable()
 }
 
 /// Encrypt `source` into a fresh blob at `path` (temp + fsync + rename), 0600.
@@ -1769,6 +1831,93 @@ mod tests {
             fs_err::remove_dir_all(&dir).unwrap();
             let _ = fs_err::remove_file(&source);
         }
+    }
+
+    fn blob_count(dir: &Path) -> usize {
+        fs_err::read_dir(dir.join(BLOBS_DIR)).unwrap().count()
+    }
+
+    fn set_dir_sync_failure(fail: bool) {
+        crate::safe_io::FAIL_DIR_SYNC.with(|f| f.set(fail));
+    }
+
+    /// FS-10: when the manifest rename is not known durable, the blob it
+    /// superseded must survive — a crash can bring the old manifest back.
+    #[test]
+    fn superseded_blobs_survive_a_lost_manifest_rename() {
+        for op in ["overwrite", "remove"] {
+            let dir = tmp(&format!("lost-rename-{op}"));
+            let identity = Identity::generate("Owner", 0).unwrap();
+            let mut reader =
+                VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+            reader.put_file_bytes("a.txt", b"old", None, None).unwrap();
+            let durable_manifest = fs_err::read(dir.join(MANIFEST_FILE)).unwrap();
+
+            set_dir_sync_failure(true);
+            match op {
+                "overwrite" => reader.put_file_bytes("a.txt", b"new", None, None),
+                _ => reader.remove_path("a.txt"),
+            }
+            .unwrap();
+            set_dir_sync_failure(false);
+            assert_eq!(blob_count(&dir), if op == "overwrite" { 2 } else { 1 });
+
+            // Crash: the un-synced rename is lost and the old manifest is back.
+            fs_err::write(dir.join(MANIFEST_FILE), &durable_manifest).unwrap();
+            let mut recovered = VaultReaderV2::open(&dir, &identity).unwrap();
+            assert_eq!(&*recovered.read_entry("a.txt").unwrap(), b"old", "{op}");
+
+            // Collection on the recovered state removes only the orphan.
+            let expected = if op == "overwrite" { 1 } else { 0 };
+            assert_eq!(recovered.collect_garbage().unwrap(), expected, "{op}");
+            assert_eq!(&*recovered.read_entry("a.txt").unwrap(), b"old", "{op}");
+            assert_eq!(blob_count(&dir), 1);
+            fs_err::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_blobs_are_reclaimed_by_the_next_durable_commit() {
+        let dir = tmp("queued-reclaim");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader.put_file_bytes("a.txt", b"one", None, None).unwrap();
+        set_dir_sync_failure(true);
+        reader.put_file_bytes("a.txt", b"two", None, None).unwrap();
+        reader
+            .put_file_bytes("a.txt", b"three", None, None)
+            .unwrap();
+        set_dir_sync_failure(false);
+        assert_eq!(blob_count(&dir), 3, "nothing reclaimed without durability");
+        reader.mkdir("later").unwrap();
+        assert_eq!(blob_count(&dir), 1, "a durable commit reclaims the queue");
+        assert_eq!(&*reader.read_entry("a.txt").unwrap(), b"three");
+        fs_err::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn garbage_collection_needs_a_durable_directory_and_spares_live_blobs() {
+        let dir = tmp("gc");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader.put_file_bytes("a.txt", b"live", None, None).unwrap();
+        let blobs = dir.join(BLOBS_DIR);
+        fs_err::write(blobs.join("0123456789abcdef0123456789abcdef"), b"orphan").unwrap();
+        fs_err::write(blobs.join(".filesec-0123456789abcdef.fstmp"), b"temp").unwrap();
+        fs_err::write(blobs.join("not-a-blob"), b"unknown").unwrap();
+
+        set_dir_sync_failure(true);
+        assert_eq!(reader.collect_garbage().unwrap(), 0);
+        set_dir_sync_failure(false);
+        assert_eq!(blob_count(&dir), 4);
+
+        assert_eq!(reader.collect_garbage().unwrap(), 2);
+        assert!(
+            blobs.join("not-a-blob").exists(),
+            "unknown files are left alone"
+        );
+        assert_eq!(&*reader.read_entry("a.txt").unwrap(), b"live");
+        fs_err::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

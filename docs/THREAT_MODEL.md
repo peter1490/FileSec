@@ -118,6 +118,12 @@ docs.
   present at the destination is never replaced. Both source entries and the
   user's existing files are preserved; the error names the conflicting paths
   (FS-09).
+- A v2 vault never deletes a blob on the strength of a manifest rename that is
+  not known durable: superseded blobs are unlinked only after a commit whose
+  directory sync succeeded, and blobs orphaned by a crash are collected (under
+  the vault's transaction lock, after a successful directory sync) the next
+  time the vault opens. Where a directory cannot be synced, the cost is disk
+  space, never a manifest that points at a deleted blob (FS-10).
 
 ### In transit (P2P networking build)
 

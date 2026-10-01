@@ -1288,7 +1288,7 @@ impl Store {
         if v2.exists() {
             // A crash after the migration commit but before the old file was
             // wiped can leave the v1 container behind; the v2 dir wins.
-            let reader = VaultReaderV2::open(&v2, identity).map_err(err)?;
+            let mut reader = VaultReaderV2::open(&v2, identity).map_err(err)?;
             let state = reader
                 .state_metadata()
                 .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
@@ -1301,6 +1301,11 @@ impl Store {
             if v1.exists() {
                 let _ = secure_wipe(&v1);
             }
+            // Reclaim blobs left unreferenced by a crash or by a commit whose
+            // durability was never confirmed (FS-10). Safe here: the vault's
+            // transaction lock is held, so no writer has a blob in flight, and
+            // the collector itself refuses to run unless the directory syncs.
+            let _ = reader.collect_garbage();
             return Ok(reader);
         }
         if self.vault_path(id).exists() {
