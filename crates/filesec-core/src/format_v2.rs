@@ -722,6 +722,10 @@ impl VaultReaderV2 {
     /// returned state only after this succeeded. An error means the rename never
     /// happened, so the previous manifest is still the one on disk.
     fn seal_and_write(&self, manifest: &ManifestV2) -> Result<(StateMetadata, bool)> {
+        // Blobs written since the last commit were renamed into place without a
+        // directory sync; make their entries durable before any manifest can
+        // reference them (best effort, as the per-blob sync used to be).
+        let _ = crate::safe_io::sync_dir(&self.dir.join(BLOBS_DIR));
         let pt = Zeroizing::new(codec::to_vec(manifest)?);
         let previous = self.state.as_ref().map(StateAnchor::from_metadata);
         let object_id = vault_object_id(&self.header_bytes)?;
@@ -757,22 +761,55 @@ impl VaultReaderV2 {
         Ok(())
     }
 
-    /// The single commit point of every mutation (FS-08): apply `edit` to a
-    /// **copy** of the manifest, seal and write that copy, and only then adopt
-    /// it — manifest, state, and view together. If the edit or the write fails,
-    /// the reader is exactly as it was, so a later successful mutation can
-    /// never persist an operation that was reported as failed.
+    /// The single commit point of every mutation (FS-08, O-03): run `edits`
+    /// against a [`VaultBatch`] — a **copy** of the manifest with a path index —
+    /// then seal and write that copy **once**, and only then adopt it
+    /// (manifest, state, and view together).
     ///
-    /// Returns whether the commit is known durable (see
-    /// [`crate::safe_io::SafeFileWriter::commit_durable`]).
-    fn commit_edit(&mut self, edit: impl FnOnce(&mut ManifestV2) -> Result<()>) -> Result<bool> {
-        let mut candidate = self.manifest.clone();
-        edit(&mut candidate)?;
-        let (state, durable) = self.seal_and_write(&candidate)?;
-        self.manifest = candidate;
-        self.state = Some(state);
-        self.view = view_of(&self.manifest);
-        Ok(durable)
+    /// All-or-nothing: if any edit or the write fails, the reader is exactly as
+    /// it was and every blob the batch staged is deleted, so a later successful
+    /// mutation can never persist an operation that was reported as failed. A
+    /// batch that changes nothing commits nothing. Blobs the batch superseded
+    /// are reclaimed only once the commit is known durable (FS-10).
+    ///
+    /// A batch holds at most [`MAX_BATCH_OPS`] operations; callers with more
+    /// work commit it in several batches.
+    pub fn commit_batch(
+        &mut self,
+        edits: impl FnOnce(&mut VaultBatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut batch = VaultBatch::new(self);
+        let edited = edits(&mut batch);
+        let VaultBatch {
+            manifest,
+            staged,
+            superseded,
+            changed,
+            ..
+        } = batch;
+        let committed = edited.and_then(|()| {
+            if changed {
+                self.seal_and_write(&manifest).map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        match committed {
+            Ok(Some((state, durable))) => {
+                self.manifest = manifest;
+                self.state = Some(state);
+                self.view = view_of(&self.manifest);
+                self.reclaim(superseded, durable);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                for id in staged {
+                    let _ = fs_err::remove_file(self.blob_path(&id));
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Queue blobs the latest commit superseded, and unlink every queued blob
@@ -888,37 +925,6 @@ impl VaultReaderV2 {
         ))
     }
 
-    /// Commit a staged blob as the file at `norm`; on failure delete the blob
-    /// (it was never referenced) and leave the reader unchanged. On success
-    /// delete the blob it replaced, if any.
-    #[allow(clippy::too_many_arguments)]
-    fn commit_file(
-        &mut self,
-        norm: String,
-        blob: StagedBlob,
-        blake3: [u8; 32],
-        size: u64,
-        mtime: Option<i64>,
-        mode: Option<u32>,
-    ) -> Result<()> {
-        let new_id = blob.file_id.clone();
-        let mut replaced = None;
-        let result = self.commit_edit(|m| {
-            replaced = place_file(m, norm, blob, blake3, size, mtime, mode);
-            Ok(())
-        });
-        match result {
-            Ok(durable) => {
-                self.reclaim(replaced.into_iter().collect(), durable);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = fs_err::remove_file(self.blob_path(&new_id));
-                Err(e)
-            }
-        }
-    }
-
     /// Add or replace the file at `vault_path` from a file on disk. Rewrites only
     /// that blob and the manifest.
     pub fn put_file(
@@ -928,12 +934,7 @@ impl VaultReaderV2 {
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let norm = normalize_path(vault_path)?;
-        reject_dir_at(&self.manifest, &norm)?;
-        let (blake3, size) = hash_path(source)?;
-        let reader = BufReader::new(fs_err::File::open(source)?);
-        let blob = self.write_blob(blake3, size, reader)?;
-        self.commit_file(norm, blob, blake3, size, mtime, mode)
+        self.commit_batch(|b| b.put_file(vault_path, source, mtime, mode))
     }
 
     /// Add or replace the file at `vault_path` from an in-memory buffer.
@@ -944,92 +945,26 @@ impl VaultReaderV2 {
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let norm = normalize_path(vault_path)?;
-        reject_dir_at(&self.manifest, &norm)?;
-        let blake3 = *blake3::hash(bytes).as_bytes();
-        let size = bytes.len() as u64;
-        let blob = self.write_blob(blake3, size, Cursor::new(bytes))?;
-        self.commit_file(norm, blob, blake3, size, mtime, mode)
+        self.commit_batch(|b| b.put_bytes(vault_path, bytes, mtime, mode))
     }
 
     /// Create an (empty) directory, plus any missing ancestors. A no-op if the
     /// directory already exists; errors if a file occupies the path.
     pub fn mkdir(&mut self, vault_path: &str) -> Result<()> {
-        let norm = normalize_path(vault_path)?;
-        if let Some(e) = self.manifest.entries.iter().find(|e| e.path == norm) {
-            return if e.kind == EntryKind::Dir {
-                Ok(())
-            } else {
-                Err(Error::Vault(format!("a file exists at {norm}")))
-            };
-        }
-        self.commit_edit(|m| {
-            ensure_dirs_in(m, &norm);
-            m.entries.push(dir_entry(norm));
-            Ok(())
-        })
-        .map(|durable| self.reclaim(Vec::new(), durable))
+        self.commit_batch(|b| b.mkdir(vault_path))
     }
 
     /// Remove the entry at `vault_path` and, if it is a directory, its whole
     /// subtree. Deletes the affected blobs. A no-op if nothing matches.
     pub fn remove_path(&mut self, vault_path: &str) -> Result<()> {
-        // An existing entry: accept a stored name an older version allowed, so
-        // a deceptive name can always be deleted.
-        let norm = crate::vault::normalize_stored_path(vault_path)?;
-        let prefix = format!("{norm}/");
-        let matches = |path: &str| path == norm || path.starts_with(&prefix);
-        if !self.manifest.entries.iter().any(|e| matches(&e.path)) {
-            return Ok(());
-        }
-        let removed_ids: Vec<String> = self
-            .manifest
-            .entries
-            .iter()
-            .filter(|e| matches(&e.path))
-            .filter_map(|e| e.file_id.clone())
-            .collect();
-        let durable = self.commit_edit(|m| {
-            m.entries.retain(|e| !matches(&e.path));
-            Ok(())
-        })?;
-        self.reclaim(removed_ids, durable);
-        Ok(())
+        self.commit_batch(|b| b.remove(vault_path))
     }
 
     /// Rename/move `from` to `to` (a file, or a directory with its whole subtree).
     /// Manifest-only — blobs are untouched. Errors if `to` already exists or `to`
     /// is inside `from`.
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
-        // `from` may be a stored name an older version allowed (so it can be
-        // fixed); the new name `to` must pass the strict rule.
-        let from = crate::vault::normalize_stored_path(from)?;
-        let to = normalize_path(to)?;
-        if from == to {
-            return Ok(());
-        }
-        let from_prefix = format!("{from}/");
-        if to == from || to.starts_with(&from_prefix) {
-            return Err(Error::Vault("cannot move a directory into itself".into()));
-        }
-        if !self.manifest.entries.iter().any(|e| e.path == from) {
-            return Err(Error::Vault(format!("not found: {from}")));
-        }
-        if self.manifest.entries.iter().any(|e| e.path == to) {
-            return Err(Error::Vault(format!("path already exists: {to}")));
-        }
-        self.commit_edit(|m| {
-            ensure_dirs_in(m, &to);
-            for e in &mut m.entries {
-                if e.path == from {
-                    e.path = to.clone();
-                } else if let Some(rest) = e.path.strip_prefix(&from_prefix) {
-                    e.path = format!("{to}/{rest}");
-                }
-            }
-            Ok(())
-        })
-        .map(|durable| self.reclaim(Vec::new(), durable))
+        self.commit_batch(|b| b.rename(from, to))
     }
 
     /// Update an entry's advisory mtime/mode (manifest-only).
@@ -1039,18 +974,7 @@ impl VaultReaderV2 {
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let norm = crate::vault::normalize_stored_path(vault_path)?;
-        self.commit_edit(|m| {
-            let e = m
-                .entries
-                .iter_mut()
-                .find(|e| e.path == norm)
-                .ok_or_else(|| Error::Vault(format!("not found: {norm}")))?;
-            e.mtime = mtime;
-            e.mode = mode;
-            Ok(())
-        })
-        .map(|durable| self.reclaim(Vec::new(), durable))
+        self.commit_batch(|b| b.set_attr(vault_path, mtime, mode))
     }
 
     /// Build a fresh v2 vault at `dir` from an opened, verified v1 [`VaultReader`]
@@ -1399,6 +1323,261 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
 
 /// Atomically write `bytes` to `path`: temp + fsync + rename (+ best-effort dir
 /// fsync), hardened to 0600 on Unix.
+/// Most operations one [`VaultBatch`] accepts. Bounds the manifest work,
+/// the staged-but-uncommitted blobs, and what a failure rolls back.
+pub const MAX_BATCH_OPS: usize = 1024;
+
+/// A set of mutations committed together by [`VaultReaderV2::commit_batch`]
+/// (O-03): one candidate manifest, one seal and fsync, one rollback-state
+/// transition — instead of one per changed file. A path index makes existence
+/// and parent-type checks O(1). Every file still goes through the same
+/// source length/hash verification as a single [`VaultReaderV2::put_file`].
+pub struct VaultBatch<'r> {
+    reader: &'r VaultReaderV2,
+    manifest: ManifestV2,
+    /// Path → position in `manifest.entries`.
+    index: std::collections::HashMap<String, usize>,
+    /// Blobs written by this batch (deleted if it does not commit).
+    staged: Vec<String>,
+    /// Blobs the batch's manifest no longer references (reclaimed after a
+    /// durable commit).
+    superseded: Vec<String>,
+    changed: bool,
+    ops: usize,
+}
+
+impl<'r> VaultBatch<'r> {
+    fn new(reader: &'r VaultReaderV2) -> Self {
+        let manifest = reader.manifest.clone();
+        let index = index_entries(&manifest);
+        Self {
+            reader,
+            manifest,
+            index,
+            staged: Vec::new(),
+            superseded: Vec::new(),
+            changed: false,
+            ops: 0,
+        }
+    }
+
+    fn count_op(&mut self) -> Result<()> {
+        self.ops += 1;
+        if self.ops > MAX_BATCH_OPS {
+            return Err(Error::Vault(format!(
+                "a batch holds at most {MAX_BATCH_OPS} operations"
+            )));
+        }
+        Ok(())
+    }
+
+    fn kind_at(&self, path: &str) -> Option<EntryKind> {
+        self.index.get(path).map(|&i| self.manifest.entries[i].kind)
+    }
+
+    fn reindex(&mut self) {
+        self.index = index_entries(&self.manifest);
+    }
+
+    /// Push directory entries for each missing ancestor of `norm`.
+    fn ensure_dirs(&mut self, norm: &str) {
+        let comps: Vec<&str> = norm.split('/').collect();
+        let mut acc = String::new();
+        for comp in comps.iter().take(comps.len().saturating_sub(1)) {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(comp);
+            if !self.index.contains_key(&acc) {
+                self.index.insert(acc.clone(), self.manifest.entries.len());
+                self.manifest.entries.push(dir_entry(acc.clone()));
+            }
+        }
+    }
+
+    fn place(
+        &mut self,
+        norm: String,
+        blob: StagedBlob,
+        blake3: [u8; 32],
+        size: u64,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) {
+        self.staged.push(blob.file_id.clone());
+        let entry = EntryV2 {
+            path: norm.clone(),
+            kind: EntryKind::File,
+            size,
+            mtime,
+            mode,
+            blake3,
+            file_id: Some(blob.file_id),
+            key: Some(blob.key),
+            nonce: Some(blob.nonce),
+            chunk_size: aead::DEFAULT_CHUNK_SIZE as u32,
+        };
+        match self.index.get(&norm) {
+            Some(&i) => {
+                let old = std::mem::replace(&mut self.manifest.entries[i], entry);
+                self.superseded.extend(old.file_id);
+            }
+            None => {
+                self.ensure_dirs(&norm);
+                self.index.insert(norm, self.manifest.entries.len());
+                self.manifest.entries.push(entry);
+            }
+        }
+        self.changed = true;
+    }
+
+    fn reject_dir(&self, norm: &str) -> Result<()> {
+        if self.kind_at(norm) == Some(EntryKind::Dir) {
+            return Err(Error::Vault(format!("a directory exists at {norm}")));
+        }
+        Ok(())
+    }
+
+    /// Add or replace a file from disk (hashed, then encrypted and re-verified).
+    pub fn put_file(
+        &mut self,
+        vault_path: &str,
+        source: &Path,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.count_op()?;
+        let norm = normalize_path(vault_path)?;
+        self.reject_dir(&norm)?;
+        let (blake3, size) = hash_path(source)?;
+        let reader = BufReader::new(fs_err::File::open(source)?);
+        let blob = self.reader.write_blob(blake3, size, reader)?;
+        self.place(norm, blob, blake3, size, mtime, mode);
+        Ok(())
+    }
+
+    /// Add or replace a file from an in-memory buffer.
+    pub fn put_bytes(
+        &mut self,
+        vault_path: &str,
+        bytes: &[u8],
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.count_op()?;
+        let norm = normalize_path(vault_path)?;
+        self.reject_dir(&norm)?;
+        let blake3 = *blake3::hash(bytes).as_bytes();
+        let size = bytes.len() as u64;
+        let blob = self.reader.write_blob(blake3, size, Cursor::new(bytes))?;
+        self.place(norm, blob, blake3, size, mtime, mode);
+        Ok(())
+    }
+
+    /// Create a directory and any missing ancestors (no-op if it exists).
+    pub fn mkdir(&mut self, vault_path: &str) -> Result<()> {
+        self.count_op()?;
+        let norm = normalize_path(vault_path)?;
+        match self.kind_at(&norm) {
+            Some(EntryKind::Dir) => Ok(()),
+            Some(EntryKind::File) => Err(Error::Vault(format!("a file exists at {norm}"))),
+            None => {
+                self.ensure_dirs(&norm);
+                self.index.insert(norm.clone(), self.manifest.entries.len());
+                self.manifest.entries.push(dir_entry(norm));
+                self.changed = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove an entry and, for a directory, its subtree (no-op if absent).
+    pub fn remove(&mut self, vault_path: &str) -> Result<()> {
+        self.count_op()?;
+        // An existing entry: accept a stored name an older version allowed, so
+        // a deceptive name can always be deleted.
+        let norm = crate::vault::normalize_stored_path(vault_path)?;
+        let prefix = format!("{norm}/");
+        let before = self.manifest.entries.len();
+        let mut removed = Vec::new();
+        self.manifest.entries.retain(|e| {
+            let hit = e.path == norm || e.path.starts_with(&prefix);
+            if hit {
+                removed.extend(e.file_id.clone());
+            }
+            !hit
+        });
+        if self.manifest.entries.len() != before {
+            self.superseded.extend(removed);
+            self.changed = true;
+            self.reindex();
+        }
+        Ok(())
+    }
+
+    /// Rename/move a file or a directory with its subtree (manifest-only).
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.count_op()?;
+        // `from` may be a stored name an older version allowed (so it can be
+        // fixed); the new name `to` must pass the strict rule.
+        let from = crate::vault::normalize_stored_path(from)?;
+        let to = normalize_path(to)?;
+        if from == to {
+            return Ok(());
+        }
+        let from_prefix = format!("{from}/");
+        if to.starts_with(&from_prefix) {
+            return Err(Error::Vault("cannot move a directory into itself".into()));
+        }
+        if !self.index.contains_key(&from) {
+            return Err(Error::Vault(format!("not found: {from}")));
+        }
+        if self.index.contains_key(&to) {
+            return Err(Error::Vault(format!("path already exists: {to}")));
+        }
+        self.ensure_dirs(&to);
+        for e in &mut self.manifest.entries {
+            if e.path == from {
+                e.path = to.clone();
+            } else if let Some(rest) = e.path.strip_prefix(&from_prefix) {
+                e.path = format!("{to}/{rest}");
+            }
+        }
+        self.changed = true;
+        self.reindex();
+        Ok(())
+    }
+
+    /// Update an entry's advisory mtime/mode (manifest-only).
+    pub fn set_attr(
+        &mut self,
+        vault_path: &str,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.count_op()?;
+        let norm = crate::vault::normalize_stored_path(vault_path)?;
+        let i = *self
+            .index
+            .get(&norm)
+            .ok_or_else(|| Error::Vault(format!("not found: {norm}")))?;
+        let e = &mut self.manifest.entries[i];
+        e.mtime = mtime;
+        e.mode = mode;
+        self.changed = true;
+        Ok(())
+    }
+}
+
+fn index_entries(manifest: &ManifestV2) -> std::collections::HashMap<String, usize> {
+    manifest
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path.clone(), i))
+        .collect()
+}
+
 /// A freshly encrypted blob that no manifest references yet.
 struct StagedBlob {
     file_id: String,
@@ -1472,6 +1651,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<bool> {
 }
 
 /// Encrypt `source` into a fresh blob at `path` (temp + fsync + rename), 0600.
+/// The blobs directory is **not** synced here: every path that commits a
+/// manifest referencing new blobs first calls [`sync_blob_dir`] once, so a
+/// batch of N files costs one directory sync instead of N (O-03).
 fn encrypt_blob<R: Read>(
     path: &Path,
     alg: aead::AeadAlg,
@@ -1483,7 +1665,7 @@ fn encrypt_blob<R: Read>(
 ) -> Result<()> {
     let mut writer = crate::safe_io::SafeFileWriter::create(path)?;
     aead::encrypt_stream_with(alg, key, nonce, aad, source, &mut writer, chunk_size)?;
-    writer.commit()
+    writer.commit_without_dir_sync()
 }
 
 #[cfg(unix)]

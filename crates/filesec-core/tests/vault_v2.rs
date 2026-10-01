@@ -810,3 +810,138 @@ fn extraction_never_replaces_an_existing_file() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// O-03: a batch is one candidate manifest, one seal, and one state
+/// transition, and it commits all-or-nothing.
+#[test]
+fn a_batch_commits_once_and_atomically() {
+    use filesec_core::format_v2::MAX_BATCH_OPS;
+
+    let identity = ident("Owner");
+    let dir = tmp_dir("batch");
+    let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+    let epoch = |r: &VaultReaderV2| r.state_metadata().unwrap().epoch;
+    let blobs = |d: &Path| std::fs::read_dir(d.join("blobs")).unwrap().count();
+    let start = epoch(&reader);
+
+    reader
+        .commit_batch(|b| {
+            for i in 0..50 {
+                b.put_bytes(
+                    &format!("docs/f{i}.txt"),
+                    format!("{i}").as_bytes(),
+                    None,
+                    None,
+                )?;
+            }
+            b.mkdir("empty")?;
+            b.rename("docs/f0.txt", "moved/f0.txt")?;
+            b.remove("docs/f1.txt")?;
+            b.put_bytes("docs/f2.txt", b"replaced", None, None)
+        })
+        .unwrap();
+    assert_eq!(
+        epoch(&reader),
+        start + 1,
+        "one state transition for the batch"
+    );
+    assert_eq!(blobs(&dir), 49, "removed and replaced blobs reclaimed");
+    let reopened = VaultReaderV2::open(&dir, &identity).unwrap();
+    assert_eq!(&*reopened.read_entry("moved/f0.txt").unwrap(), b"0");
+    assert!(reopened.read_entry("docs/f1.txt").is_err());
+    assert_eq!(&*reopened.read_entry("docs/f2.txt").unwrap(), b"replaced");
+
+    // A failing operation rolls back the whole batch, including blobs it staged.
+    let before = epoch(&reader);
+    let result = reader.commit_batch(|b| {
+        b.put_bytes("new-a.txt", b"a", None, None)?;
+        b.put_bytes("new-b.txt", b"b", None, None)?;
+        b.put_bytes("docs", b"a directory is here", None, None)
+    });
+    assert!(result.is_err());
+    assert_eq!(epoch(&reader), before);
+    assert!(reader.read_entry("new-a.txt").is_err());
+    assert_eq!(
+        blobs(&dir),
+        49,
+        "staged blobs of a failed batch are deleted"
+    );
+
+    // A batch that changes nothing commits nothing.
+    reader.commit_batch(|b| b.mkdir("empty")).unwrap();
+    assert_eq!(epoch(&reader), before);
+
+    // Batches are bounded.
+    let result = reader.commit_batch(|b| {
+        for i in 0..=MAX_BATCH_OPS {
+            b.mkdir(&format!("d{i}"))?;
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(epoch(&reader), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// O-03 benchmark: thousands of small files and moves, one commit per file
+/// (the old behavior) versus bounded batches. Opt-in, since it is about
+/// timing rather than correctness:
+///   cargo test -p filesec-core --release --test vault_v2 -- --ignored --nocapture
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn bench_bulk_small_files_and_moves() {
+    use filesec_core::format_v2::MAX_BATCH_OPS;
+    use std::time::Instant;
+
+    const FILES: usize = 2_000;
+    let identity = ident("Owner");
+    let payload = b"small file";
+
+    let dir = tmp_dir("bench-single");
+    let mut single = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+    let t = Instant::now();
+    for i in 0..FILES {
+        single
+            .put_file_bytes(&format!("in/f{i}.txt"), payload, None, None)
+            .unwrap();
+    }
+    let single_put = t.elapsed();
+    let t = Instant::now();
+    for i in 0..FILES {
+        single
+            .rename(&format!("in/f{i}.txt"), &format!("out/f{i}.txt"))
+            .unwrap();
+    }
+    let single_move = t.elapsed();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dir = tmp_dir("bench-batch");
+    let mut batched = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+    let ids: Vec<usize> = (0..FILES).collect();
+    let t = Instant::now();
+    for chunk in ids.chunks(MAX_BATCH_OPS) {
+        batched
+            .commit_batch(|b| {
+                chunk
+                    .iter()
+                    .try_for_each(|i| b.put_bytes(&format!("in/f{i}.txt"), payload, None, None))
+            })
+            .unwrap();
+    }
+    let batch_put = t.elapsed();
+    let t = Instant::now();
+    for chunk in ids.chunks(MAX_BATCH_OPS) {
+        batched
+            .commit_batch(|b| {
+                chunk
+                    .iter()
+                    .try_for_each(|i| b.rename(&format!("in/f{i}.txt"), &format!("out/f{i}.txt")))
+            })
+            .unwrap();
+    }
+    let batch_move = t.elapsed();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    println!("{FILES} small files: per-file commits {single_put:?}, batched {batch_put:?}");
+    println!("{FILES} moves:       per-move commits {single_move:?}, batched {batch_move:?}");
+}

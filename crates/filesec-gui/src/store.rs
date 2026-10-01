@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use filesec_core::contacts::ContactBook;
 use filesec_core::format::{self, ExportOptions};
-use filesec_core::format_v2::VaultReaderV2;
+use filesec_core::format_v2::{VaultBatch, VaultReaderV2, MAX_BATCH_OPS};
 use filesec_core::identity::Identity;
 use filesec_core::keystore::KeystoreFile;
 use filesec_core::manifest::EntryKind;
@@ -915,6 +915,33 @@ impl Store {
         })
     }
 
+    /// Apply `op` to every item as bounded batches (O-03): each batch is one
+    /// candidate manifest, one seal, and one anchor transition, and commits
+    /// all-or-nothing. Items are applied in order, so a later item sees the
+    /// tree left by the earlier ones.
+    fn mutate_vault_in_batches<T>(
+        &self,
+        reader: &VaultReaderV2,
+        items: &[T],
+        op: impl Fn(&mut VaultBatch<'_>, &T) -> filesec_core::Result<()>,
+    ) -> StoreResult<()> {
+        let object_id = reader
+            .state_metadata()
+            .map(|state| state.object_id.clone())
+            .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+        self.in_txn(StateObjectType::VaultManifest, &object_id, || {
+            self.ensure_current_vault(reader)?;
+            let mut writer = reader.clone();
+            for chunk in items.chunks(MAX_BATCH_OPS) {
+                writer
+                    .commit_batch(|batch| chunk.iter().try_for_each(|item| op(batch, item)))
+                    .map_err(err)?;
+                self.commit_vault_reader(&writer)?;
+            }
+            Ok(())
+        })
+    }
+
     fn current_anchor(
         &self,
         identity_fingerprint: [u8; 32],
@@ -1542,16 +1569,33 @@ impl Store {
             .state_metadata()
             .map(|state| state.object_id.clone())
             .ok_or_else(|| "vault has no rollback-protection metadata".to_string())?;
+        enum Add<'a> {
+            Dir(&'a str),
+            File(&'a format::AddedFile),
+        }
+        let ops: Vec<Add<'_>> = added_dirs
+            .iter()
+            .map(|d| Add::Dir(d))
+            .chain(added.iter().map(Add::File))
+            .collect();
         self.in_txn(StateObjectType::VaultManifest, &object_id, || {
             self.ensure_current_vault(reader)?;
             let mut writer = reader.clone();
-            for d in added_dirs {
-                writer.mkdir(d).map_err(err)?;
-                self.commit_vault_reader(&writer)?;
-            }
-            for f in added {
+            // One manifest seal and one anchor transition per bounded batch
+            // instead of one per file (O-03); each batch commits atomically.
+            for chunk in ops.chunks(MAX_BATCH_OPS) {
                 writer
-                    .put_file(&f.vault_path, &f.source, f.mtime, f.mode)
+                    .commit_batch(|batch| {
+                        for op in chunk {
+                            match op {
+                                Add::Dir(d) => batch.mkdir(d)?,
+                                Add::File(f) => {
+                                    batch.put_file(&f.vault_path, &f.source, f.mtime, f.mode)?
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
                     .map_err(err)?;
                 self.commit_vault_reader(&writer)?;
             }
@@ -1569,13 +1613,7 @@ impl Store {
         reader: &VaultReaderV2,
         remove: &[String],
     ) -> StoreResult<()> {
-        self.mutate_vault(reader, |writer| {
-            for p in remove {
-                writer.remove_path(p).map_err(err)?;
-                self.commit_vault_reader(writer)?;
-            }
-            Ok(())
-        })
+        self.mutate_vault_in_batches(reader, remove, |batch, path| batch.remove(path))
     }
 
     /// Apply a batch of manifest-only renames (`from` -> `to`) to an existing v2
@@ -1590,13 +1628,7 @@ impl Store {
         reader: &VaultReaderV2,
         pairs: &[(String, String)],
     ) -> StoreResult<()> {
-        self.mutate_vault(reader, |writer| {
-            for (from, to) in pairs {
-                writer.rename(from, to).map_err(err)?;
-                self.commit_vault_reader(writer)?;
-            }
-            Ok(())
-        })
+        self.mutate_vault_in_batches(reader, pairs, |batch, (from, to)| batch.rename(from, to))
     }
 
     /// Write `bytes` to `vault_path` inside an existing v2 vault (creating or

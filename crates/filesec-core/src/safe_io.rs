@@ -120,7 +120,18 @@ impl SafeFileWriter {
     /// could still bring the previous directory entry back — so anything the
     /// previous content referenced must not be deleted yet (FS-10). An `Err`
     /// always means the rename did not happen.
-    pub fn commit_durable(mut self) -> Result<bool> {
+    pub fn commit_durable(self) -> Result<bool> {
+        let parent = self.parent_dir();
+        self.commit_without_dir_sync()?;
+        Ok(sync_dir(&parent).is_ok())
+    }
+
+    /// Flush, fsync, and atomically rename into place, **without** syncing the
+    /// containing directory. For a caller that renames many files into one
+    /// directory and then makes them durable together with a single
+    /// [`sync_dir`] before anything depends on them (a v2 batch: every blob,
+    /// then one directory sync, then the manifest that references them).
+    pub fn commit_without_dir_sync(mut self) -> Result<()> {
         let mut file = self
             .file
             .take()
@@ -132,11 +143,14 @@ impl SafeFileWriter {
         reject_symlink(&self.dest)?;
         std::fs::rename(&self.tmp, &self.dest)?;
         self.committed = true;
-        let parent = match self.dest.parent() {
+        Ok(())
+    }
+
+    fn parent_dir(&self) -> PathBuf {
+        match self.dest.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
-        };
-        Ok(sync_dir(&parent).is_ok())
+        }
     }
 }
 
