@@ -106,7 +106,7 @@ impl Vault {
         if self.contains(&norm) {
             return Err(Error::Vault(format!("path already exists: {norm}")));
         }
-        self.ensure_parents(&norm);
+        self.ensure_parents(&norm)?;
         self.entries.push(VaultEntry {
             path: norm,
             kind: EntryKind::File,
@@ -120,10 +120,12 @@ impl Vault {
     /// Add an explicit (possibly empty) directory.
     pub fn add_dir(&mut self, path: &str) -> Result<()> {
         let norm = normalize_path(path)?;
-        if self.contains(&norm) {
-            return Ok(());
+        match self.entries.iter().find(|e| e.path == norm) {
+            Some(e) if e.kind == EntryKind::Dir => return Ok(()),
+            Some(_) => return Err(Error::Vault(format!("a file exists at {norm}"))),
+            None => {}
         }
-        self.ensure_parents(&norm);
+        self.ensure_parents(&norm)?;
         self.entries.push(VaultEntry {
             path: norm,
             kind: EntryKind::Dir,
@@ -148,8 +150,9 @@ impl Vault {
         before - self.entries.len()
     }
 
-    /// Push directory entries for each missing ancestor of `path`.
-    fn ensure_parents(&mut self, path: &str) {
+    /// Push directory entries for each missing ancestor of `path`, refusing
+    /// to treat an existing file as a directory.
+    fn ensure_parents(&mut self, path: &str) -> Result<()> {
         let mut acc = String::new();
         let comps: Vec<&str> = path.split('/').collect();
         for comp in comps.iter().take(comps.len().saturating_sub(1)) {
@@ -157,16 +160,23 @@ impl Vault {
                 acc.push('/');
             }
             acc.push_str(comp);
-            if !self.entries.iter().any(|e| e.path == acc) {
-                self.entries.push(VaultEntry {
+            match self.entries.iter().find(|e| e.path == acc) {
+                Some(e) if e.kind == EntryKind::Dir => {}
+                Some(_) => {
+                    return Err(Error::Vault(format!(
+                        "a file exists at {acc}; it cannot contain other entries"
+                    )))
+                }
+                None => self.entries.push(VaultEntry {
                     path: acc.clone(),
                     kind: EntryKind::Dir,
                     mtime: None,
                     mode: None,
                     content: Zeroizing::new(Vec::new()),
-                });
+                }),
             }
         }
+        Ok(())
     }
 
     /// Internal: append a pre-validated entry (used by the importer, which has
@@ -280,6 +290,27 @@ pub(crate) fn normalize_stored_path(path: &str) -> Result<String> {
         return Err(Error::Vault("path is too deep".into()));
     }
     Ok(components.join("/"))
+}
+
+/// Reject a tree in which a file is an ancestor of another entry (`a` a file
+/// while `a/b` exists): such a manifest cannot be extracted faithfully and has
+/// no consistent meaning in the browser. `entries` are normalized paths.
+pub(crate) fn check_tree_shape(entries: &[(String, EntryKind)]) -> Result<()> {
+    let files: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|(_, kind)| *kind == EntryKind::File)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    for (path, _) in entries {
+        let mut cur = path.as_str();
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            if files.contains(parent) {
+                return Err(Error::Format("a file entry is used as a directory"));
+            }
+            cur = parent;
+        }
+    }
+    Ok(())
 }
 
 /// Render a vault path for display with every invisible or bidirectional
@@ -468,5 +499,31 @@ mod tests {
         );
         // Ordinary non-ASCII names are untouched.
         assert!(normalize_path("caf\u{e9}/\u{65e5}\u{672c}.txt").is_ok());
+    }
+
+    #[test]
+    fn a_file_cannot_be_used_as_a_directory() {
+        let mut vault = Vault::new("V", 0);
+        vault.add_file("a", b"file".to_vec(), None, None).unwrap();
+        assert!(vault
+            .add_file("a/b", b"child".to_vec(), None, None)
+            .is_err());
+        assert!(vault.add_dir("a").is_err(), "a file already occupies it");
+        assert!(vault.add_dir("a/sub").is_err());
+        vault.add_dir("d").unwrap();
+        vault.add_dir("d").unwrap();
+        vault
+            .add_file("d/e.txt", b"ok".to_vec(), None, None)
+            .unwrap();
+        assert!(check_tree_shape(&[
+            ("a".into(), EntryKind::File),
+            ("a/b".into(), EntryKind::File),
+        ])
+        .is_err());
+        assert!(check_tree_shape(&[
+            ("d".into(), EntryKind::Dir),
+            ("d/e".into(), EntryKind::File),
+        ])
+        .is_ok());
     }
 }

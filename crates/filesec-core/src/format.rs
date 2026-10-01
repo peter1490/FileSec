@@ -882,8 +882,10 @@ fn validate_manifest_layout(
     }
     let mut total_plaintext: u64 = 0;
     let mut seen = BTreeSet::new();
+    let mut shape = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         let p = normalize_path(&entry.path)?;
+        shape.push((p.clone(), entry.kind));
         if !seen.insert(p) {
             return Err(Error::Format("duplicate path in manifest"));
         }
@@ -904,6 +906,8 @@ fn validate_manifest_layout(
     if num_chunks > u32::MAX as u64 {
         return Err(Error::Format("too many chunks"));
     }
+    // A file may never be an ancestor of another entry.
+    crate::vault::check_tree_shape(&shape)?;
     let expected = total_plaintext
         .checked_add(num_chunks.saturating_mul(aead::TAG_LEN as u64))
         .ok_or(Error::Format("length overflow"))?;

@@ -113,12 +113,14 @@ fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()>
         return Err(Error::Format("too many manifest entries"));
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut shape = Vec::with_capacity(manifest.entries.len());
     let mut total_size = 0u64;
     for e in &manifest.entries {
         // The user's own stored vault: formatting characters an older version
         // accepted must not lock them out (they are shown escaped and must be
         // renamed before extraction or export, which use the strict rule).
         let norm = crate::vault::normalize_stored_path(&e.path)?;
+        shape.push((norm.clone(), e.kind));
         if !seen.insert(norm) {
             return Err(Error::Format("duplicate path in manifest"));
         }
@@ -146,7 +148,7 @@ fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()>
             }
         }
     }
-    Ok(())
+    crate::vault::check_tree_shape(&shape)
 }
 
 /// Plaintext header file. Stable for the vault's lifetime; fed as AAD into the
@@ -779,7 +781,25 @@ impl VaultReaderV2 {
         &mut self,
         edits: impl FnOnce(&mut VaultBatch<'_>) -> Result<()>,
     ) -> Result<()> {
-        let mut batch = VaultBatch::new(self);
+        self.commit_with(Some(MAX_BATCH_OPS), edits)
+    }
+
+    /// Fill a freshly created vault from an already-validated source in one
+    /// commit (no operation bound). The builders use the same indexed editor
+    /// as every mutation, so building is linear in the number of entries.
+    fn commit_build(
+        &mut self,
+        edits: impl FnOnce(&mut VaultBatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.commit_with(None, edits)
+    }
+
+    fn commit_with(
+        &mut self,
+        limit: Option<usize>,
+        edits: impl FnOnce(&mut VaultBatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut batch = VaultBatch::new(self, limit);
         let edited = edits(&mut batch);
         let VaultBatch {
             manifest,
@@ -864,11 +884,6 @@ impl VaultReaderV2 {
         Ok(removed)
     }
 
-    /// Push directory entries for each missing ancestor of `norm` (in memory).
-    fn ensure_dirs(&mut self, norm: &str) {
-        ensure_dirs_in(&mut self.manifest, norm);
-    }
-
     /// Encrypt `source` into a fresh, not yet referenced blob, verifying that
     /// the bytes actually encrypted match `blake3`/`size`. On a mismatch the
     /// blob is removed and [`Error::Auth`] returned.
@@ -898,32 +913,6 @@ impl VaultReaderV2 {
             key: BlobKey(*key.as_bytes()),
             nonce,
         })
-    }
-
-    /// Encrypt a new blob and stage the entry **in memory** (no reseal). Returns
-    /// the old blob's `file_id` if this overwrote an existing file, so the caller
-    /// can delete it after the manifest commit. Errors (leaving memory unchanged)
-    /// if a directory already occupies `norm`. Used by the fresh-vault builders.
-    fn stage_file<R: Read>(
-        &mut self,
-        norm: String,
-        blake3: [u8; 32],
-        size: u64,
-        source: R,
-        mtime: Option<i64>,
-        mode: Option<u32>,
-    ) -> Result<Option<String>> {
-        reject_dir_at(&self.manifest, &norm)?;
-        let blob = self.write_blob(blake3, size, source)?;
-        Ok(place_file(
-            &mut self.manifest,
-            norm,
-            blob,
-            blake3,
-            size,
-            mtime,
-            mode,
-        ))
     }
 
     /// Add or replace the file at `vault_path` from a file on disk. Rewrites only
@@ -1026,37 +1015,32 @@ impl VaultReaderV2 {
         };
         let mut plaintext = reader.plaintext_stream()?;
         let mut offset: u64 = 0;
-        for e in reader.entries() {
-            match e.kind {
-                EntryKind::Dir => {
-                    if !me.manifest.entries.iter().any(|x| x.path == e.path) {
-                        me.ensure_dirs(&e.path);
-                        me.manifest.entries.push(dir_entry(e.path.clone()));
+        me.commit_build(|b| {
+            for e in reader.entries() {
+                match e.kind {
+                    EntryKind::Dir => b.add_dir_trusted(&e.path)?,
+                    EntryKind::File => {
+                        // Files are laid out contiguously in entry order; the next
+                        // `e.size` bytes of the stream are exactly this file's content.
+                        if e.data_offset != offset {
+                            return Err(Error::Format("non-contiguous data offset"));
+                        }
+                        let src = (&mut plaintext).take(e.size);
+                        b.put_stream_trusted(&e.path, e.blake3, e.size, src, e.mtime, e.mode)?;
+                        offset = offset
+                            .checked_add(e.size)
+                            .ok_or(Error::Format("size overflow"))?;
                     }
-                }
-                EntryKind::File => {
-                    // Files are laid out contiguously in entry order; the next
-                    // `e.size` bytes of the stream are exactly this file's content.
-                    if e.data_offset != offset {
-                        return Err(Error::Format("non-contiguous data offset"));
-                    }
-                    let mut src = (&mut plaintext).take(e.size);
-                    // Fresh vault, so this never overwrites (no old blob to drop).
-                    me.stage_file(e.path.clone(), e.blake3, e.size, &mut src, e.mtime, e.mode)?;
-                    offset = offset
-                        .checked_add(e.size)
-                        .ok_or(Error::Format("size overflow"))?;
                 }
             }
-        }
-        // The stream must end exactly at the last file — no trailing plaintext.
-        let mut extra = [0u8; 1];
-        match plaintext.read(&mut extra) {
-            Ok(0) => {}
-            Ok(_) => return Err(Error::Format("trailing data after last entry")),
-            Err(e) => return Err(Error::Io(e)),
-        }
-        me.reseal_manifest()?;
+            // The stream must end exactly at the last file — no trailing plaintext.
+            let mut extra = [0u8; 1];
+            match plaintext.read(&mut extra) {
+                Ok(0) => Ok(()),
+                Ok(_) => Err(Error::Format("trailing data after last entry")),
+                Err(e) => Err(Error::Io(e)),
+            }
+        })?;
         Ok(me)
     }
 
@@ -1118,24 +1102,20 @@ impl VaultReaderV2 {
         // importer — there are no data offsets or contiguity to track: just walk
         // the manifest and re-stage each entry. Trash is included (a re-key is a
         // faithful round-trip), matching `to_vault`/`materialize(|_| true)`.
-        for e in &source.manifest.entries {
-            match e.kind {
-                EntryKind::Dir => {
-                    if !me.manifest.entries.iter().any(|x| x.path == e.path) {
-                        me.ensure_dirs(&e.path);
-                        me.manifest.entries.push(dir_entry(e.path.clone()));
+        me.commit_build(|b| {
+            for e in &source.manifest.entries {
+                match e.kind {
+                    EntryKind::Dir => b.add_dir_trusted(&e.path)?,
+                    EntryKind::File => {
+                        // Stream this one blob's plaintext straight into a fresh
+                        // blob, re-hashing as we go.
+                        let src = source.entry_plaintext(e)?;
+                        b.put_stream_trusted(&e.path, e.blake3, e.size, src, e.mtime, e.mode)?;
                     }
                 }
-                EntryKind::File => {
-                    // Stream this one blob's plaintext straight into a fresh blob,
-                    // re-hashing as we go. Fresh vault, so this never overwrites
-                    // (no old blob to drop).
-                    let mut src = source.entry_plaintext(e)?;
-                    me.stage_file(e.path.clone(), e.blake3, e.size, &mut src, e.mtime, e.mode)?;
-                }
             }
-        }
-        me.reseal_manifest()?;
+            Ok(())
+        })?;
         Ok(me)
     }
 
@@ -1204,28 +1184,25 @@ impl VaultReaderV2 {
             )?,
             None => Self::create(dir, identity, suite, &vault.name, vault.created_at)?,
         };
-        for e in vault.entries() {
-            match e.kind {
-                EntryKind::Dir => {
-                    if !me.manifest.entries.iter().any(|x| x.path == e.path) {
-                        me.ensure_dirs(&e.path);
-                        me.manifest.entries.push(dir_entry(e.path.clone()));
+        me.commit_build(|b| {
+            for e in vault.entries() {
+                match e.kind {
+                    EntryKind::Dir => b.add_dir_trusted(&e.path)?,
+                    EntryKind::File => {
+                        let digest = *blake3::hash(e.content.as_slice()).as_bytes();
+                        b.put_stream_trusted(
+                            &e.path,
+                            digest,
+                            e.content.len() as u64,
+                            Cursor::new(e.content.as_slice()),
+                            e.mtime,
+                            e.mode,
+                        )?;
                     }
                 }
-                EntryKind::File => {
-                    let digest = *blake3::hash(e.content.as_slice()).as_bytes();
-                    me.stage_file(
-                        e.path.clone(),
-                        digest,
-                        e.content.len() as u64,
-                        Cursor::new(e.content.as_slice()),
-                        e.mtime,
-                        e.mode,
-                    )?;
-                }
             }
-        }
-        me.reseal_manifest()?;
+            Ok(())
+        })?;
         Ok(me)
     }
 
@@ -1345,10 +1322,11 @@ pub struct VaultBatch<'r> {
     superseded: Vec<String>,
     changed: bool,
     ops: usize,
+    limit: Option<usize>,
 }
 
 impl<'r> VaultBatch<'r> {
-    fn new(reader: &'r VaultReaderV2) -> Self {
+    fn new(reader: &'r VaultReaderV2, limit: Option<usize>) -> Self {
         let manifest = reader.manifest.clone();
         let index = index_entries(&manifest);
         Self {
@@ -1359,17 +1337,18 @@ impl<'r> VaultBatch<'r> {
             superseded: Vec::new(),
             changed: false,
             ops: 0,
+            limit,
         }
     }
 
     fn count_op(&mut self) -> Result<()> {
         self.ops += 1;
-        if self.ops > MAX_BATCH_OPS {
-            return Err(Error::Vault(format!(
-                "a batch holds at most {MAX_BATCH_OPS} operations"
-            )));
+        match self.limit {
+            Some(limit) if self.ops > limit => Err(Error::Vault(format!(
+                "a batch holds at most {limit} operations"
+            ))),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn kind_at(&self, path: &str) -> Option<EntryKind> {
@@ -1380,8 +1359,10 @@ impl<'r> VaultBatch<'r> {
         self.index = index_entries(&self.manifest);
     }
 
-    /// Push directory entries for each missing ancestor of `norm`.
-    fn ensure_dirs(&mut self, norm: &str) {
+    /// Push directory entries for each missing ancestor of `norm`, refusing
+    /// to treat an existing *file* as a directory (the tree must stay valid:
+    /// `a` cannot be a file while `a/b` exists).
+    fn ensure_dirs(&mut self, norm: &str) -> Result<()> {
         let comps: Vec<&str> = norm.split('/').collect();
         let mut acc = String::new();
         for comp in comps.iter().take(comps.len().saturating_sub(1)) {
@@ -1389,11 +1370,20 @@ impl<'r> VaultBatch<'r> {
                 acc.push('/');
             }
             acc.push_str(comp);
-            if !self.index.contains_key(&acc) {
-                self.index.insert(acc.clone(), self.manifest.entries.len());
-                self.manifest.entries.push(dir_entry(acc.clone()));
+            match self.kind_at(&acc) {
+                Some(EntryKind::Dir) => {}
+                Some(EntryKind::File) => {
+                    return Err(Error::Vault(format!(
+                        "a file exists at {acc}; it cannot contain other entries"
+                    )))
+                }
+                None => {
+                    self.index.insert(acc.clone(), self.manifest.entries.len());
+                    self.manifest.entries.push(dir_entry(acc.clone()));
+                }
             }
         }
+        Ok(())
     }
 
     fn place(
@@ -1404,7 +1394,7 @@ impl<'r> VaultBatch<'r> {
         size: u64,
         mtime: Option<i64>,
         mode: Option<u32>,
-    ) {
+    ) -> Result<()> {
         self.staged.push(blob.file_id.clone());
         let entry = EntryV2 {
             path: norm.clone(),
@@ -1424,12 +1414,13 @@ impl<'r> VaultBatch<'r> {
                 self.superseded.extend(old.file_id);
             }
             None => {
-                self.ensure_dirs(&norm);
+                self.ensure_dirs(&norm)?;
                 self.index.insert(norm, self.manifest.entries.len());
                 self.manifest.entries.push(entry);
             }
         }
         self.changed = true;
+        Ok(())
     }
 
     fn reject_dir(&self, norm: &str) -> Result<()> {
@@ -1453,8 +1444,7 @@ impl<'r> VaultBatch<'r> {
         let (blake3, size) = hash_path(source)?;
         let reader = BufReader::new(fs_err::File::open(source)?);
         let blob = self.reader.write_blob(blake3, size, reader)?;
-        self.place(norm, blob, blake3, size, mtime, mode);
-        Ok(())
+        self.place(norm, blob, blake3, size, mtime, mode)
     }
 
     /// Add or replace a file from an in-memory buffer.
@@ -1471,8 +1461,7 @@ impl<'r> VaultBatch<'r> {
         let blake3 = *blake3::hash(bytes).as_bytes();
         let size = bytes.len() as u64;
         let blob = self.reader.write_blob(blake3, size, Cursor::new(bytes))?;
-        self.place(norm, blob, blake3, size, mtime, mode);
-        Ok(())
+        self.place(norm, blob, blake3, size, mtime, mode)
     }
 
     /// Create a directory and any missing ancestors (no-op if it exists).
@@ -1483,13 +1472,48 @@ impl<'r> VaultBatch<'r> {
             Some(EntryKind::Dir) => Ok(()),
             Some(EntryKind::File) => Err(Error::Vault(format!("a file exists at {norm}"))),
             None => {
-                self.ensure_dirs(&norm);
+                self.ensure_dirs(&norm)?;
                 self.index.insert(norm.clone(), self.manifest.entries.len());
                 self.manifest.entries.push(dir_entry(norm));
                 self.changed = true;
                 Ok(())
             }
         }
+    }
+
+    /// Builder form of [`Self::mkdir`] for a path from an already-validated
+    /// source manifest (stored names an older version accepted pass through).
+    fn add_dir_trusted(&mut self, path: &str) -> Result<()> {
+        let norm = crate::vault::normalize_stored_path(path)?;
+        match self.kind_at(&norm) {
+            Some(EntryKind::Dir) => Ok(()),
+            Some(EntryKind::File) => Err(Error::Format("a path is both a file and a directory")),
+            None => {
+                self.ensure_dirs(&norm)?;
+                self.index.insert(norm.clone(), self.manifest.entries.len());
+                self.manifest.entries.push(dir_entry(norm));
+                self.changed = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Builder form of [`Self::put_bytes`]: stream `source` (which must hash to
+    /// `blake3` over exactly `size` bytes) as the file at `path` from an
+    /// already-validated source manifest.
+    fn put_stream_trusted<R: Read>(
+        &mut self,
+        path: &str,
+        blake3: [u8; 32],
+        size: u64,
+        source: R,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        let norm = crate::vault::normalize_stored_path(path)?;
+        self.reject_dir(&norm)?;
+        let blob = self.reader.write_blob(blake3, size, source)?;
+        self.place(norm, blob, blake3, size, mtime, mode)
     }
 
     /// Remove an entry and, for a directory, its subtree (no-op if absent).
@@ -1536,7 +1560,7 @@ impl<'r> VaultBatch<'r> {
         if self.index.contains_key(&to) {
             return Err(Error::Vault(format!("path already exists: {to}")));
         }
-        self.ensure_dirs(&to);
+        self.ensure_dirs(&to)?;
         for e in &mut self.manifest.entries {
             if e.path == from {
                 e.path = to.clone();
@@ -1584,63 +1608,6 @@ struct StagedBlob {
     file_id: String,
     key: BlobKey,
     nonce: Vec<u8>,
-}
-
-/// Push directory entries for each missing ancestor of `norm`.
-fn ensure_dirs_in(manifest: &mut ManifestV2, norm: &str) {
-    let comps: Vec<&str> = norm.split('/').collect();
-    let mut acc = String::new();
-    for comp in comps.iter().take(comps.len().saturating_sub(1)) {
-        if !acc.is_empty() {
-            acc.push('/');
-        }
-        acc.push_str(comp);
-        if !manifest.entries.iter().any(|e| e.path == acc) {
-            manifest.entries.push(dir_entry(acc.clone()));
-        }
-    }
-}
-
-/// Refuse to put a file where a directory already is.
-fn reject_dir_at(manifest: &ManifestV2, norm: &str) -> Result<()> {
-    match manifest.entries.iter().find(|e| e.path == norm) {
-        Some(e) if e.kind == EntryKind::Dir => {
-            Err(Error::Vault(format!("a directory exists at {norm}")))
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Record `blob` as the file at `norm` (creating missing parent directories),
-/// returning the `file_id` of the blob it replaces, if any.
-fn place_file(
-    manifest: &mut ManifestV2,
-    norm: String,
-    blob: StagedBlob,
-    blake3: [u8; 32],
-    size: u64,
-    mtime: Option<i64>,
-    mode: Option<u32>,
-) -> Option<String> {
-    let old = manifest
-        .entries
-        .iter()
-        .position(|e| e.path == norm)
-        .and_then(|pos| manifest.entries.remove(pos).file_id);
-    ensure_dirs_in(manifest, &norm);
-    manifest.entries.push(EntryV2 {
-        path: norm,
-        kind: EntryKind::File,
-        size,
-        mtime,
-        mode,
-        blake3,
-        file_id: Some(blob.file_id),
-        key: Some(blob.key),
-        nonce: Some(blob.nonce),
-        chunk_size: aead::DEFAULT_CHUNK_SIZE as u32,
-    });
-    old
 }
 
 /// Atomically write `bytes` to `path`; `Ok(true)` if the rename is known
@@ -1907,14 +1874,16 @@ mod tests {
             .put_file_bytes("file.txt", b"old content", None, None)
             .unwrap();
         let before = fs_err::read(dir.join(MANIFEST_FILE)).unwrap();
-        let result = reader.stage_file(
-            "file.txt".into(),
-            *blake3::hash(b"expected").as_bytes(),
-            8,
-            &b"modified"[..],
-            None,
-            None,
-        );
+        let result = reader.commit_batch(|b| {
+            b.put_stream_trusted(
+                "file.txt",
+                *blake3::hash(b"expected").as_bytes(),
+                8,
+                &b"modified"[..],
+                None,
+                None,
+            )
+        });
         assert!(matches!(result, Err(Error::Auth)));
         assert_eq!(&*reader.read_entry("file.txt").unwrap(), b"old content");
         assert_eq!(fs_err::read(dir.join(MANIFEST_FILE)).unwrap(), before);
@@ -2154,6 +2123,36 @@ mod tests {
         );
         fs_err::remove_dir_all(&dir).unwrap();
         fs_err::remove_dir_all(&dest).unwrap();
+    }
+
+    /// Lower-priority audit item: a file can never be an ancestor of another
+    /// entry — not through a mutation, and not in a manifest read from disk.
+    #[test]
+    fn a_file_cannot_contain_other_entries() {
+        let dir = tmp("tree-validity");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        reader.put_file_bytes("a", b"file", None, None).unwrap();
+        assert!(reader.put_file_bytes("a/b", b"child", None, None).is_err());
+        assert!(reader.mkdir("a/sub").is_err());
+        reader.put_file_bytes("c.txt", b"c", None, None).unwrap();
+        assert!(reader.rename("c.txt", "a/c.txt").is_err());
+
+        // A sealed manifest describing such a tree is refused on open.
+        let idx = reader
+            .manifest
+            .entries
+            .iter()
+            .position(|e| e.path == "c.txt")
+            .unwrap();
+        reader.manifest.entries[idx].path = "a/c.txt".into();
+        reader.reseal_manifest().unwrap();
+        drop(reader);
+        assert!(matches!(
+            VaultReaderV2::open(&dir, &identity),
+            Err(Error::Format(_))
+        ));
+        fs_err::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
