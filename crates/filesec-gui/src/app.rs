@@ -30,9 +30,11 @@ use filesec_core::SuiteId;
 use crate::autounlock;
 use crate::passkey;
 use crate::prefs::ThemeChoice;
+#[cfg(feature = "pqc")]
+use crate::store::MIGRATION_RESUME_PENDING;
 use crate::store::{
     new_vault_id, write_private_export, Registry, Store, StoreResult, VaultMeta,
-    ANCHOR_RECOVERY_REQUIRED, MIGRATION_RESUME_PENDING,
+    ANCHOR_RECOVERY_REQUIRED,
 };
 
 use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
@@ -611,6 +613,9 @@ struct TransferState {
     send_port: String,
     send_pairing: String,
     send_vault: Option<String>, // vault id to send
+    /// Explicit consent to send classical-only to a contact without
+    /// post-quantum keys (only offered when that would be a downgrade).
+    send_allow_classical: bool,
 }
 
 /// A running transfer and the UI view of its progress.
@@ -875,6 +880,7 @@ enum Outcome {
     Noop,
     /// Stop the session: the store needs a restart to reach a consistent state
     /// (for example, to finish a committed identity migration).
+    #[cfg_attr(not(feature = "pqc"), allow(dead_code))]
     Fatal(String),
     /// Rollback anchors were re-established; continue to the unlock screen.
     AnchorsRecovered(Box<Store>),
@@ -4635,8 +4641,11 @@ impl App {
             meta,
             file_count,
             sender_name,
+            suite,
         } = &event
         {
+            let classical_from_hybrid_peer = !suite.is_hybrid()
+                && matches!(&self.state, State::Unlocked(s) if s.identity.is_hybrid_capable());
             if let (Some(store), Some(identity)) = (self.store_arc(), self.ident_arc()) {
                 if let State::Unlocked(s) = &mut self.state {
                     s.registry.upsert(meta.clone());
@@ -4651,9 +4660,14 @@ impl App {
             let who = sender_name
                 .clone()
                 .unwrap_or_else(|| "a verified contact".into());
+            let protection = if classical_from_hybrid_peer {
+                " It arrived with classical protection only (the sender used a classical container)."
+            } else {
+                ""
+            };
             self.set_toast(
                 format!(
-                    "Received \u{201c}{}\u{201d} from {who} ({file_count} file(s)).",
+                    "Received \u{201c}{}\u{201d} from {who} ({file_count} file(s)).{protection}",
                     meta.name
                 ),
                 false,
@@ -4805,7 +4819,7 @@ impl App {
         };
         let built = match &self.state {
             State::Unlocked(s) if s.transfer.active.is_none() => {
-                build_send_config(&s.transfer, &s.contacts)
+                build_send_config(&s.transfer, &s.contacts, &s.identity)
             }
             _ => return,
         };
@@ -4939,6 +4953,7 @@ fn build_listen_config(
 fn build_send_config(
     forms: &TransferState,
     contacts: &ContactBook,
+    identity: &Identity,
 ) -> Result<crate::net::SendConfig, String> {
     let fpr_hex = forms
         .send_contact
@@ -4971,6 +4986,10 @@ fn build_send_config(
         }
         Some(p.to_string())
     };
+    let downgrade = crate::net::transfer_downgrades_protection(identity, &contact.identity);
+    if downgrade && !forms.send_allow_classical {
+        return Err(crate::net::CLASSICAL_SEND_NEEDS_CONSENT.into());
+    }
     Ok(crate::net::SendConfig {
         host,
         port,
@@ -4978,6 +4997,7 @@ fn build_send_config(
         recipient_fpr: contact.fingerprint(),
         transfer_code,
         vault_id,
+        allow_classical: downgrade && forms.send_allow_classical,
     })
 }
 
@@ -5176,6 +5196,34 @@ fn send_card(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             "e.g. ABCD-EFGH-JKMN-…",
             field_w.min(260.0),
         );
+
+        // Hybrid protection travels with the data only if the recipient has
+        // post-quantum keys too. Otherwise say so, and require a decision.
+        let downgrade = s.transfer.send_contact.as_deref().is_some_and(|fp| {
+            s.contacts
+                .contacts
+                .iter()
+                .find(|c| hex(&c.fingerprint()) == fp)
+                .is_some_and(|c| {
+                    crate::net::transfer_downgrades_protection(&s.identity, &c.identity)
+                })
+        });
+        if downgrade {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "This contact has no post-quantum keys. The vault would be sent with \
+                     classical protection only (X25519/Ed25519), not the hybrid protection \
+                     your vaults have at rest. Ask them to upgrade their identity, or confirm:",
+                )
+                .color(cc.warn)
+                .small(),
+            );
+            ui.checkbox(
+                &mut s.transfer.send_allow_classical,
+                "Send with classical protection only",
+            );
+        }
 
         ui.add_space(12.0);
         if theme::primary_button(ui, "Send").clicked() {

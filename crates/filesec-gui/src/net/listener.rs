@@ -441,11 +441,12 @@ fn run_transfer(
         Err(e) => Err(e),
     };
     let _ = secure_wipe(&temp);
-    let (meta, file_count) = result.map_err(ConnError::shown)?;
+    let (meta, file_count, suite) = result.map_err(ConnError::shown)?;
     shared.emitter.emit(NetEvent::Received {
         meta,
         file_count,
         sender_name: name,
+        suite,
     });
     Ok(())
 }
@@ -571,7 +572,7 @@ fn import_received(
     identity: &Identity,
     temp: &Path,
     peer_fpr: &[u8; 32],
-) -> Result<(VaultMeta, usize), String> {
+) -> Result<(VaultMeta, usize, filesec_core::SuiteId), String> {
     let (reader, sender) = format::verify_and_open(temp, identity).map_err(|e| e.to_string())?;
     if &sender.fingerprint != peer_fpr {
         return Err("the file's signature does not match the connected sender".into());
@@ -587,7 +588,7 @@ fn import_received(
         file_count: file_count as u64,
         total_size: reader.total_size(),
     };
-    Ok((meta, file_count))
+    Ok((meta, file_count, reader.suite()))
 }
 
 /// Best-effort LAN IP for display (the source address the OS routes outward).

@@ -121,6 +121,11 @@ docs.
   code oracle; the secret space is not offline-enumerable. Both parties must be
   verified contacts. Protocol downgrade to the retired pairing-code scheme is
   rejected (F07, Stage 5).
+- The transferred container uses the hybrid suite whenever both identities are
+  hybrid-capable, so post-quantum protection is not lost in transit; a send to a
+  classical-only contact requires an explicit downgrade confirmation (FS-04).
+  The handshake around it remains classical (X25519/Ed25519 + transfer secret);
+  it is not a post-quantum key exchange.
 - The listener uses a bounded worker pool, per-connection handshake deadlines
   (slowloris-resistant), per-IP backoff, a hard declared-transfer-size ceiling,
   and split handshake/data frame caps (F08, Stage 5).

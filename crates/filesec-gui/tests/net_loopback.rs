@@ -130,6 +130,7 @@ fn loopback_transfer_imports_the_vault() {
             recipient_fpr: bob.fingerprint(),
             transfer_code: Some(code),
             vault_id: vid,
+            allow_classical: false,
         },
         alice.clone(),
         send_store,
@@ -184,6 +185,7 @@ fn loopback_rejects_unverified_sender() {
             recipient_fpr: bob.fingerprint(),
             transfer_code: Some(code),
             vault_id: vid,
+            allow_classical: false,
         },
         alice,
         send_store,
@@ -226,6 +228,7 @@ fn loopback_rejects_a_non_designated_sender() {
             recipient_fpr: bob.fingerprint(),
             transfer_code: Some(code),
             vault_id: vid,
+            allow_classical: false,
         },
         alice,
         send_store,
@@ -267,6 +270,7 @@ fn loopback_wrong_transfer_code_aborts() {
             recipient_fpr: bob.fingerprint(),
             transfer_code: Some("00000000000000000000000000".into()),
             vault_id: vid,
+            allow_classical: false,
         },
         alice,
         send_store,
@@ -331,6 +335,7 @@ fn loopback_slowloris_does_not_block_a_real_transfer() {
             recipient_fpr: bob.fingerprint(),
             transfer_code: Some(code),
             vault_id: vid,
+            allow_classical: false,
         },
         alice.clone(),
         send_store,
@@ -413,6 +418,7 @@ fn loopback_large_multifile_roundtrips_with_exact_size() {
             recipient_fpr: bob.fingerprint(),
             transfer_code: Some(code),
             vault_id: vid,
+            allow_classical: false,
         },
         alice.clone(),
         send_store,
@@ -450,4 +456,146 @@ fn loopback_large_multifile_roundtrips_with_exact_size() {
 
     bob_h.stop();
     alice_h.stop();
+}
+
+/// Run one loopback send from `alice` (holding `vid` in `send_store`) to `bob`
+/// and return the receiver's outcome: `Ok(suite)` of the container as it came
+/// off the wire, or the sender's error.
+#[cfg(feature = "pqc")]
+fn send_and_receive(
+    alice: Arc<Identity>,
+    bob: Arc<Identity>,
+    send_store: Arc<Store>,
+    recv_store: Arc<Store>,
+    vid: String,
+    allow_classical: bool,
+) -> Result<filesec_core::SuiteId, String> {
+    let mut contacts = ContactBook::default();
+    contacts.upsert(alice.public(), 0);
+    contacts.set_trust(&alice.fingerprint(), Trust::Verified, 0);
+    let (mut bob_h, port, code) =
+        start_bob(bob.clone(), recv_store, contacts, Some(alice.fingerprint()));
+    let mut alice_h = net::start_sender(
+        SendConfig {
+            host: "127.0.0.1".into(),
+            port,
+            recipient: bob.public(),
+            recipient_fpr: bob.fingerprint(),
+            transfer_code: Some(code),
+            vault_id: vid,
+            allow_classical,
+        },
+        alice,
+        send_store,
+        egui::Context::default(),
+    );
+    let outcome = loop {
+        if let Some(NetEvent::Error(e)) = alice_h.try_recv() {
+            break Err(e);
+        }
+        match bob_h.try_recv() {
+            Some(NetEvent::Offer { .. }) => bob_h.send(NetCommand::AcceptOffer),
+            Some(NetEvent::Received { suite, .. }) => break Ok(suite),
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    bob_h.stop();
+    alice_h.stop();
+    outcome
+}
+
+#[cfg(feature = "pqc")]
+fn hybrid_fixture(
+    bob_hybrid: bool,
+) -> (Arc<Identity>, Arc<Identity>, Arc<Store>, Arc<Store>, String) {
+    let send_store = Arc::new(Store::at(tmp("send-pq")).unwrap());
+    let recv_store = Arc::new(Store::at(tmp("recv-pq")).unwrap());
+    let alice = Identity::generate("Alice", 0)
+        .unwrap()
+        .upgraded_to_hybrid()
+        .unwrap();
+    let bob = Identity::generate("Bob", 0).unwrap();
+    let bob = if bob_hybrid {
+        bob.upgraded_to_hybrid().unwrap()
+    } else {
+        bob
+    };
+    let vid = new_vault_id().unwrap();
+    let mut vault = Vault::new("Shared", 0);
+    vault
+        .add_file("hello.txt", b"post-quantum hello".to_vec(), None, None)
+        .unwrap();
+    send_store.save_vault(&alice, &vid, &vault).unwrap();
+    assert!(send_store
+        .open_vault(&alice, &vid)
+        .unwrap()
+        .suite()
+        .is_hybrid());
+    (Arc::new(alice), Arc::new(bob), send_store, recv_store, vid)
+}
+
+#[cfg(feature = "pqc")]
+#[test]
+fn hybrid_peers_receive_a_hybrid_transport_container() {
+    let (alice, bob, send_store, recv_store, vid) = hybrid_fixture(true);
+    let suite = send_and_receive(alice, bob, send_store, recv_store, vid, false).unwrap();
+    assert_eq!(
+        suite,
+        filesec_core::SuiteId::Hybrid,
+        "FS-04: hybrid must travel"
+    );
+}
+
+#[cfg(feature = "pqc")]
+#[test]
+fn a_classical_recipient_needs_explicit_consent_to_downgrade() {
+    let (alice, bob, send_store, recv_store, vid) = hybrid_fixture(false);
+    let error = send_and_receive(
+        alice.clone(),
+        bob.clone(),
+        send_store.clone(),
+        recv_store.clone(),
+        vid.clone(),
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(error, net::CLASSICAL_SEND_NEEDS_CONSENT);
+
+    let suite = send_and_receive(alice, bob, send_store, recv_store, vid, true).unwrap();
+    assert_eq!(suite, filesec_core::SuiteId::Classic);
+}
+
+#[cfg(feature = "pqc")]
+#[test]
+fn transfer_suite_selection_follows_both_identities() {
+    let classic = Identity::generate("C", 0).unwrap();
+    let hybrid = Identity::generate("H", 0)
+        .unwrap()
+        .upgraded_to_hybrid()
+        .unwrap();
+    assert_eq!(
+        net::transfer_suite(&hybrid, &hybrid.public()),
+        filesec_core::SuiteId::Hybrid
+    );
+    assert_eq!(
+        net::transfer_suite(&hybrid, &classic.public()),
+        filesec_core::SuiteId::Classic
+    );
+    assert_eq!(
+        net::transfer_suite(&classic, &hybrid.public()),
+        filesec_core::SuiteId::Classic
+    );
+    assert!(net::transfer_downgrades_protection(
+        &hybrid,
+        &classic.public()
+    ));
+    assert!(!net::transfer_downgrades_protection(
+        &classic,
+        &hybrid.public()
+    ));
+    assert!(!net::transfer_downgrades_protection(
+        &hybrid,
+        &hybrid.public()
+    ));
 }

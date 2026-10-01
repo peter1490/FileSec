@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use filesec_core::contacts::ContactBook;
-use filesec_core::{Identity, PublicIdentity};
+use filesec_core::{Identity, PublicIdentity, SuiteId};
 
 use crate::store::{Store, VaultMeta};
 
@@ -58,7 +58,42 @@ pub struct SendConfig {
     pub transfer_code: Option<String>,
     /// The local vault to send.
     pub vault_id: String,
+    /// The user explicitly accepted sending with classical-only protection to a
+    /// recipient that has no post-quantum keys (see
+    /// [`transfer_downgrades_protection`]). Ignored when no downgrade happens.
+    pub allow_classical: bool,
 }
+
+/// The container suite a direct transfer from `sender` to `recipient` uses.
+///
+/// Hybrid (X25519+ML-KEM-768 / Ed25519+ML-DSA-65) whenever both identities can
+/// take part in it, so the post-quantum protection of a hybrid store travels
+/// with the data (FS-04); classical otherwise. The handshake that carries the
+/// container is classical either way (X25519/Ed25519 bound to the 128-bit
+/// transfer secret); the container's own encryption and signatures are what a
+/// recorded transfer has to break.
+#[must_use]
+pub fn transfer_suite(sender: &Identity, recipient: &PublicIdentity) -> SuiteId {
+    #[cfg(feature = "pqc")]
+    if sender.is_hybrid_capable() && recipient.is_hybrid_capable() {
+        return SuiteId::Hybrid;
+    }
+    let _ = (sender, recipient);
+    SuiteId::Classic
+}
+
+/// Whether sending to `recipient` drops post-quantum protection that `sender`
+/// has: the sender is hybrid-capable but the recipient is not, so the
+/// container can only be classical. The UI must obtain an explicit, informed
+/// decision ([`SendConfig::allow_classical`]) before such a send.
+#[must_use]
+pub fn transfer_downgrades_protection(sender: &Identity, recipient: &PublicIdentity) -> bool {
+    sender.is_hybrid_capable() && !transfer_suite(sender, recipient).is_hybrid()
+}
+
+/// The error a send returns when it would downgrade protection without the
+/// user's explicit consent.
+pub const CLASSICAL_SEND_NEEDS_CONSENT: &str = "This contact has no post-quantum keys, so the vault could only be sent with classical protection. Confirm that explicitly to send it anyway.";
 
 /// Status of the router port-mapping attempt (internet mode only).
 #[derive(Clone, Debug)]
@@ -112,6 +147,8 @@ pub enum NetEvent {
         meta: VaultMeta,
         file_count: usize,
         sender_name: Option<String>,
+        /// The suite of the container as it arrived over the wire.
+        suite: SuiteId,
     },
     /// A send completed.
     Sent { vault_name: String },

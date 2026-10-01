@@ -48,6 +48,16 @@ pub fn run(
     let reader = store.open_vault(identity, &config.vault_id)?;
     let vault_name = reader.name().to_string();
 
+    // Keep hybrid protection whenever both ends support it (FS-04); a lower
+    // suite than the vault or identity has needs the user's explicit consent.
+    let suite = super::transfer_suite(identity, &config.recipient);
+    let downgrade = !suite.is_hybrid()
+        && (super::transfer_downgrades_protection(identity, &config.recipient)
+            || reader.suite().is_hybrid());
+    if downgrade && !config.allow_classical {
+        return Err(super::CLASSICAL_SEND_NEEDS_CONSENT.into());
+    }
+
     // 1. Connect first, so an unreachable receiver fails fast.
     emitter.emit(NetEvent::Connecting);
     let addr = resolve(&config.host, config.port)?;
@@ -101,7 +111,10 @@ pub fn run(
     // 3. Prepare the export — manifest + content-key wrap only, still no file data
     //    read — which gives us the exact container size to declare in the offer.
     let recipients = [config.recipient.clone()];
-    let options = ExportOptions::default();
+    let options = ExportOptions {
+        suite,
+        ..ExportOptions::default()
+    };
     let plan = reader
         .export_plan(identity, &recipients, &options)
         .map_err(|e| e.to_string())?;

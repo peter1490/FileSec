@@ -477,6 +477,18 @@ Security model:
   guessable; the identity check remains the real protection.
 - **Defense in depth.** Even if the channel were broken, the payload is still the
   end-to-end-sealed, signed `.fsec` that only the recipient can open.
+- **Post-quantum protection travels with the data.** When both identities are
+  hybrid-capable, the transferred `.fsec` uses the hybrid suite
+  (X25519+ML-KEM-768 / Ed25519+ML-DSA-65), exactly like the vault at rest. If the
+  recipient has no post-quantum keys, the container can only be classical; the
+  send form says so and the transfer does not start until you explicitly confirm
+  sending with classical protection. The receiver's notice also says when a
+  vault arrived classical-only.
+- **The handshake itself is classical.** The channel around the container is
+  X25519/Ed25519 bound to the 128-bit transfer secret; it has no post-quantum
+  key exchange. A recorded session therefore relies on the container's own suite
+  (and the transfer secret) for long-term confidentiality — which is why the
+  hybrid container matters.
 
 What it does **not** protect against (documented, not hidden): traffic analysis
 (record sizes and timing reveal the file-size class), the receiver's address
