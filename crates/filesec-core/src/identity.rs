@@ -32,13 +32,7 @@ pub const UNNAMED_DISPLAY: &str = "(unnamed)";
 /// (making `admin.txt` render as `txt.nimda`, or hiding text behind zero-width
 /// runs). They are dropped outright by [`sanitize_display_name`].
 fn is_spoofing_format_char(c: char) -> bool {
-    matches!(c,
-        '\u{200B}'..='\u{200F}' | // ZWSP, ZWNJ, ZWJ, LRM, RLM
-        '\u{202A}'..='\u{202E}' | // LRE, RLE, PDF, LRO, RLO (bidi overrides)
-        '\u{2060}'..='\u{2064}' | // word joiner + invisible math operators
-        '\u{2066}'..='\u{2069}' | // LRI, RLI, FSI, PDI (bidi isolates)
-        '\u{061C}' |              // Arabic letter mark
-        '\u{FEFF}') // BOM / zero-width no-break space
+    crate::util::is_spoofing_format_char(c)
 }
 
 /// Reduce an untrusted display name to a safe, human-readable rendering (F13).

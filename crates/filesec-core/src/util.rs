@@ -12,6 +12,30 @@ pub fn now_unix() -> i64 {
     }
 }
 
+/// Whether `c` is an invisible or text-reordering *format* character: bidi
+/// embeddings/overrides/isolates and marks, zero-width characters, invisible
+/// operators, soft hyphen, deprecated format controls, interlinear annotation
+/// marks, and Unicode tag characters.
+///
+/// They have no legitimate place in a display name or a file name, and they
+/// are the classic tools for visual spoofing: `report\u{202E}gpj.exe` renders as
+/// `reportexe.jpg`, and zero-width or tag characters hide text entirely.
+/// Identity display names drop them; new vault paths reject them.
+#[must_use]
+pub fn is_spoofing_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' |               // soft hyphen (invisible unless wrapped)
+        '\u{061C}' |               // Arabic letter mark
+        '\u{180E}' |               // Mongolian vowel separator
+        '\u{200B}'..='\u{200F}' | // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        '\u{202A}'..='\u{202E}' | // LRE, RLE, PDF, LRO, RLO (bidi overrides)
+        '\u{2060}'..='\u{2064}' | // word joiner + invisible math operators
+        '\u{2066}'..='\u{206F}' | // LRI, RLI, FSI, PDI + deprecated format controls
+        '\u{FEFF}' |               // BOM / zero-width no-break space
+        '\u{FFF9}'..='\u{FFFB}' | // interlinear annotation controls
+        '\u{E0001}' | '\u{E0020}'..='\u{E007F}') // tag characters
+}
+
 /// Lowercase hex encoding.
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {

@@ -114,7 +114,10 @@ fn validate_manifest_v2(manifest: &ManifestV2, alg: aead::AeadAlg) -> Result<()>
     let mut seen = std::collections::BTreeSet::new();
     let mut total_size = 0u64;
     for e in &manifest.entries {
-        let norm = normalize_path(&e.path)?;
+        // The user's own stored vault: formatting characters an older version
+        // accepted must not lock them out (they are shown escaped and must be
+        // renamed before extraction or export, which use the strict rule).
+        let norm = crate::vault::normalize_stored_path(&e.path)?;
         if !seen.insert(norm) {
             return Err(Error::Format("duplicate path in manifest"));
         }
@@ -544,7 +547,10 @@ impl VaultReaderV2 {
     }
 
     fn file_entry(&self, path: &str) -> Result<&EntryV2> {
-        let norm = normalize_path(path)?;
+        // Reading a stored entry (to view it in-app) is allowed even for a name
+        // an older version accepted; writing it to disk goes through the strict
+        // rule in the extraction paths.
+        let norm = crate::vault::normalize_stored_path(path)?;
         let e = self
             .manifest
             .entries
@@ -968,7 +974,9 @@ impl VaultReaderV2 {
     /// Remove the entry at `vault_path` and, if it is a directory, its whole
     /// subtree. Deletes the affected blobs. A no-op if nothing matches.
     pub fn remove_path(&mut self, vault_path: &str) -> Result<()> {
-        let norm = normalize_path(vault_path)?;
+        // An existing entry: accept a stored name an older version allowed, so
+        // a deceptive name can always be deleted.
+        let norm = crate::vault::normalize_stored_path(vault_path)?;
         let prefix = format!("{norm}/");
         let matches = |path: &str| path == norm || path.starts_with(&prefix);
         if !self.manifest.entries.iter().any(|e| matches(&e.path)) {
@@ -993,7 +1001,9 @@ impl VaultReaderV2 {
     /// Manifest-only — blobs are untouched. Errors if `to` already exists or `to`
     /// is inside `from`.
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
-        let from = normalize_path(from)?;
+        // `from` may be a stored name an older version allowed (so it can be
+        // fixed); the new name `to` must pass the strict rule.
+        let from = crate::vault::normalize_stored_path(from)?;
         let to = normalize_path(to)?;
         if from == to {
             return Ok(());
@@ -1029,7 +1039,7 @@ impl VaultReaderV2 {
         mtime: Option<i64>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let norm = normalize_path(vault_path)?;
+        let norm = crate::vault::normalize_stored_path(vault_path)?;
         self.commit_edit(|m| {
             let e = m
                 .entries
@@ -1918,6 +1928,49 @@ mod tests {
         );
         assert_eq!(&*reader.read_entry("a.txt").unwrap(), b"live");
         fs_err::remove_dir_all(&dir).unwrap();
+    }
+
+    /// FS-16: new names with formatting characters are refused; a vault an
+    /// older version stored with one still opens, its entry can be read in-app
+    /// and renamed, but it is never extracted under the deceptive name.
+    #[test]
+    fn deceptive_names_are_refused_new_and_quarantined_from_disk_when_stored() {
+        let dir = tmp("deceptive-name");
+        let identity = Identity::generate("Owner", 0).unwrap();
+        let mut reader = VaultReaderV2::create(&dir, &identity, SuiteId::Classic, "V", 1).unwrap();
+        let deceptive = "report\u{202e}gpj.exe";
+        assert!(reader.put_file_bytes(deceptive, b"x", None, None).is_err());
+        assert!(reader.mkdir("dir\u{200b}").is_err());
+
+        // What an older version could have stored.
+        reader
+            .put_file_bytes("report.txt", b"payload", None, None)
+            .unwrap();
+        let idx = reader
+            .manifest
+            .entries
+            .iter()
+            .position(|e| e.path == "report.txt")
+            .unwrap();
+        reader.manifest.entries[idx].path = deceptive.to_string();
+        reader.reseal_manifest().unwrap();
+        drop(reader);
+
+        let mut reopened = VaultReaderV2::open(&dir, &identity).unwrap();
+        assert_eq!(&*reopened.read_entry(deceptive).unwrap(), b"payload");
+        let dest = tmp("deceptive-dest");
+        fs_err::create_dir_all(&dest).unwrap();
+        assert!(reopened.extract_to(&dest).is_err(), "never written to disk");
+        assert_eq!(fs_err::read_dir(&dest).unwrap().count(), 0);
+        assert!(reopened.rename(deceptive, "report\u{202e}x").is_err());
+        reopened.rename(deceptive, "report.exe.jpg").unwrap();
+        reopened.extract_to(&dest).unwrap();
+        assert_eq!(
+            fs_err::read(dest.join("report.exe.jpg")).unwrap(),
+            b"payload"
+        );
+        fs_err::remove_dir_all(&dir).unwrap();
+        fs_err::remove_dir_all(&dest).unwrap();
     }
 
     #[test]

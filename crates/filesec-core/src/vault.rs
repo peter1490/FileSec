@@ -190,7 +190,30 @@ impl Vault {
 /// redundant `.`/`//` — are still normalized for backward compatibility. This is
 /// the single chokepoint that keeps a malicious container from escaping its
 /// extraction directory or naming an absolute destination.
+///
+/// Invisible and bidirectional formatting characters
+/// ([`crate::util::is_spoofing_format_char`]) are rejected too (FS-16): they
+/// let a name render as something else (`report\u{202E}gpj.exe` shows as
+/// `reportexe.jpg`) in the app, in file managers, and in every program that
+/// later opens the extracted file. A valid sender signature does not make a
+/// file name truthful.
 pub fn normalize_path(path: &str) -> Result<String> {
+    let norm = normalize_stored_path(path)?;
+    if norm.chars().any(crate::util::is_spoofing_format_char) {
+        return Err(Error::Vault(
+            "invisible or bidirectional formatting characters in path".into(),
+        ));
+    }
+    Ok(norm)
+}
+
+/// [`normalize_path`] without the formatting-character rule, for paths that
+/// are **already stored in the user's own local vault** (an older version
+/// accepted them). Such a vault must keep opening so the entry can be seen —
+/// rendered with [`visible_path`] — renamed, or removed; every path that is
+/// created, renamed to, imported from someone else, or extracted to disk still
+/// goes through the strict [`normalize_path`].
+pub(crate) fn normalize_stored_path(path: &str) -> Result<String> {
     if path.is_empty() || path.len() > MAX_PATH_LEN {
         return Err(Error::Vault("invalid path length".into()));
     }
@@ -257,6 +280,26 @@ pub fn normalize_path(path: &str) -> Result<String> {
         return Err(Error::Vault("path is too deep".into()));
     }
     Ok(components.join("/"))
+}
+
+/// Render a vault path for display with every invisible or bidirectional
+/// formatting character made visible as `⟨U+XXXX⟩`, so what the user sees is
+/// the actual sequence of characters (FS-16). Borrowed unchanged when there is
+/// nothing to escape.
+#[must_use]
+pub fn visible_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.chars().any(crate::util::is_spoofing_format_char) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len() + 16);
+    for c in path.chars() {
+        if crate::util::is_spoofing_format_char(c) {
+            out.push_str(&format!("\u{27E8}U+{:04X}\u{27E9}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// The identity of a normalized vault path on the most aliasing filesystems
@@ -404,5 +447,26 @@ mod tests {
         assert!(error.contains("already exists"), "{error}");
         assert_eq!(std::fs::read(dest.join("kept.txt")).unwrap(), b"mine");
         std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn new_paths_reject_formatting_characters_but_stored_ones_stay_usable() {
+        for path in [
+            "report\u{202e}gpj.exe",
+            "a/b\u{200b}c",
+            "\u{2066}x\u{2069}",
+            "soft\u{ad}hyphen",
+            "tag\u{e0041}",
+        ] {
+            assert!(normalize_path(path).is_err(), "accepted {path:?}");
+            assert!(normalize_stored_path(path).is_ok(), "stored {path:?}");
+        }
+        assert_eq!(visible_path("report.txt"), "report.txt");
+        assert_eq!(
+            visible_path("report\u{202e}gpj.exe"),
+            "report\u{27e8}U+202E\u{27e9}gpj.exe"
+        );
+        // Ordinary non-ASCII names are untouched.
+        assert!(normalize_path("caf\u{e9}/\u{65e5}\u{672c}.txt").is_ok());
     }
 }

@@ -1789,7 +1789,13 @@ impl App {
             }
             Action::BeginRename(path) => {
                 if let State::Unlocked(s) = &mut self.state {
-                    s.rename_input = leaf_name(&path).to_string();
+                    // Pre-fill without invisible/bidi formatting characters,
+                    // so confirming the rename fixes a name an older version
+                    // stored (new names may not contain them).
+                    s.rename_input = leaf_name(&path)
+                        .chars()
+                        .filter(|c| !filesec_core::util::is_spoofing_format_char(*c))
+                        .collect();
                     s.rename_target = Some(path);
                 }
             }
@@ -2846,7 +2852,7 @@ impl App {
             let dest = if into.is_empty() {
                 String::new()
             } else {
-                format!(" to {}", leaf_name(&into))
+                format!(" to {}", shown(leaf_name(&into)))
             };
             let msg = if failed > 0 {
                 format!("Added {n} file(s){dest}; {failed} could not be read.")
@@ -3423,7 +3429,7 @@ impl App {
                 if existing.contains(&to) {
                     return JobReport::err(format!(
                         "“{}” already exists in that folder.",
-                        leaf_name(from)
+                        shown(leaf_name(from))
                     ));
                 }
                 pairs.push((from.clone(), to));
@@ -3438,7 +3444,7 @@ impl App {
             let where_to = if dest.is_empty() {
                 "the top level".to_string()
             } else {
-                format!("“{}”", leaf_name(&dest))
+                format!("“{}”", shown(leaf_name(&dest)))
             };
             finalize_after_save(
                 &store,
@@ -6057,7 +6063,8 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             theme::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Rename “{}”", leaf_name(&target))).color(c.text),
+                        RichText::new(format!("Rename “{}”", shown(leaf_name(&target))))
+                            .color(c.text),
                     );
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut s.rename_input)
@@ -6200,7 +6207,7 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let target = if cur.is_empty() {
             name.clone()
         } else {
-            leaf_name(&cur).to_string()
+            shown(leaf_name(&cur))
         };
         painter.text(
             panel_rect.center(),
@@ -6364,7 +6371,7 @@ fn trash_panel(
                         ui.add_space(4.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                RichText::new(leaf_name(&item.orig_path))
+                                RichText::new(shown(leaf_name(&item.orig_path)))
                                     .color(c.text)
                                     .size(14.5),
                             );
@@ -6664,7 +6671,11 @@ fn entry_row(
     cui.add_space(8.0);
     cui.vertical(|ui| {
         ui.add_space(4.0);
-        ui.label(RichText::new(leaf_name(&row.path)).color(c.text).size(14.5));
+        ui.label(
+            RichText::new(shown(leaf_name(&row.path)))
+                .color(c.text)
+                .size(14.5),
+        );
         let secondary = if is_dir {
             format!(
                 "{} item{}",
@@ -8386,6 +8397,14 @@ fn parent_dir(path: &str) -> &str {
 }
 
 /// The final path segment (the display name) of a vault path.
+/// A vault path or name as the UI shows it: invisible and bidirectional
+/// formatting characters are made visible (`⟨U+202E⟩`), so a name cannot render
+/// as something it is not (FS-16). Entries created now cannot contain them; this
+/// covers names an older version stored.
+fn shown(name: &str) -> String {
+    filesec_core::vault::visible_path(name).into_owned()
+}
+
 fn leaf_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -8528,7 +8547,7 @@ fn breadcrumb_segments(dir: &str) -> Vec<(String, String)> {
         } else {
             acc = format!("{acc}/{seg}");
         }
-        out.push((seg.to_string(), acc.clone()));
+        out.push((shown(seg), acc.clone()));
     }
     out
 }
@@ -8784,7 +8803,7 @@ fn move_folder_options(
     let mut opts = vec![(String::new(), "Top level".to_string(), 0usize)];
     for d in dirs {
         let depth = d.split('/').count();
-        opts.push((d.to_string(), leaf_name(d).to_string(), depth));
+        opts.push((d.to_string(), shown(leaf_name(d)), depth));
     }
     opts
 }
@@ -8863,6 +8882,12 @@ mod browse_tests {
         assert_eq!(parent_dir("a/b/c"), "a/b");
         assert_eq!(parent_dir("top"), "");
         assert_eq!(leaf_name("a/b/c.txt"), "c.txt");
+        // FS-16: formatting characters are shown, not interpreted.
+        assert_eq!(
+            shown("report\u{202e}gpj.exe"),
+            "report\u{27e8}U+202E\u{27e9}gpj.exe"
+        );
+        assert_eq!(shown("plain.txt"), "plain.txt");
         assert_eq!(leaf_name("solo"), "solo");
     }
 

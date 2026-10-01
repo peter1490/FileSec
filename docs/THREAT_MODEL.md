@@ -101,6 +101,13 @@ docs.
 - Container blob IDs are validated as exactly 32 lowercase-hex characters; entry
   paths are normalized and **absolute/drive/traversal inputs are rejected
   outright**, not silently rewritten (F16/F19).
+- Paths containing invisible or bidirectional formatting characters (bidi
+  overrides/isolates/marks, zero-width characters, soft hyphen, tag characters)
+  are rejected for every new, renamed, imported, exported, or extracted entry,
+  because they make a name render as something else (`report\u{202E}gpj.exe` →
+  `reportexe.jpg`). A local vault an older version stored such a name in still
+  opens; the app shows the characters visibly as `⟨U+202E⟩` and the entry must be
+  renamed before it can be extracted or sent (FS-16).
 - The highest-risk parsers — public identity CBOR, pasted/armored keys, identity
   backups, the manifest, the transport handshake, and path normalization — have
   `cargo-fuzz` targets (`fuzz/`), smoke-run in CI (Stage 8).
