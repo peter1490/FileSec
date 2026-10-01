@@ -367,3 +367,40 @@ fn legacy_single_record_secure_layout_is_upgraded_in_place() {
     assert!(error.contains("rollback detected"), "{error}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Lower-priority audit item: loading a keystore never establishes its first
+/// anchor — only a confirmed unlock does — so a self-signed keystore planted
+/// in an empty namespace cannot claim it before the owner unlocks.
+#[test]
+fn a_planted_keystore_cannot_claim_an_empty_namespace() {
+    let dir = tmp();
+    let secure = Arc::new(MemoryAnchorStorage::new());
+    let store = open(&dir, &secure).unwrap();
+    let owner = Identity::generate("Owner", 0).unwrap();
+    let owner_ks = KeystoreFile::create(&owner, PASS, fast_kdf()).unwrap();
+    let mallory = Identity::generate("Mallory", 0).unwrap();
+    let planted = KeystoreFile::create(&mallory, b"attacker passphrase", fast_kdf()).unwrap();
+
+    // The planted keystore is merely looked at (e.g. by the unlock screen).
+    std::fs::write(dir.join("keystore.fsk"), planted.to_bytes().unwrap()).unwrap();
+    store.load_keystore().unwrap();
+    let records_before = secure.len();
+
+    // The owner's keystore still loads and, once unlocked, is anchored.
+    std::fs::write(dir.join("keystore.fsk"), owner_ks.to_bytes().unwrap()).unwrap();
+    let ks = store.load_keystore().unwrap();
+    assert_eq!(secure.len(), records_before, "loading anchors nothing");
+    let identity = ks.unlock(PASS).unwrap();
+    store.confirm_unlocked_keystore(&ks, &identity).unwrap();
+    assert_eq!(secure.len(), records_before + 1);
+
+    // From now on another identity's keystore is refused.
+    assert!(store.confirm_unlocked_keystore(&ks, &mallory).is_err());
+    std::fs::write(dir.join("keystore.fsk"), planted.to_bytes().unwrap()).unwrap();
+    let error = store.load_keystore().err().expect("must be refused");
+    assert!(
+        error.contains("different identity") || error.contains("state-anchor mismatch"),
+        "{error}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

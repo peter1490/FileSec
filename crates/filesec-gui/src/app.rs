@@ -2201,6 +2201,12 @@ impl App {
                     }
                 }
             };
+            if let Err(e) = store.confirm_unlocked_keystore(&ks, &identity) {
+                return JobReport {
+                    outcome: Outcome::UnlockFailed(e),
+                    toast: None,
+                };
+            }
             let contacts = match store.load_contacts(&identity) {
                 Ok(contacts) => contacts,
                 Err(e) if legacy_recovery && e.contains("legacy") => {
@@ -2397,6 +2403,12 @@ impl App {
                 };
                 match ks.unlock_with_passkey(i, &secret) {
                     Ok(identity) => {
+                        if let Err(e) = store.confirm_unlocked_keystore(&ks, &identity) {
+                            return JobReport {
+                                outcome: Outcome::UnlockFailed(e),
+                                toast: None,
+                            };
+                        }
                         let contacts = match store.load_contacts(&identity) {
                             Ok(contacts) => contacts,
                             Err(e) => {
@@ -2595,6 +2607,12 @@ impl App {
                     };
                 }
             };
+            if let Err(e) = store.confirm_unlocked_keystore(&ks, &identity) {
+                return JobReport {
+                    outcome: Outcome::UnlockFailed(e),
+                    toast: None,
+                };
+            }
             let contacts = match store.load_contacts(&identity) {
                 Ok(contacts) => contacts,
                 Err(e) => {

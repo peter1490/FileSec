@@ -1023,6 +1023,29 @@ impl Store {
         result
     }
 
+    /// Like [`Self::accept_state`] for state read from disk, except that an
+    /// object with **no** anchor yet stays unanchored (nothing is written).
+    /// An existing anchor still advances to an authenticated successor.
+    fn check_loaded_state(&self, state: &StateMetadata, suspect_path: &Path) -> StoreResult<()> {
+        let result = (|| {
+            let _guard = self
+                .lock
+                .anchors
+                .lock()
+                .map_err(|_| "state anchor lock is unavailable".to_string())?;
+            if let Some(anchor) = self.get_anchor_locked(state.object_type, &state.object_id)? {
+                if anchor.check_candidate(state).map_err(err)? {
+                    self.put_anchor_locked(&StateAnchor::from_metadata(state))?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() && suspect_path.exists() {
+            let _ = self.quarantine(suspect_path);
+        }
+        result
+    }
+
     fn check_state_transition(&self, state: &StateMetadata) -> StoreResult<()> {
         let _guard = self
             .lock
@@ -1099,8 +1122,33 @@ impl Store {
             let state = ks
                 .state_metadata()
                 .ok_or_else(|| "keystore has no rollback-protection metadata".to_string())?;
-            self.accept_state(state, &self.keystore_path())?;
+            // Checked against an existing anchor (rollback, fork, or another
+            // identity are refused), but a *first* anchor is never established
+            // here: before anyone has unlocked it, a self-signed keystore planted
+            // in an empty or cold-start namespace would otherwise claim it. See
+            // [`Self::confirm_unlocked_keystore`].
+            self.check_loaded_state(state, &self.keystore_path())?;
             Ok(ks)
+        })
+    }
+
+    /// Record the keystore's state as the high-water anchor once `identity` —
+    /// just unlocked from `ks` by passphrase, passkey, or device token — has
+    /// been confirmed to be the identity the keystore is signed by. This is
+    /// where a store's first keystore anchor is established.
+    pub fn confirm_unlocked_keystore(
+        &self,
+        ks: &KeystoreFile,
+        identity: &Identity,
+    ) -> StoreResult<()> {
+        let state = ks
+            .state_metadata()
+            .ok_or_else(|| "keystore has no rollback-protection metadata".to_string())?;
+        if state.identity_fingerprint != identity.fingerprint() {
+            return Err("the unlocked identity does not match the keystore".into());
+        }
+        self.in_txn(StateObjectType::Keystore, KEYSTORE_OBJECT_ID, || {
+            self.accept_state(state, &self.keystore_path())
         })
     }
 
