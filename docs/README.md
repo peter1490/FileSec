@@ -146,8 +146,10 @@ rollback-protected v3 state frame. Older v1/v2 keystores remain recoverable: the
 unlock screen clearly marks the one-time migration, requires the passphrase as
 explicit confirmation, and immediately rewraps the keystore. Keystore writes are
 atomic (temp + fsync + rename), so enrolling/removing a key can never half-write
-it. Upgrading to post-quantum re-seals a fresh keystore, so re-enroll any keys
-after.
+it. Upgrading to post-quantum first verifies your current passphrase against the
+existing keystore (a mistyped confirmation changes nothing), then re-seals the
+new identity under the same data key, so the passphrase, enrolled security keys,
+and a saved device unlock all keep working.
 
 > The passkey backend talks to the key over USB HID via `ctap-hid-fido2`, which
 > vendors the C `hidapi` library — it is **only** compiled with

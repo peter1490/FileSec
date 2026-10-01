@@ -601,7 +601,7 @@ fn migrate_classical_store_to_post_quantum() {
     );
 
     // Migrate.
-    let new = store.migrate_to_hybrid(&old, pass, fast_kdf()).unwrap();
+    let new = store.migrate_to_hybrid(&old, pass).unwrap();
     assert!(new.is_hybrid_capable());
     assert_ne!(new.fingerprint(), old.fingerprint());
 

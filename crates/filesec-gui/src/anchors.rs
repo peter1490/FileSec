@@ -113,6 +113,18 @@ impl MemoryAnchorStorage {
         self.len() == 0
     }
 
+    /// Every record, sorted by account — for asserting that nothing changed.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(String, Vec<u8>)> {
+        let mut records: Vec<_> = self
+            .records
+            .lock()
+            .map(|r| r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        records.sort();
+        records
+    }
+
     /// Size of the largest record currently held.
     #[must_use]
     pub fn largest_record(&self) -> usize {

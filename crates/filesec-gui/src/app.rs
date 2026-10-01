@@ -3990,11 +3990,19 @@ impl App {
             s.migrate = None;
         }
         self.spawn_job(ctx, "Upgrading to post-quantum…", move || {
-            let new =
-                match store.migrate_to_hybrid(&identity, pass.as_bytes(), KdfParams::default()) {
-                    Ok(n) => n,
-                    Err(e) => return JobReport::err(e),
-                };
+            let new = match store.migrate_to_hybrid(&identity, pass.as_bytes()) {
+                Ok(n) => n,
+                Err(e) if e.contains("passphrase") => {
+                    return JobReport::err(
+                        "Incorrect passphrase — nothing was changed. Enter your current passphrase to upgrade.",
+                    )
+                }
+                Err(e) => return JobReport::err(e),
+            };
+            let passkeys = store
+                .load_keystore()
+                .map(|ks| ks.passkey_slots())
+                .unwrap_or_default();
             // Migration is committed (the keystore now holds the hybrid identity).
             // Reload the store under the new identity to rebuild the session; on
             // the off chance a reload fails, ask for a restart rather than risk an
@@ -4020,16 +4028,16 @@ impl App {
                     identity: new,
                     contacts,
                     registry,
-                    // Migration re-seals a fresh passphrase-only keystore; any
-                    // security keys must be re-enrolled afterwards. The passphrase
-                    // is unchanged, so a saved keychain secret stays valid.
-                    passkeys: Vec::new(),
+                    // Migration keeps the keystore's data key, so the passphrase,
+                    // enrolled security keys, and this device's saved unlock all
+                    // carry over unchanged.
+                    passkeys,
                     auto_unlock: autounlock::is_saved(&data_dir),
                     data_dir,
                     rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
                 "Upgraded to post-quantum. Your safety number changed — re-share your \
-                 public key so contacts can re-verify it. Re-enroll any security keys.",
+                 public key so contacts can re-verify it.",
             )
         });
     }
@@ -7224,7 +7232,7 @@ fn migrate_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Acti
             .small(),
         );
         ui.add_space(10.0);
-        ui.label("Confirm your passphrase to re-seal the keystore:");
+        ui.label("Enter your current passphrase to confirm (it stays your passphrase):");
         ui.add(
             egui::TextEdit::singleline(&mut form.pass)
                 .password(true)

@@ -464,7 +464,7 @@ pub fn import_identity_armored(text: &str, passphrase: &[u8]) -> Result<Identity
 // ---------------------------------------------------------------------------
 
 /// The single passphrase keyslot: the DEK wrapped under an Argon2id key.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PassphraseSlot {
     kdf: KdfParams,
     salt: Vec<u8>,
@@ -1011,6 +1011,60 @@ impl KeystoreFile {
         }
     }
 
+    /// Re-seal this keystore around `successor`, a continuation of the identity
+    /// it currently holds — the post-quantum upgrade's keystore step.
+    ///
+    /// `passphrase` must open **this** keystore (a wrong value is
+    /// [`Error::BadPassphrase`] and nothing changes), the identity inside must
+    /// be `current` (the caller's active session), and `successor` must keep
+    /// `current`'s classical Ed25519/X25519 keys byte for byte. The result keeps
+    /// the same data key and therefore every unlock method exactly as it was:
+    /// the passphrase (and its KDF parameters), each enrolled passkey, and any
+    /// device-unlock slot. Only the sealed secret bundle is replaced (under a
+    /// fresh nonce), and the signed state starts a new chain for `successor`'s
+    /// fingerprint.
+    ///
+    /// Returns a new value; `self` is untouched, so the caller decides when the
+    /// result becomes durable.
+    pub fn continue_identity(
+        &self,
+        passphrase: &[u8],
+        current: &Identity,
+        successor: &Identity,
+    ) -> Result<Self> {
+        let Inner::V3(v3) = &self.0 else {
+            return Err(Error::LegacyState("keystore"));
+        };
+        let dek = v3.body.unlock_dek_with_passphrase(passphrase)?;
+        let stored = decrypt_bundle(&dek, &v3.body.bundle_nonce, &v3.body.bundle_ct)?;
+        if stored.fingerprint() != current.fingerprint()
+            || v3.state.identity_fingerprint != current.fingerprint()
+        {
+            return Err(Error::StateMismatch(
+                "keystore does not hold the active identity".into(),
+            ));
+        }
+        if successor.sign_public() != stored.sign_public()
+            || successor.kem_public() != stored.kem_public()
+        {
+            return Err(Error::StateMismatch(
+                "successor identity changes the classical keys".into(),
+            ));
+        }
+        let (bundle_nonce, bundle_ct) = encrypt_bundle(&dek, successor)?;
+        let body = KeystoreV2 {
+            version: VERSION_V2,
+            bundle_nonce,
+            bundle_ct,
+            passphrase: v3.body.passphrase.clone(),
+            passkeys: v3.body.passkeys.clone(),
+            device: v3.body.device.clone(),
+        };
+        Ok(Self(Inner::V3(Box::new(KeystoreV3::build(
+            body, successor, None,
+        )?))))
+    }
+
     /// Authenticated state metadata used by the independent high-water anchor.
     #[must_use]
     pub fn state_metadata(&self) -> Option<&StateMetadata> {
@@ -1419,5 +1473,34 @@ mod tests {
             import_identity_armored(&ks_armored, b"pw"),
             Err(Error::Format(_))
         ));
+    }
+
+    /// FS-02: continuing a keystore to a successor identity authenticates the
+    /// existing keystore first and refuses anything that is not a continuation.
+    #[cfg(feature = "pqc")]
+    #[test]
+    fn continue_identity_requires_the_current_passphrase_and_identity() {
+        let id = Identity::generate("Alice", 0).unwrap();
+        let ks = KeystoreFile::create(&id, b"pw", fast_params()).unwrap();
+        let successor = id.upgraded_to_hybrid().unwrap();
+        assert!(matches!(
+            ks.continue_identity(b"pW", &id, &successor),
+            Err(Error::BadPassphrase)
+        ));
+        let other = Identity::generate("Mallory", 0).unwrap();
+        assert!(ks.continue_identity(b"pw", &other, &successor).is_err());
+        let unrelated = other.upgraded_to_hybrid().unwrap();
+        assert!(ks.continue_identity(b"pw", &id, &unrelated).is_err());
+
+        let next = ks.continue_identity(b"pw", &id, &successor).unwrap();
+        let reopened = KeystoreFile::from_bytes(&next.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            reopened.unlock(b"pw").unwrap().fingerprint(),
+            successor.fingerprint()
+        );
+        assert_eq!(
+            reopened.state_metadata().unwrap().identity_fingerprint,
+            successor.fingerprint()
+        );
     }
 }

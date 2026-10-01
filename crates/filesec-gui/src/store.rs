@@ -1369,21 +1369,28 @@ impl Store {
     ///    here, `new` still opens every file and a later normal save (which uses
     ///    [`self_options`]) finishes upgrading any stragglers.
     ///
+    /// `passphrase` must be the current keystore passphrase: it is verified
+    /// against the existing keystore before anything is written, and it stays
+    /// the passphrase afterwards (it is never replaced by what was typed).
+    ///
     /// The new identity has a **new fingerprint** — the caller must re-share its
     /// public key and have contacts re-verify the new safety number. Any `.fsec`
     /// addressed to the *old* fingerprint that has not been imported yet should be
     /// imported before migrating.
     #[cfg(feature = "pqc")]
-    pub fn migrate_to_hybrid(
-        &self,
-        old: &Identity,
-        passphrase: &[u8],
-        kdf: filesec_core::kdf::KdfParams,
-    ) -> StoreResult<Identity> {
+    pub fn migrate_to_hybrid(&self, old: &Identity, passphrase: &[u8]) -> StoreResult<Identity> {
         if old.is_hybrid_capable() {
             return Err("this identity is already post-quantum".to_string());
         }
         let new = old.upgraded_to_hybrid().map_err(err)?;
+        // Authenticate before any write (FS-02): the confirmation must open the
+        // current keystore and that keystore must hold the active identity. The
+        // re-sealed keystore keeps the same data key, so the passphrase, its KDF
+        // parameters, every passkey, and any device-unlock slot stay valid.
+        let resealed = self
+            .load_keystore()?
+            .continue_identity(passphrase, old, &new)
+            .map_err(err)?;
         let contacts = self.load_contacts(old)?;
         let registry = self.load_registry(old)?;
 
@@ -1398,8 +1405,7 @@ impl Store {
         // 2. Commit: explicitly transition the anchor namespace, then put the
         // keystore and metadata under the continued hybrid identity.
         self.authorize_identity_anchor_migration(old, &new)?;
-        let ks = KeystoreFile::create(&new, passphrase, kdf).map_err(err)?;
-        self.save_keystore(&ks)?;
+        self.save_keystore(&resealed)?;
         self.save_contacts(&new, &contacts)?;
         self.save_registry(&new, &registry)?;
 
