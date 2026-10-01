@@ -193,10 +193,29 @@ jobs:
           choco install nsis -y --no-progress
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      # cargo-wix drives the WiX v3 toolset. Install a pinned version rather
-      # than relying on whatever the runner image happens to bundle.
-      - name: Install WiX Toolset v3
-        run: choco install wixtoolset --version 3.14.1 -y --no-progress
+      # cargo-wix drives the WiX v3 toolset. Pin the toolset build rather than
+      # trusting whatever the runner image bundles. windows-2025 already ships
+      # WiX 3.14.1 (choco package 3.14.1.20250415), and choco refuses to install
+      # an "older" 3.14.1 package over it, so verify the exact candle.exe build
+      # and install the pinned package only when an image lacks WiX entirely.
+      - name: Pin WiX Toolset v3
+        env:
+          WIX_BUILD: 3.14.1.8722
+          WIX_CHOCO_VERSION: 3.14.1.20250415
+        run: |
+          $candle = if ($env:WIX) { Join-Path $env:WIX 'bin\candle.exe' } else { '' }
+          if (-not ($candle -and (Test-Path $candle))) {
+            choco install wixtoolset --version $env:WIX_CHOCO_VERSION -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install wixtoolset failed ($LASTEXITCODE)" }
+            $wix = 'C:\Program Files (x86)\WiX Toolset v3.14\'
+            "WIX=$wix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            $candle = Join-Path $wix 'bin\candle.exe'
+          }
+          $build = (Get-Item $candle).VersionInfo.FileVersion
+          if ($build -ne $env:WIX_BUILD) {
+            throw "expected WiX $env:WIX_BUILD at $candle, found $build"
+          }
+          "Using WiX $build at $candle"
 
       - name: Set variant parameters
         shell: bash

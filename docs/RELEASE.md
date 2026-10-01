@@ -56,7 +56,8 @@ A tag cannot publish on the strength of its build alone:
 - **Pinned toolchain and runners.** CI and releases build with one pinned Rust
   toolchain (`RUST_TOOLCHAIN` in both workflows; bump them together) on pinned
   runner images (`ubuntu-24.04`, `macos-15`, `windows-2025`), and the WiX
-  toolset is installed at a pinned version. `stable`/`*-latest` would let the
+  toolset is pinned to one exact build (3.14.1.8722, verified before packaging and
+  installed only if the image lacks it). `stable`/`*-latest` would let the
   same commit build differently on a re-run.
 - **Protected `release` environment.** The `publish` job runs in the `release`
   environment. In *Settings → Environments → release*, require at least one
