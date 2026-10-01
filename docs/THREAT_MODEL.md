@@ -124,6 +124,14 @@ docs.
   the vault's transaction lock, after a successful directory sync) the next
   time the vault opens. Where a directory cannot be synced, the cost is disk
   space, never a manifest that points at a deleted blob (FS-10).
+- Vault creation/import is staged (`<id>.fsv2.partial` → rename → anchor) and
+  deletion is tombstoned (`<id>.fsv2.deleted` → registry commit → terminal
+  "deleted" anchor → wipe). Every unlock reconciles the registry with the vault
+  directories: an interrupted deletion is undone or finished according to the
+  registry, and a committed but unregistered vault is authenticated and listed
+  again. A restored copy of a deleted vault is refused as a rollback. Encrypted
+  remnants are restored, quarantined, or left in place — never deleted blindly
+  (FS-11).
 
 ### In transit (P2P networking build)
 

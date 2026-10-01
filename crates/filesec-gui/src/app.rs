@@ -2224,9 +2224,8 @@ impl App {
             let passkeys = ks.passkey_slots();
             let data_dir = store.data_dir().display().to_string();
             // Securely wipe any checkout temp files orphaned by a prior crash,
-            // plus any vault-migration scratch dirs left behind by a crash.
-            store.clean_checkout_dir();
-            store.clean_partial_dirs();
+            // drop interrupted scratch dirs, and reconcile the vault list.
+            let (registry, repair_note) = finish_unlock(&store, &identity, registry);
             if legacy_recovery {
                 let _ = std::fs::remove_file(&recovery_marker);
             }
@@ -2240,11 +2239,14 @@ impl App {
                     data_dir,
                     rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
-                if legacy_recovery {
-                    "Legacy local state recovered and upgraded with rollback protection."
-                } else {
-                    "Unlocked."
-                },
+                with_note(
+                    if legacy_recovery {
+                        "Legacy local state recovered and upgraded with rollback protection."
+                    } else {
+                        "Unlocked."
+                    },
+                    &repair_note,
+                ),
             )
         });
     }
@@ -2368,8 +2370,7 @@ impl App {
                         };
                         let passkeys = ks.passkey_slots();
                         let data_dir = store.data_dir().display().to_string();
-                        store.clean_checkout_dir();
-                        store.clean_partial_dirs();
+                        let (registry, repair_note) = finish_unlock(&store, &identity, registry);
                         return JobReport::ok(
                             Outcome::Unlocked(Box::new(SessionInit {
                                 identity,
@@ -2382,7 +2383,7 @@ impl App {
                                     .rollback_protection_warning()
                                     .map(str::to_string),
                             })),
-                            "Unlocked with your security key.",
+                            with_note("Unlocked with your security key.", &repair_note),
                         );
                     }
                     Err(e) => last_err = e.to_string(),
@@ -2566,8 +2567,7 @@ impl App {
                 }
             };
             let passkeys = ks.passkey_slots();
-            store.clean_checkout_dir();
-            store.clean_partial_dirs();
+            let (registry, repair_note) = finish_unlock(&store, &identity, registry);
             JobReport::ok(
                 Outcome::Unlocked(Box::new(SessionInit {
                     identity,
@@ -2578,7 +2578,7 @@ impl App {
                     data_dir,
                     rollback_warning: store.rollback_protection_warning().map(str::to_string),
                 })),
-                "Unlocked from this device.",
+                with_note("Unlocked from this device.", &repair_note),
             )
         });
     }
@@ -2720,7 +2720,10 @@ impl App {
                 total_size: 0,
             });
             if let Err(e) = store.save_registry(&identity, &registry) {
-                return JobReport::err(e);
+                return JobReport::err(format!(
+                    "The vault was created but the vault list could not be updated ({e}). \
+                     It will be recovered automatically the next time you unlock."
+                ));
             }
             JobReport::ok(
                 Outcome::Created {
@@ -2765,14 +2768,12 @@ impl App {
             _ => return,
         };
         self.spawn_job(ctx, "Deleting vault…", move || {
-            if let Err(e) = store.delete_vault_file(&id) {
-                return JobReport::err(e);
-            }
-            let mut registry = registry;
-            registry.remove(&id);
-            if let Err(e) = store.save_registry(&identity, &registry) {
-                return JobReport::err(e);
-            }
+            // Tombstone → registry commit → retire: a failure leaves the vault
+            // intact and listed; an interruption is finished on the next unlock.
+            let registry = match store.delete_vault(&identity, &registry, &id) {
+                Ok(registry) => registry,
+                Err(e) => return JobReport::err(format!("The vault was not deleted: {e}")),
+            };
             JobReport::ok(
                 Outcome::Deleted {
                     registry,
@@ -3895,7 +3896,10 @@ impl App {
                 total_size: reader.total_size(),
             });
             if let Err(e) = store.save_registry(&identity, &registry) {
-                return JobReport::err(e);
+                return JobReport::err(format!(
+                    "The vault was imported but the vault list could not be updated ({e}). \
+                     It will be recovered automatically the next time you unlock."
+                ));
             }
             JobReport {
                 outcome: Outcome::Imported(Box::new(ImportData {
@@ -5382,6 +5386,31 @@ fn fatal_ui(msg: &str, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.colored_label(ERR_RED, msg);
     });
+}
+
+/// Post-unlock housekeeping shared by every unlock path: shred stale checkout
+/// temps, drop interrupted scratch directories, and reconcile the registry with
+/// the vault directories (FS-11). Returns the registry the session should use
+/// and a note about anything that was repaired.
+fn finish_unlock(store: &Store, identity: &Identity, registry: Registry) -> (Registry, String) {
+    store.clean_checkout_dir();
+    store.clean_partial_dirs();
+    match store.reconcile_vaults(identity, registry.clone()) {
+        Ok((registry, notes)) => (registry, notes.join(" ")),
+        Err(e) => (
+            registry,
+            format!("Could not check the vault list for interrupted operations: {e}"),
+        ),
+    }
+}
+
+/// `message`, followed by `note` when there is one.
+fn with_note(message: &str, note: &str) -> String {
+    if note.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message} {note}")
+    }
 }
 
 fn anchor_recovery_ui(r: &mut AnchorRecovery, ui: &mut egui::Ui, action: &mut Option<Action>) {

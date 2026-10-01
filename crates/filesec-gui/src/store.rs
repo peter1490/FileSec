@@ -281,6 +281,20 @@ struct ObjectAnchorRecord {
     anchor: StateAnchor,
 }
 
+/// The terminal high-water mark of a deleted vault: no state can ever be its
+/// successor, so a restored copy of the deleted directory is refused as a
+/// rollback (and quarantined) instead of silently reappearing (FS-11).
+fn deleted_vault_anchor(identity: &Identity, id: &str) -> StateAnchor {
+    StateAnchor {
+        identity_fingerprint: identity.fingerprint(),
+        object_type: StateObjectType::VaultManifest,
+        object_id: id.to_string(),
+        suite_id: 0,
+        epoch: u64::MAX,
+        current_state_hash: [0xff; 32],
+    }
+}
+
 fn object_tag(object_type: StateObjectType) -> &'static str {
     match object_type {
         StateObjectType::Keystore => "keystore",
@@ -1241,24 +1255,51 @@ impl Store {
     /// Persist a (typically new) vault to its local v2 store directory, encrypted
     /// to the identity itself under the identity's at-rest suite.
     pub fn save_vault(&self, identity: &Identity, id: &str, vault: &Vault) -> StoreResult<()> {
-        self.in_txn(StateObjectType::VaultManifest, id, || {
-            let dir = self.vault_dir_v2(id);
-            if dir.exists() {
-                return Err("vault already exists; use the rollback-aware mutation APIs".into());
-            }
-            let reader = VaultReaderV2::from_vault_with_object_id(
-                &dir,
+        self.create_vault_dir(id, |partial| {
+            VaultReaderV2::from_vault_with_object_id(
+                partial,
                 identity,
                 self_suite(identity),
                 vault,
                 id,
             )
-            .map_err(err)?;
-            let state = reader
-                .state_metadata()
-                .cloned()
-                .ok_or_else(|| "new vault has no rollback-protection metadata".to_string())?;
-            drop(reader);
+        })
+    }
+
+    /// Create a new vault directory as a staged transaction (FS-11): `build`
+    /// writes the complete vault into `<id>.fsv2.partial`, which is renamed to
+    /// `<id>.fsv2` (the commit point) and then anchored. A crash before the
+    /// rename leaves only a `.partial` that the next unlock discards; a crash
+    /// after it leaves a complete vault that [`Self::reconcile_vaults`] registers.
+    /// An existing vault or tombstone at `id` is never overwritten.
+    fn create_vault_dir(
+        &self,
+        id: &str,
+        build: impl FnOnce(&Path) -> filesec_core::Result<VaultReaderV2>,
+    ) -> StoreResult<()> {
+        self.in_txn(StateObjectType::VaultManifest, id, || {
+            let dir = self.vault_dir_v2(id);
+            if dir.exists() || self.vault_tombstone(id).exists() {
+                return Err("vault already exists; use the rollback-aware mutation APIs".into());
+            }
+            let partial = self.vaults_dir.join(format!("{id}.fsv2.partial"));
+            wipe_vault_dir(&partial);
+            let state = match build(&partial) {
+                Ok(reader) => reader.state_metadata().cloned(),
+                Err(e) => {
+                    wipe_vault_dir(&partial);
+                    return Err(err(e));
+                }
+            };
+            let Some(state) = state else {
+                wipe_vault_dir(&partial);
+                return Err("new vault has no rollback-protection metadata".into());
+            };
+            if let Err(e) = std::fs::rename(&partial, &dir) {
+                wipe_vault_dir(&partial);
+                return Err(err(e));
+            }
+            let _ = filesec_core::safe_io::sync_dir(&self.vaults_dir);
             // A vault whose anchor could not be recorded was never created as
             // far as the caller knows; don't leave an unanchored directory.
             if let Err(e) = self.commit_state(&state) {
@@ -1589,45 +1630,198 @@ impl Store {
         id: &str,
         reader: &format::VaultReader,
     ) -> StoreResult<()> {
-        self.in_txn(StateObjectType::VaultManifest, id, || {
-            let dir = self.vault_dir_v2(id);
-            let _ = std::fs::remove_dir_all(&dir);
-            let imported = match VaultReaderV2::from_reader_v1_with_object_id(
-                &dir,
+        self.create_vault_dir(id, |partial| {
+            VaultReaderV2::from_reader_v1_with_object_id(
+                partial,
                 identity,
                 self_suite(identity),
                 reader,
                 id,
-            ) {
-                Ok(reader) => reader,
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(err(e));
-                }
-            };
-            if let Err(e) = self.commit_vault_reader(&imported) {
-                drop(imported);
-                wipe_vault_dir(&dir);
-                return Err(e);
-            }
-            Ok(())
+            )
         })
     }
 
-    /// Delete a vault's encrypted store, securely wiping its contents. Handles
-    /// both the v2 directory and any leftover legacy v1 `.fsec` file.
-    pub fn delete_vault_file(&self, id: &str) -> StoreResult<()> {
+    fn vault_tombstone(&self, id: &str) -> PathBuf {
+        self.vaults_dir.join(format!("{id}.fsv2.deleted"))
+    }
+
+    fn legacy_vault_tombstone(&self, id: &str) -> PathBuf {
+        self.vaults_dir.join(format!("{id}.fsec.deleted"))
+    }
+
+    /// Delete a vault as a recoverable transaction (FS-11) and return the
+    /// updated registry.
+    ///
+    /// 1. The vault's directory (and any legacy `.fsec`) is renamed to a
+    ///    `.deleted` **tombstone** — the encrypted data is still intact.
+    /// 2. The registry without the vault is saved: the commit point. If that
+    ///    fails the tombstone is renamed back and nothing changed.
+    /// 3. The vault's anchor is set to a terminal "deleted" high-water mark, so
+    ///    a restored copy of the deleted vault is never accepted again, and the
+    ///    tombstone is securely wiped.
+    ///
+    /// A crash after step 1 is resolved by [`Self::reconcile_vaults`] on the
+    /// next unlock: a tombstone the registry still lists is restored, one it no
+    /// longer lists is retired.
+    pub fn delete_vault(
+        &self,
+        identity: &Identity,
+        registry: &Registry,
+        id: &str,
+    ) -> StoreResult<Registry> {
+        let mut updated = registry.clone();
+        updated.remove(id);
         self.in_txn(StateObjectType::VaultManifest, id, || {
-            let dir = self.vault_dir_v2(id);
-            if dir.exists() {
-                wipe_vault_dir(&dir);
+            self.tombstone_vault(id)
+        })?;
+        if let Err(e) = self.save_registry(identity, &updated) {
+            return Err(
+                match self.in_txn(StateObjectType::VaultManifest, id, || {
+                    self.restore_tombstone(id)
+                }) {
+                    Ok(()) => e,
+                    Err(restore) => format!(
+                        "{e} (the vault is kept as a tombstone and will be restored on the next unlock: {restore})"
+                    ),
+                },
+            );
+        }
+        // Committed. Finishing is retried by the next unlock if it fails here.
+        let _ = self.in_txn(StateObjectType::VaultManifest, id, || {
+            self.retire_tombstone(identity, id)
+        });
+        Ok(updated)
+    }
+
+    fn tombstone_vault(&self, id: &str) -> StoreResult<()> {
+        let live = self.vault_dir_v2(id);
+        if live.exists() {
+            std::fs::rename(&live, self.vault_tombstone(id)).map_err(err)?;
+        }
+        let legacy = self.vault_path(id);
+        if legacy.exists() {
+            std::fs::rename(&legacy, self.legacy_vault_tombstone(id)).map_err(err)?;
+        }
+        let _ = filesec_core::safe_io::sync_dir(&self.vaults_dir);
+        Ok(())
+    }
+
+    fn restore_tombstone(&self, id: &str) -> StoreResult<()> {
+        let tomb = self.vault_tombstone(id);
+        if tomb.exists() {
+            std::fs::rename(&tomb, self.vault_dir_v2(id)).map_err(err)?;
+        }
+        let legacy = self.legacy_vault_tombstone(id);
+        if legacy.exists() {
+            std::fs::rename(&legacy, self.vault_path(id)).map_err(err)?;
+        }
+        let _ = filesec_core::safe_io::sync_dir(&self.vaults_dir);
+        Ok(())
+    }
+
+    /// Finish a committed deletion: record the terminal anchor, then wipe.
+    fn retire_tombstone(&self, identity: &Identity, id: &str) -> StoreResult<()> {
+        {
+            let _guard = self
+                .lock
+                .anchors
+                .lock()
+                .map_err(|_| "state anchor lock is unavailable".to_string())?;
+            self.put_anchor_locked(&deleted_vault_anchor(identity, id))?;
+        }
+        let tomb = self.vault_tombstone(id);
+        if tomb.exists() {
+            wipe_vault_dir(&tomb);
+        }
+        let _ = secure_wipe(&self.legacy_vault_tombstone(id));
+        Ok(())
+    }
+
+    /// Bring the registry and the vault directories back into agreement after
+    /// an interruption (FS-11). Run on every unlock, before the session starts.
+    ///
+    /// * A `.deleted` tombstone the registry still lists is **restored** (its
+    ///   deletion never committed); one it no longer lists is **retired**.
+    /// * A committed vault directory the registry does not list (a create or
+    ///   import whose registry update failed or was interrupted) is opened —
+    ///   which authenticates it and checks its anchor — and registered again.
+    ///   Anything that does not open is left in place (or quarantined by the
+    ///   anchor check), never deleted.
+    ///
+    /// Returns the reconciled registry (saved if it changed) and human-readable
+    /// notes about what was repaired.
+    pub fn reconcile_vaults(
+        &self,
+        identity: &Identity,
+        registry: Registry,
+    ) -> StoreResult<(Registry, Vec<String>)> {
+        let mut registry = registry;
+        let mut notes = Vec::new();
+        let mut changed = false;
+        for id in self.tombstoned_vaults() {
+            if registry.vaults.iter().any(|v| v.id == id) {
+                self.in_txn(StateObjectType::VaultManifest, &id, || {
+                    self.restore_tombstone(&id)
+                })?;
+                let name = registry
+                    .vaults
+                    .iter()
+                    .find(|v| v.id == id)
+                    .map(|v| v.name.clone())
+                    .unwrap_or_default();
+                notes.push(format!(
+                    "Kept vault \"{name}\": its deletion was interrupted before it completed."
+                ));
+            } else {
+                self.in_txn(StateObjectType::VaultManifest, &id, || {
+                    self.retire_tombstone(identity, &id)
+                })?;
             }
-            let v1 = self.vault_path(id);
-            if v1.exists() {
-                let _ = secure_wipe(&v1);
+        }
+        for (id, _) in self.v2_vaults() {
+            if registry.vaults.iter().any(|v| v.id == id) {
+                continue;
             }
-            Ok(())
-        })
+            let Ok(reader) = self.open_vault(identity, &id) else {
+                continue;
+            };
+            notes.push(format!(
+                "Recovered vault \"{}\", which was saved but missing from the vault list.",
+                reader.name()
+            ));
+            registry.upsert(VaultMeta {
+                id,
+                name: reader.name().to_string(),
+                created_at: reader.created_at(),
+                modified_at: now_unix(),
+                file_count: reader.file_count() as u64,
+                total_size: reader.total_size(),
+            });
+            changed = true;
+        }
+        if changed {
+            self.save_registry(identity, &registry)?;
+        }
+        Ok((registry, notes))
+    }
+
+    /// Vault ids with a `.deleted` tombstone (v2 directory or legacy file).
+    fn tombstoned_vaults(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let id = name
+                    .strip_suffix(".fsv2.deleted")
+                    .or_else(|| name.strip_suffix(".fsec.deleted"));
+                if let Some(id) = id {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// The hardened directory holding checked-out plaintext temp files.

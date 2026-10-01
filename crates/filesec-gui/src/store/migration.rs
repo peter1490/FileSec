@@ -349,6 +349,12 @@ mod upgrade {
             fault("validate")?;
             let contacts = self.load_contacts(old)?;
             let registry = self.load_registry(old)?;
+            if !self.tombstoned_vaults().is_empty() {
+                return Err(
+                    "a vault deletion was interrupted; lock and unlock FileSec to finish it before upgrading"
+                        .into(),
+                );
+            }
             if let Some(id) = self.unrecovered_legacy_vaults().first() {
                 return Err(format!(
                     "legacy vault {id} must be recovered before upgrading"
