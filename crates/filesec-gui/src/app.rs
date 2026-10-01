@@ -9172,8 +9172,8 @@ mod ui_smoke {
     }
 
     /// Auto-unlock's device-binding advisory is shown exactly when storage is
-    /// available but not device-bound (Linux Secret Service), and stays silent
-    /// when it is device-bound (macOS/Windows) or unsupported. Keeps the F09
+    /// available but not device-bound (Windows roaming credentials, Linux Secret
+    /// Service), and stays silent when it is device-bound (macOS) or unsupported. Keeps the F09
     /// warning wired to the real platform property rather than hard-coded. (F09)
     #[test]
     fn device_binding_warning_matches_platform_support() {

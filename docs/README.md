@@ -181,9 +181,12 @@ This is strictly **opt-in and per-device**. Your passphrase is never stored or
 replaced — it remains your recovery secret and keeps working everywhere — so this
 can never become a lockout. The trade-off is explicit: the keychain becomes a
 second way in, gated by your logged-in OS account, so only enable it on a machine
-you trust. The token is device-local and non-syncing on macOS (login keychain)
-and Windows (per-user Credential Manager); on Linux the Secret Service gives no
-device-binding guarantee, so the UI shows a caveat there. The signed installer
+you trust. The token is device-local and non-syncing on macOS (login keychain).
+On Windows it is a per-user Credential Manager entry, but the keychain library
+FileSec uses writes it with "enterprise" persistence, which Windows can carry to
+other computers through a roaming profile; on Linux the Secret Service gives no
+device-binding guarantee. The UI shows the matching caveat on both. Either way
+the token opens nothing without this computer's keystore file. The signed installer
 builds enable this feature; the default `cargo` build leaves it (and its
 secret-store dependency) out entirely. The backend crate is target-gated so each
 OS pulls only its own (no `zbus` on macOS/Windows). See

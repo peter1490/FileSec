@@ -21,17 +21,24 @@
 //!
 //! ## Device binding
 //!
-//! Where the platform supports it the token is device-local and non-syncing:
+//! Device binding is claimed only where the backend actually provides it
+//! (audit FS-07 — never inferred from the platform name alone):
 //!
 //! * **macOS** — stored in the login keychain as a generic password; the keyring
 //!   backend does not mark it synchronizable, so it stays on this device and is
-//!   not pushed to iCloud Keychain. (See [`DEVICE_BOUND`].)
-//! * **Windows** — a per-user Credential Manager entry, local to this account on
-//!   this machine.
+//!   not pushed to iCloud Keychain. [`DEVICE_BOUND`] is `true`.
+//! * **Windows** — a per-user Credential Manager generic credential. The keyring
+//!   backend writes it with `CRED_PERSIST_ENTERPRISE`, not
+//!   `CRED_PERSIST_LOCAL_MACHINE`, and Microsoft documents that enterprise
+//!   persistence can follow a roaming profile to other computers. So
+//!   [`DEVICE_BOUND`] is `false` and [`device_binding_warning`] says so.
 //! * **Linux** — the Secret Service gives **no device-binding or user-presence
 //!   guarantee**; [`DEVICE_BOUND`] is `false` and [`device_binding_warning`]
 //!   returns a caveat the UI surfaces so the user only enables it on a trusted
 //!   machine.
+//!
+//! On every platform the token alone opens nothing: it unwraps only the device
+//! slot of *this* data directory's keystore file.
 //!
 //! The whole module is **inert without the `keyring` feature**: the calls below
 //! become stubs (`load_device_token` reports "nothing saved", `save`/`clear`
@@ -56,26 +63,64 @@ pub const ANCHOR_SERVICE: &str = "dev.FileSec.FileSec.StateAnchors";
 /// The UI uses this to show/enable the "remember on this device" controls.
 pub const SUPPORTED: bool = cfg!(feature = "keyring");
 
+/// The platform families whose keychain backends differ in device binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    MacOs,
+    Windows,
+    Linux,
+    Other,
+}
+
+const CURRENT_PLATFORM: Platform = if cfg!(target_os = "macos") {
+    Platform::MacOs
+} else if cfg!(target_os = "windows") {
+    Platform::Windows
+} else if cfg!(target_os = "linux") {
+    Platform::Linux
+} else {
+    Platform::Other
+};
+
+const WINDOWS_ROAMING_WARNING: &str =
+    "On Windows the device token is kept in Credential Manager with \"enterprise\" persistence, \
+     which Windows can copy to other computers you sign in to with a roaming profile. It opens \
+     nothing without this computer's FileSec keystore, but only enable auto-unlock if your \
+     account roaming is acceptable for it.";
+
+const LINUX_SECRET_SERVICE_WARNING: &str =
+    "On this system the device token is kept in the Secret Service (GNOME Keyring / KWallet), \
+     which gives no guarantee it stays on this device and may be readable whenever you are \
+     logged in. Only enable auto-unlock on a trusted personal machine.";
+
+/// Whether `platform`'s keychain backend, as FileSec uses it, keeps the token on
+/// this device, and the caveat to show when it does not.
+const fn platform_binding(platform: Platform) -> (bool, Option<&'static str>) {
+    match platform {
+        Platform::MacOs => (true, None),
+        Platform::Windows => (false, Some(WINDOWS_ROAMING_WARNING)),
+        Platform::Linux | Platform::Other => (false, Some(LINUX_SECRET_SERVICE_WARNING)),
+    }
+}
+
 /// Whether this platform's keychain binds the stored device token to this
-/// device/user — i.e. it does not sync or export to other machines. True on
-/// macOS (login keychain, non-syncing) and Windows (per-user Credential
-/// Manager); false on Linux, whose Secret Service offers no such guarantee.
-pub const DEVICE_BOUND: bool = cfg!(all(
-    feature = "keyring",
-    any(target_os = "macos", target_os = "windows")
-));
+/// device — i.e. it does not sync, roam, or export to other machines. True only
+/// on macOS (non-syncing login keychain). False on Windows, whose keyring
+/// backend uses roaming-capable enterprise persistence, and on Linux, whose
+/// Secret Service offers no such guarantee.
+pub const DEVICE_BOUND: bool = SUPPORTED && platform_binding(CURRENT_PLATFORM).0;
 
 /// A device-binding caveat to surface in the UI when auto-unlock is available but
-/// the platform keychain gives no device-binding/user-presence guarantee (the
-/// Linux Secret Service). `None` when storage is device-bound or auto-unlock is
-/// unsupported.
+/// the platform keychain does not keep the token on this device (Windows
+/// roaming credentials, the Linux Secret Service). `None` when storage is
+/// device-bound or auto-unlock is unsupported.
 #[must_use]
 pub fn device_binding_warning() -> Option<&'static str> {
-    (SUPPORTED && !DEVICE_BOUND).then_some(
-        "On this system the device token is kept in the Secret Service (GNOME Keyring / KWallet), \
-         which gives no guarantee it stays on this device and may be readable whenever you are \
-         logged in. Only enable auto-unlock on a trusted personal machine.",
-    )
+    if SUPPORTED {
+        platform_binding(CURRENT_PLATFORM).1
+    } else {
+        None
+    }
 }
 
 /// A user-facing keychain error (already a human-readable message).
@@ -232,4 +277,30 @@ pub fn save_state_anchors(_account: &str, _bytes: &[u8]) -> Result<(), AutoUnloc
 #[cfg(not(feature = "keyring"))]
 pub fn delete_state_anchors(_account: &str) -> Result<(), AutoUnlockError> {
     Err(AutoUnlockError::new(NO_SUPPORT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FS-07: device binding is claimed only where the backend provides it.
+    #[test]
+    fn only_macos_is_claimed_device_bound() {
+        assert_eq!(platform_binding(Platform::MacOs), (true, None));
+        let (bound, warning) = platform_binding(Platform::Windows);
+        assert!(
+            !bound,
+            "keyring writes CRED_PERSIST_ENTERPRISE, which can roam"
+        );
+        assert!(warning.is_some_and(|w| w.contains("roaming")));
+        for platform in [Platform::Linux, Platform::Other] {
+            let (bound, warning) = platform_binding(platform);
+            assert!(!bound);
+            assert!(warning.is_some());
+        }
+        assert_eq!(
+            DEVICE_BOUND,
+            SUPPORTED && CURRENT_PLATFORM == Platform::MacOs
+        );
+    }
 }

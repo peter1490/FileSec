@@ -136,8 +136,10 @@ docs.
   128-bit device token that wraps the keystore DEK in a dedicated keyslot; only
   the token goes to the OS keychain and it is useless without this machine's
   keystore file. Enrolling/removing advances the rollback-protected epoch. Device
-  binding is real on macOS (login keychain) and Windows (Credential Manager); the
-  Linux Secret Service cannot guarantee it, so the UI warns (F09, Stage 6).
+  binding is claimed only on macOS (non-syncing login keychain). On Windows the
+  keyring backend writes Credential Manager entries with roaming-capable
+  `CRED_PERSIST_ENTERPRISE`, and the Linux Secret Service cannot guarantee
+  binding either, so the UI warns on both (F09, Stage 6; FS-07).
 - **Passkeys require user verification by default** (PIN or built-in UV); the
   no-PIN/no-UV fallback is gone. Passkey slot labels/timestamps are authenticated
   and add/remove advances the keystore epoch. The UI describes passkey as an
