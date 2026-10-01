@@ -140,7 +140,10 @@ docs.
   discloses any identity or signature material, closing the old offline pairing-
   code oracle; the secret space is not offline-enumerable. Both parties must be
   verified contacts. Protocol downgrade to the retired pairing-code scheme is
-  rejected (F07, Stage 5).
+  rejected (F07, Stage 5). A captured `Hello` replayed to the same listening
+  session is refused before the responder discloses anything: every responder
+  of a session shares a bounded cache of answered proofs that lives exactly as
+  long as the transfer secret (FS-12).
 - The transferred container uses the hybrid suite whenever both identities are
   hybrid-capable, so post-quantum protection is not lost in transit; a send to a
   classical-only contact requires an explicit downgrade confirmation (FS-04).

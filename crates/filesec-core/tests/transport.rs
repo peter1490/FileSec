@@ -240,3 +240,76 @@ proptest! {
         }
     }
 }
+
+/// FS-12: a captured `Hello` replayed to the same listening session (same
+/// transfer secret) must not make a fresh responder disclose its identity and
+/// signature again. Without a shared cache it would — that is the gap.
+#[test]
+fn an_exact_hello_replay_is_refused_before_any_auth() {
+    use filesec_core::transport::HelloReplayCache;
+
+    let (alice, bob) = pair();
+    let cache = HelloReplayCache::new(16);
+    let initiator = Initiator::new(&alice, bob.fingerprint(), SECRET).unwrap();
+    let hello = initiator.write_hello().unwrap();
+
+    let mut first = Responder::new(&bob, SECRET, None)
+        .unwrap()
+        .with_replay_cache(&cache);
+    let auth = first.read_hello_write_auth(&hello).expect("first answer");
+    assert!(!auth.is_empty());
+
+    // Replayed to a fresh responder of the same session: nothing is produced.
+    let mut replayed = Responder::new(&bob, SECRET, None)
+        .unwrap()
+        .with_replay_cache(&cache);
+    assert!(matches!(
+        replayed.read_hello_write_auth(&hello),
+        Err(Error::HandshakeProtocol(m)) if m.contains("replay")
+    ));
+
+    // The legitimate session still completes, and a new Hello is answered.
+    let (confirm, _isess) = initiator.read_auth_write_confirm(&auth).unwrap();
+    let (peer, _rsess) = first.read_confirm(&confirm).unwrap();
+    assert_eq!(peer.fingerprint, alice.fingerprint());
+    let again = Initiator::new(&alice, bob.fingerprint(), SECRET).unwrap();
+    let mut next = Responder::new(&bob, SECRET, None)
+        .unwrap()
+        .with_replay_cache(&cache);
+    next.read_hello_write_auth(&again.write_hello().unwrap())
+        .expect("a fresh Hello is answered");
+}
+
+#[test]
+fn the_replay_cache_is_bounded_and_ignores_unproven_hellos() {
+    use filesec_core::transport::HelloReplayCache;
+
+    let (alice, bob) = pair();
+    let cache = HelloReplayCache::new(2);
+    // A wrong-secret Hello fails the proof and is never recorded.
+    let stranger = Initiator::new(&alice, bob.fingerprint(), b"some other secret value").unwrap();
+    let mut responder = Responder::new(&bob, SECRET, None)
+        .unwrap()
+        .with_replay_cache(&cache);
+    assert!(matches!(
+        responder.read_hello_write_auth(&stranger.write_hello().unwrap()),
+        Err(Error::TransferSecretMismatch)
+    ));
+    for _ in 0..2 {
+        let initiator = Initiator::new(&alice, bob.fingerprint(), SECRET).unwrap();
+        let mut responder = Responder::new(&bob, SECRET, None)
+            .unwrap()
+            .with_replay_cache(&cache);
+        responder
+            .read_hello_write_auth(&initiator.write_hello().unwrap())
+            .unwrap();
+    }
+    // Full: further handshakes under this secret are refused, never forgotten.
+    let initiator = Initiator::new(&alice, bob.fingerprint(), SECRET).unwrap();
+    let mut responder = Responder::new(&bob, SECRET, None)
+        .unwrap()
+        .with_replay_cache(&cache);
+    assert!(responder
+        .read_hello_write_auth(&initiator.write_hello().unwrap())
+        .is_err());
+}

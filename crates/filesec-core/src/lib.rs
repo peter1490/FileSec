@@ -53,5 +53,5 @@ pub use format_v2::VaultReaderV2;
 pub use identity::{sanitize_display_name, Identity, PublicIdentity};
 pub use suite::SuiteId;
 #[cfg(feature = "net")]
-pub use transport::{Initiator, PeerAuth, RecordType, Responder, Session};
+pub use transport::{HelloReplayCache, Initiator, PeerAuth, RecordType, Responder, Session};
 pub use vault::Vault;

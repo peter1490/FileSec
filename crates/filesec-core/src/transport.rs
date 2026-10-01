@@ -72,6 +72,11 @@
 //! secret is a second factor layered on the public-key identity gate: the
 //! verified-contact requirement still applies independently.
 //!
+//! The proof binds only initiator-chosen values, so a captured `Hello` stays
+//! valid for as long as the secret does. A listener therefore shares one
+//! [`HelloReplayCache`] across all its responders: an exact replay is refused
+//! before any `Auth` (identity, signature, key agreement) is produced (FS-12).
+//!
 //! # Record layer
 //!
 //! After the handshake, each application record is an independent AEAD frame:
@@ -578,7 +583,58 @@ pub struct Responder<'a> {
     k_psk: SymKey,
     secret_commit: [u8; 32],
     expected_peer_fpr: Option<[u8; 32]>,
+    replay_cache: Option<&'a HelloReplayCache>,
     pending: Option<ResponderPending>,
+}
+
+/// Memory of the `Hello` proofs a listener has already answered under its
+/// current transfer secret (FS-12).
+///
+/// The `Hello` proof binds the initiator's ephemeral key and nonce but not
+/// anything the responder chose, so without this an eavesdropper could replay a
+/// captured `Hello` to the same listener and each fresh responder would answer
+/// with its identity and signature (and spend the asymmetric work) — no secret
+/// needed. With one cache shared by every [`Responder`] of a listening session,
+/// an exact replay is refused before any `Auth` is produced.
+///
+/// Scoped to one transfer secret: create it alongside the secret and drop it
+/// with the listener, so its entries expire exactly when the secret does. Only
+/// `Hello`s that already proved the secret are recorded, so a peer without the
+/// secret cannot fill it. It is bounded: once `capacity` proofs are held, new
+/// handshakes under that secret are refused (start listening again for a new
+/// code) rather than forgetting an old proof and making it replayable.
+pub struct HelloReplayCache {
+    seen: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    capacity: usize,
+}
+
+impl HelloReplayCache {
+    /// An empty cache admitting at most `capacity` distinct `Hello`s.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capacity,
+        }
+    }
+
+    /// Record a verified `Hello` proof, refusing an exact replay.
+    fn admit(&self, proof: &[u8; 32]) -> Result<()> {
+        let mut seen = self
+            .seen
+            .lock()
+            .map_err(|_| Error::HandshakeProtocol("handshake replay cache is unavailable"))?;
+        if seen.contains(proof) {
+            return Err(Error::HandshakeProtocol("replayed handshake"));
+        }
+        if seen.len() >= self.capacity {
+            return Err(Error::HandshakeProtocol(
+                "too many handshakes under this transfer code; start a new one",
+            ));
+        }
+        seen.insert(*proof);
+        Ok(())
+    }
 }
 
 impl<'a> Responder<'a> {
@@ -610,15 +666,26 @@ impl<'a> Responder<'a> {
             k_psk,
             secret_commit,
             expected_peer_fpr,
+            replay_cache: None,
             pending: None,
         })
+    }
+
+    /// Refuse any `Hello` that `cache` has already seen. Every responder of one
+    /// listening session (one transfer secret) must share the same cache; see
+    /// [`HelloReplayCache`].
+    #[must_use]
+    pub fn with_replay_cache(mut self, cache: &'a HelloReplayCache) -> Self {
+        self.replay_cache = Some(cache);
+        self
     }
 
     /// Consume the initiator's `Hello`; **verify the transfer-secret proof before
     /// disclosing anything**; then derive the session keys and return the `Auth`
     /// bytes (carrying the responder's identity and signature). A peer that cannot
     /// prove the secret is refused with [`Error::TransferSecretMismatch`] and no
-    /// bytes are produced.
+    /// bytes are produced. With a [`HelloReplayCache`] attached, an exact replay
+    /// of an already-answered `Hello` is refused the same way, before any work.
     pub fn read_hello_write_auth(&mut self, hello_bytes: &[u8]) -> Result<Vec<u8>> {
         let hello: HelloMsg = codec::from_slice(hello_bytes)?;
         if hello.magic != MAGIC {
@@ -642,6 +709,11 @@ impl<'a> Responder<'a> {
         );
         if !ct_eq(&expect_tag, &hello.i_psk_tag) {
             return Err(Error::TransferSecretMismatch);
+        }
+        // A valid proof that was already answered is a replay: refuse it before
+        // any identity, signature, or key agreement is produced.
+        if let Some(cache) = self.replay_cache {
+            cache.admit(&hello.i_psk_tag)?;
         }
 
         let th0 = transcript0(

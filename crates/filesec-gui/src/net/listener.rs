@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use filesec_core::contacts::{ContactBook, Trust};
-use filesec_core::transport::{RecordType, Responder};
+use filesec_core::transport::{HelloReplayCache, RecordType, Responder};
 use filesec_core::{codec, format, Identity};
 
 use super::concurrency::{RateLimiter, Semaphore};
@@ -59,6 +59,11 @@ const RATE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// the enforced defense.)
 const MAX_TRANSFER_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 
+/// How many distinct `Hello`s one transfer code will ever answer. Each needs the
+/// secret, so only real senders count against it; generous for retries, and
+/// once reached the user simply starts listening again for a fresh code.
+const MAX_HELLOS_PER_SECRET: usize = 4096;
+
 /// Everything a worker thread needs, cloned per connection.
 #[derive(Clone)]
 struct Shared {
@@ -78,6 +83,10 @@ struct Shared {
     /// Accept/Reject/Cancel here.
     active_cmd: Arc<Mutex<Option<mpsc::Sender<NetCommand>>>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Every `Hello` answered under this session's transfer secret, so a
+    /// captured one cannot be replayed to make us disclose our identity again
+    /// (FS-12). Lives exactly as long as the secret.
+    replay_cache: Arc<HelloReplayCache>,
 }
 
 /// The outcome of servicing one connection, telling the worker how to react.
@@ -179,6 +188,7 @@ pub fn run(
         transfer_active: Arc::new(AtomicBool::new(false)),
         active_cmd: Arc::new(Mutex::new(None)),
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
+        replay_cache: Arc::new(HelloReplayCache::new(MAX_HELLOS_PER_SECRET)),
     };
     let permits = Semaphore::new(MAX_CONCURRENT_HANDSHAKES);
 
@@ -285,7 +295,8 @@ fn handle_conn(shared: &Shared, mut stream: TcpStream, ip: IpAddr) -> Result<(),
     let deadline = Instant::now() + HANDSHAKE_DEADLINE;
 
     let mut responder = Responder::new(&shared.identity, shared.secret.as_ref(), shared.expected)
-        .map_err(|e| ConnError::probe(e.to_string()))?;
+        .map_err(|e| ConnError::probe(e.to_string()))?
+        .with_replay_cache(&shared.replay_cache);
 
     let hello = read_handshake_frame_deadline(&mut stream, deadline)
         .map_err(|e| ConnError::probe(e.to_string()))?;
