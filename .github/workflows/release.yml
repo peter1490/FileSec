@@ -464,6 +464,19 @@ jobs:
         with:
           subject-path: release/*
 
+      # Prove the attestations verify the way a consumer will check them
+      # (manifest first, then every file) before anything is published.
+      - name: Verify provenance before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh attestation verify release/SHA256SUMS --repo "$REPO"
+          for f in release/*; do
+            gh attestation verify "$f" --repo "$REPO" > /dev/null
+          done
+
       - name: Create release
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:

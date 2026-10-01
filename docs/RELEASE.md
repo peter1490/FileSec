@@ -92,7 +92,9 @@ its name from `$ARTIFACT_BASE` and extend the check deliberately.
 It also generates a per-variant **SBOM** (`filesec-<ver>.spdx.json`,
 `filesec-pqc-<ver>.spdx.json`; SPDX 2.3 — no target, since they describe the
 dependency graph rather than a build), then publishes every artifact plus a
-**`SHA256SUMS`** file to a GitHub Release. Verify a download with:
+**`SHA256SUMS`** file to a GitHub Release. A checksum alone only proves the
+download matches the manifest next to it — on a mutable release both could have
+been replaced — so verify the manifest's provenance first (below), then:
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
@@ -121,6 +123,23 @@ verify each download against it:
 gh attestation verify SHA256SUMS --repo peter1490/FileSec
 gh attestation verify filesec-<ver>-universal-apple-darwin.dmg --repo peter1490/FileSec
 ```
+
+The publish job runs the same `gh attestation verify` on `SHA256SUMS` and every
+file right after attesting them, so a release whose provenance does not verify is
+never published.
+
+### Release immutability
+
+GitHub reported `immutable=false` for v0.4.4: a maintainer (or a compromised
+token with `contents: write`) could replace assets after publication, and a
+replaced `SHA256SUMS` would vouch for replaced binaries. Provenance verification
+catches that, but only for consumers who run it. Enable **release immutability**
+for the repository (*Settings → General → Releases*), so published assets and
+their tag can no longer change, together with the `v*` tag ruleset and the
+protected `release` environment described under *Release gates*. These are
+repository settings a maintainer must turn on; nothing in the workflow can set
+them. Until they are on, treat attestation verification as required, not
+optional.
 
 ### Signing is required for official tags
 
