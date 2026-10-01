@@ -85,6 +85,9 @@ passkey = ["dep:ctap-hid-fido2"]
 keyring = ["dep:keyring"]
 
 [dependencies]
+# Same version filesec-core already uses (no new crate in the graph). Hashes
+# the identity-migration journal into its committed record.
+blake3 = "1.8.5"
 directories = "6.0.0"
 eframe = "0.32.3"
 egui = "0.32.3"

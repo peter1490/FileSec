@@ -6,9 +6,10 @@
 //! contents. Files are created with restrictive permissions where the OS
 //! supports it.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ use filesec_core::SuiteId;
 
 use crate::anchors::SecureAnchorStorage;
 use crate::prefs::Prefs;
+
+mod migration;
+use migration::MigrationRecord;
+pub use migration::MIGRATION_RESUME_PENDING;
 
 /// The algorithm suite the local at-rest store encrypts itself under for
 /// `identity`. The suite **tracks the identity**: a hybrid (post-quantum)
@@ -121,8 +126,27 @@ fn store_locks() -> &'static Mutex<HashMap<PathBuf, Weak<StoreLock>>> {
 struct StoreLock {
     path: PathBuf,
     file: Option<std::fs::File>,
+    /// Shared by every ordinary transaction; taken exclusively by operations
+    /// that must see and change the whole store at once (identity migration).
+    exclusive: RwLock<()>,
     anchors: Mutex<()>,
     objects: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+thread_local! {
+    /// Set while this thread holds a store's `exclusive` lock for writing, so
+    /// the transactions it runs inside don't try to re-take it for reading.
+    static EXCLUSIVE_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Clears [`EXCLUSIVE_HELD`] when an exclusive section ends, however it ends.
+#[cfg_attr(not(feature = "pqc"), allow(dead_code))]
+struct ExclusiveFlag;
+
+impl Drop for ExclusiveFlag {
+    fn drop(&mut self) {
+        EXCLUSIVE_HELD.with(|held| held.set(false));
+    }
 }
 
 impl Drop for StoreLock {
@@ -190,6 +214,7 @@ fn acquire_store_lock(canonical: &Path) -> StoreResult<Arc<StoreLock>> {
         let lock = Arc::new(StoreLock {
             path: canonical.to_path_buf(),
             file: Some(file),
+            exclusive: RwLock::new(()),
             anchors: Mutex::new(()),
             objects: Mutex::new(HashMap::new()),
         });
@@ -226,6 +251,9 @@ enum AnchorBackend {
 struct AnchorSet {
     version: u16,
     anchors: Vec<StateAnchor>,
+    /// A committed, not yet finished identity migration (FS-03).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration: Option<MigrationRecord>,
 }
 
 /// The per-store root record in secure storage (`version` 2). Bounded: it
@@ -233,6 +261,11 @@ struct AnchorSet {
 #[derive(Serialize, Deserialize)]
 struct AnchorRoot {
     version: u16,
+    /// A committed, not yet finished identity migration (FS-03). Bounded:
+    /// the record is a fixed-size commitment to the journal in the data
+    /// directory, never the journal itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration: Option<MigrationRecord>,
 }
 
 /// Reads just the `version` of any anchor record, ignoring other fields.
@@ -271,6 +304,7 @@ fn object_anchor_account(root: &str, object_type: StateObjectType, object_id: &s
 fn encode_root_record() -> StoreResult<Vec<u8>> {
     filesec_core::codec::to_vec(&AnchorRoot {
         version: ANCHOR_ROOT_VERSION,
+        migration: None,
     })
     .map_err(err)
 }
@@ -383,6 +417,7 @@ impl Store {
             store.secure.as_deref(),
         )?;
         store.upgrade_secure_anchor_layout()?;
+        store.resume_identity_migration()?;
         Ok(store)
     }
 
@@ -529,6 +564,7 @@ impl Store {
                 AnchorBackend::DegradedFile => store.save_file_anchor_set_locked(&AnchorSet {
                     version: ANCHORS_VERSION,
                     anchors,
+                    migration: None,
                 })?,
             }
         }
@@ -618,6 +654,7 @@ impl Store {
             return Ok(AnchorSet {
                 version: ANCHORS_VERSION,
                 anchors: Vec::new(),
+                migration: None,
             });
         }
         let set: AnchorSet = filesec_core::codec::from_slice(&bytes).map_err(err)?;
@@ -708,31 +745,6 @@ impl Store {
         }
     }
 
-    /// Remove one object's anchor (caller holds `lock.anchors`).
-    #[cfg_attr(not(feature = "pqc"), allow(dead_code))]
-    fn delete_anchor_locked(
-        &self,
-        object_type: StateObjectType,
-        object_id: &str,
-    ) -> StoreResult<()> {
-        match self.anchor_backend {
-            AnchorBackend::SecureStorage => self
-                .secure_storage()?
-                .delete(&object_anchor_account(
-                    &self.anchor_account,
-                    object_type,
-                    object_id,
-                ))
-                .map_err(|e| format!("could not update rollback anchors: {e}")),
-            AnchorBackend::DegradedFile => {
-                let mut set = self.load_file_anchor_set_locked()?;
-                set.anchors
-                    .retain(|a| a.object_type != object_type || a.object_id != object_id);
-                self.save_file_anchor_set_locked(&set)
-            }
-        }
-    }
-
     /// Convert a store whose secure storage still holds the legacy layout (one
     /// record with every anchor, which outgrows Windows Credential Manager's
     /// 2,560-byte limit after a handful of vaults) into one bounded record per
@@ -783,6 +795,16 @@ impl Store {
         object_id: &str,
         f: impl FnOnce() -> StoreResult<R>,
     ) -> StoreResult<R> {
+        let _shared = if EXCLUSIVE_HELD.with(Cell::get) {
+            None
+        } else {
+            Some(
+                self.lock
+                    .exclusive
+                    .read()
+                    .map_err(|_| "store lock is unavailable".to_string())?,
+            )
+        };
         let txn = {
             let mut objects = self
                 .lock
@@ -797,6 +819,20 @@ impl Store {
         let _guard = txn
             .lock()
             .map_err(|_| "state transaction lock is unavailable".to_string())?;
+        f()
+    }
+
+    /// Run `f` with the whole store to itself: every other transaction (in any
+    /// thread) waits until it returns. Transactions `f` runs itself proceed.
+    #[cfg_attr(not(feature = "pqc"), allow(dead_code))]
+    fn exclusively<R>(&self, f: impl FnOnce() -> StoreResult<R>) -> StoreResult<R> {
+        let _write = self
+            .lock
+            .exclusive
+            .write()
+            .map_err(|_| "store lock is unavailable".to_string())?;
+        EXCLUSIVE_HELD.with(|held| held.set(true));
+        let _flag = ExclusiveFlag;
         f()
     }
 
@@ -1623,235 +1659,6 @@ impl Store {
                 let _ = secure_wipe(&entry.path());
             }
         }
-    }
-
-    /// Every self-encrypted store file that currently exists: the registry, the
-    /// contact book, and each vault container. (The keystore is *not* one of
-    /// these — it is passphrase-sealed, not encrypted to the identity.)
-    #[cfg(feature = "pqc")]
-    fn self_encrypted_files(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        for p in [self.index_path(), self.contacts_path()] {
-            if p.exists() {
-                paths.push(p);
-            }
-        }
-        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                // Only finished `.fsec` vaults — never a stray `*.tmp` from an
-                // interrupted write or migration.
-                if p.extension().and_then(|s| s.to_str()) == Some("fsec") {
-                    paths.push(p);
-                }
-            }
-        }
-        paths
-    }
-
-    /// Re-encrypt every self-encrypted store file so it is signed by `opener` and
-    /// addressed to `recipients` under `options`. Each file is rewritten atomically
-    /// (temp + rename).
-    #[cfg(feature = "pqc")]
-    fn reencrypt_all(
-        &self,
-        opener: &Identity,
-        recipients: &[filesec_core::PublicIdentity],
-        options: &ExportOptions,
-    ) -> StoreResult<()> {
-        for path in self.self_encrypted_files() {
-            let reader = format::open_vault_from_path(&path, opener).map_err(err)?;
-            let tmp = path.with_extension("migrate-tmp");
-            if let Err(e) = reader.reexport_to_path(opener, recipients, options, &tmp) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(err(e));
-            }
-            std::fs::rename(&tmp, &path).map_err(err)?;
-            harden_file(&path);
-        }
-        Ok(())
-    }
-
-    /// List every v2 vault directory in the store.
-    #[cfg(feature = "pqc")]
-    fn v2_vault_dirs(&self) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&self.vaults_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.is_dir() && p.extension().and_then(|s| s.to_str()) == Some("fsv2") {
-                    dirs.push(p);
-                }
-            }
-        }
-        dirs
-    }
-
-    /// Re-key every v2 vault to `suite`, addressed to `opener` — the post-quantum
-    /// migration's harden phase. Crash-safe per vault: the new directory is built
-    /// in `<dir>.partial`, the current dir is moved aside to `<dir>.old`, the new
-    /// dir is renamed into place, then `.old` is removed. `clean_partial_dirs`
-    /// rolls back an interruption. Idempotent — a vault already on `suite` is left
-    /// alone. (`opener` shares the pre-migration X25519 key, so it can still open a
-    /// classical vault here; hardening to the hybrid suite is what re-establishes
-    /// confidentiality from the old fingerprint.)
-    #[cfg(feature = "pqc")]
-    fn reencrypt_v2_vaults(
-        &self,
-        opener: &Identity,
-        recipient: &Identity,
-        suite: SuiteId,
-    ) -> StoreResult<()> {
-        for dir in self.v2_vault_dirs() {
-            let current = VaultReaderV2::open(&dir, opener).map_err(err)?;
-            if current.suite() == suite {
-                continue;
-            }
-            let object_id = current
-                .state_metadata()
-                .map(|state| state.object_id.clone())
-                .ok_or_else(|| "vault has no rollback metadata".to_string())?;
-            let mut partial = dir.clone().into_os_string();
-            partial.push(".partial");
-            let partial = PathBuf::from(partial);
-            let mut old = dir.clone().into_os_string();
-            old.push(".old");
-            let old = PathBuf::from(old);
-            let _ = std::fs::remove_dir_all(&partial);
-            // Stream the re-key blob-by-blob straight from `current`, so a multi-GB
-            // vault never materializes in RAM (peak is a couple of chunks).
-            // `current` must stay alive across the build; drop it before moving `dir`.
-            let replacement = match VaultReaderV2::from_reader_v2_with_object_id(
-                &partial, recipient, suite, &current, &object_id,
-            ) {
-                Ok(reader) => reader,
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&partial);
-                    return Err(err(e));
-                }
-            };
-            let state = replacement
-                .state_metadata()
-                .cloned()
-                .ok_or_else(|| "re-keyed vault has no rollback metadata".to_string())?;
-            drop(replacement);
-            drop(current);
-            std::fs::rename(&dir, &old).map_err(err)?;
-            std::fs::rename(&partial, &dir).map_err(err)?;
-            let _ = std::fs::remove_dir_all(&old);
-            self.commit_state(&state)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "pqc")]
-    fn authorize_identity_anchor_migration(
-        &self,
-        old: &Identity,
-        new: &Identity,
-    ) -> StoreResult<()> {
-        // The PQ upgrade is an identity continuation only when both classical
-        // long-term keys are byte-for-byte unchanged. This prevents this narrow
-        // recovery hook from clearing another identity's high-water history.
-        if old.sign_public() != new.sign_public() || old.kem_public() != new.kem_public() {
-            return Err("identity migration changed the classical identity keys".into());
-        }
-        let _guard = self
-            .lock
-            .anchors
-            .lock()
-            .map_err(|_| "state anchor lock is unavailable".to_string())?;
-        let mut objects = vec![
-            (StateObjectType::Keystore, KEYSTORE_OBJECT_ID.to_string()),
-            (StateObjectType::Contacts, "contacts".to_string()),
-            (StateObjectType::Registry, "registry".to_string()),
-        ];
-        objects.extend(
-            self.v2_vaults()
-                .into_iter()
-                .map(|(id, _)| (StateObjectType::VaultManifest, id)),
-        );
-        for (object_type, object_id) in objects {
-            if let Some(anchor) = self.get_anchor_locked(object_type, &object_id)? {
-                if anchor.identity_fingerprint == old.fingerprint() {
-                    self.delete_anchor_locked(object_type, &object_id)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Migrate a classical identity to a hybrid (post-quantum) one, re-encrypting
-    /// the entire local store to the new identity. Returns the new identity.
-    ///
-    /// **Crash-safe by construction.** Re-sealing the keystore is the atomic
-    /// commit point; before it every store file is readable by *both* identities,
-    /// and after it by the *new* one — so an interruption at any step never locks
-    /// you out:
-    ///
-    /// 1. **Bridge** — re-encrypt every store file to `[old, new]` under the
-    ///    classical suite. Both identities can open it, and the keystore still
-    ///    holds `old`, so a crash here leaves everything openable by `old`
-    ///    (re-running the migration is safe).
-    /// 2. **Commit** — re-seal the keystore to `new`. After this the app is hybrid
-    ///    and the bridged files (which list `new` as a recipient) all open.
-    /// 3. **Harden** — re-encrypt every store file to `[new]` only under the
-    ///    hybrid suite, giving post-quantum protection at rest. If interrupted
-    ///    here, `new` still opens every file and a later normal save (which uses
-    ///    [`self_options`]) finishes upgrading any stragglers.
-    ///
-    /// `passphrase` must be the current keystore passphrase: it is verified
-    /// against the existing keystore before anything is written, and it stays
-    /// the passphrase afterwards (it is never replaced by what was typed).
-    ///
-    /// The new identity has a **new fingerprint** — the caller must re-share its
-    /// public key and have contacts re-verify the new safety number. Any `.fsec`
-    /// addressed to the *old* fingerprint that has not been imported yet should be
-    /// imported before migrating.
-    #[cfg(feature = "pqc")]
-    pub fn migrate_to_hybrid(&self, old: &Identity, passphrase: &[u8]) -> StoreResult<Identity> {
-        if old.is_hybrid_capable() {
-            return Err("this identity is already post-quantum".to_string());
-        }
-        let new = old.upgraded_to_hybrid().map_err(err)?;
-        // Authenticate before any write (FS-02): the confirmation must open the
-        // current keystore and that keystore must hold the active identity. The
-        // re-sealed keystore keeps the same data key, so the passphrase, its KDF
-        // parameters, every passkey, and any device-unlock slot stay valid.
-        let resealed = self
-            .load_keystore()?
-            .continue_identity(passphrase, old, &new)
-            .map_err(err)?;
-        let contacts = self.load_contacts(old)?;
-        let registry = self.load_registry(old)?;
-
-        // 1. Bridge: classical suite, addressed to both identities.
-        let bridge = [old.public(), new.public()];
-        let classic = ExportOptions {
-            suite: SuiteId::Classic,
-            ..ExportOptions::default()
-        };
-        self.reencrypt_all(old, &bridge, &classic)?;
-
-        // 2. Commit: explicitly transition the anchor namespace, then put the
-        // keystore and metadata under the continued hybrid identity.
-        self.authorize_identity_anchor_migration(old, &new)?;
-        self.save_keystore(&resealed)?;
-        self.save_contacts(&new, &contacts)?;
-        self.save_registry(&new, &registry)?;
-
-        // 3. Harden: hybrid suite, addressed to the new identity only.
-        let new_only = [new.public()];
-        let hybrid = ExportOptions {
-            suite: SuiteId::Hybrid,
-            ..ExportOptions::default()
-        };
-        self.reencrypt_all(&new, &new_only, &hybrid)?;
-        // v2 vault directories aren't `.fsec` files, so `reencrypt_all` skipped
-        // them; re-key each to the new hybrid suite (addressed to `new`).
-        self.reencrypt_v2_vaults(old, &new, SuiteId::Hybrid)?;
-
-        Ok(new)
     }
 }
 

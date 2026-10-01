@@ -32,7 +32,7 @@ use crate::passkey;
 use crate::prefs::ThemeChoice;
 use crate::store::{
     new_vault_id, write_private_export, Registry, Store, StoreResult, VaultMeta,
-    ANCHOR_RECOVERY_REQUIRED,
+    ANCHOR_RECOVERY_REQUIRED, MIGRATION_RESUME_PENDING,
 };
 
 use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
@@ -873,6 +873,9 @@ struct ImportData {
 /// State mutations applied on the UI thread when a job completes.
 enum Outcome {
     Noop,
+    /// Stop the session: the store needs a restart to reach a consistent state
+    /// (for example, to finish a committed identity migration).
+    Fatal(String),
     /// Rollback anchors were re-established; continue to the unlock screen.
     AnchorsRecovered(Box<Store>),
     AnchorRecoveryFailed(String),
@@ -1292,6 +1295,9 @@ impl App {
         }
         match report.outcome {
             Outcome::Noop => {}
+            Outcome::Fatal(msg) => {
+                self.state = State::Fatal(msg);
+            }
             Outcome::AnchorsRecovered(store) => {
                 let unlock = Unlock::for_store(&store);
                 self.store = Some(Arc::new(*store));
@@ -3992,7 +3998,18 @@ impl App {
         self.spawn_job(ctx, "Upgrading to post-quantum…", move || {
             let new = match store.migrate_to_hybrid(&identity, pass.as_bytes()) {
                 Ok(n) => n,
-                Err(e) if e.contains("passphrase") => {
+                Err(e) if e.starts_with(MIGRATION_RESUME_PENDING) => {
+                    // Committed: the next launch finishes it before anything
+                    // loads. Continuing this session on the old identity would
+                    // only show a half-moved store.
+                    return JobReport {
+                        outcome: Outcome::Fatal(format!(
+                            "{e}\n\nNothing was lost. Quit and reopen FileSec to finish the upgrade."
+                        )),
+                        toast: None,
+                    };
+                }
+                Err(e) if e.contains("incorrect passphrase") => {
                     return JobReport::err(
                         "Incorrect passphrase — nothing was changed. Enter your current passphrase to upgrade.",
                     )

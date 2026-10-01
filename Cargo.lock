@@ -1596,6 +1596,7 @@ dependencies = [
 name = "filesec-gui"
 version = "0.4.4"
 dependencies = [
+ "blake3",
  "ctap-hid-fido2",
  "directories",
  "eframe",

@@ -95,10 +95,16 @@ keys too. The keystore persists each post-quantum keypair as its compact seed.
 - An **existing classical** identity can **upgrade in place** ("My Identity →
   Upgrade to post-quantum"): the same X25519/Ed25519 keys are kept, fresh
   ML-KEM-768/ML-DSA-65 keys are added, and the entire local store is re-encrypted
-  to the new identity. The migration is **crash-safe** — it bridges every store
-  file to *both* identities under the classical suite, re-seals the keystore (the
-  atomic commit point), then hardens to the new hybrid identity only, so an
-  interruption at any step never locks you out. Because the fingerprint commits
+  to the new identity. The migration is a **resumable transaction**: it first
+  checks that your passphrase opens the current keystore and that every object
+  loads and passes its rollback check; it then writes complete new-identity
+  copies under `migration/` in the data directory and validates them, records a
+  journal, and commits by writing a hash of that journal into the rollback-anchor
+  store. Before the commit nothing live (and no anchor) has changed and the
+  staging is discarded on the next launch; after it, the copies are moved into
+  place and re-anchored, and if that is interrupted the next launch finishes it
+  before anything loads. Unrecovered legacy vaults must be recovered first.
+  Because the fingerprint commits
   to the new keys, your **safety number changes**: re-share your public key so
   contacts can re-verify.
 - Until you migrate, a classical identity is limited to the **classical
