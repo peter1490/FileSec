@@ -9,7 +9,7 @@
 //! spinner; when the worker finishes it sends back a [`JobReport`] that is
 //! applied on the UI thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc};
 use std::time::UNIX_EPOCH;
 
@@ -8703,25 +8703,44 @@ fn parse_trash_token(trashed_path: &str) -> Option<(i64, String)> {
     Some((deleted_at, pct_decode_seg(encoded)))
 }
 
-/// (file count, total size) of everything strictly inside a trashed folder.
-fn trashed_subtree_totals(entries: &[(String, EntryKind, u64)], top: &str) -> (usize, u64) {
-    let prefix = format!("{top}/");
-    entries
-        .iter()
-        .filter(|(p, k, _)| *k == EntryKind::File && p.starts_with(&prefix))
-        .fold((0, 0), |(n, sz), (_, _, s)| (n + 1, sz + s))
+/// (file count, total size) of everything inside each trashed folder, keyed by
+/// the folder's top-level trash path, in **one pass** over the entries.
+///
+/// The previous per-folder rescan was O(n × t) for n entries and t trashed
+/// folders and ran every frame — 0.6 s for 40,000 entries (O-01).
+fn trashed_subtree_totals(entries: &[(String, EntryKind, u64)]) -> HashMap<&str, (usize, u64)> {
+    let mut totals: HashMap<&str, (usize, u64)> = HashMap::new();
+    for (path, kind, size) in entries {
+        if *kind != EntryKind::File {
+            continue;
+        }
+        let Some(rest) = path.strip_prefix(".trash/") else {
+            continue;
+        };
+        // Only files *below* a top-level trash entry count toward it.
+        let Some((top, _)) = rest.split_once('/') else {
+            continue;
+        };
+        let top_path = &path[..".trash/".len() + top.len()];
+        let slot = totals.entry(top_path).or_default();
+        slot.0 += 1;
+        slot.1 += size;
+    }
+    totals
 }
 
 /// The soft-deleted entries (the direct children of `.trash`), most-recent
-/// first. Malformed tokens are skipped rather than shown wrong.
+/// first. Malformed tokens are skipped rather than shown wrong. Linear in the
+/// number of entries (plus sorting the trash items themselves).
 fn trashed_items(entries: &[(String, EntryKind, u64)]) -> Vec<TrashItem> {
+    let totals = trashed_subtree_totals(entries);
     let mut items: Vec<TrashItem> = entries
         .iter()
         .filter(|(p, _, _)| parent_dir(p) == TRASH_DIR)
         .filter_map(|(p, kind, size)| {
             let (deleted_at, orig_path) = parse_trash_token(p)?;
             let (files, total) = if *kind == EntryKind::Dir {
-                trashed_subtree_totals(entries, p)
+                totals.get(p.as_str()).copied().unwrap_or((0, 0))
             } else {
                 (0, *size)
             };
@@ -9047,6 +9066,41 @@ mod browse_tests {
         // Live-only views of the vault.
         assert!(has_live_entries(&e));
         assert_eq!(live_counts(&e), (1, 10)); // docs/a.txt only
+    }
+
+    /// O-01: one-pass totals count every file at any depth under its own
+    /// top-level trash entry, and nothing else.
+    #[test]
+    fn trashed_folder_totals_cover_nested_files_only() {
+        let e = |p: &str, k: EntryKind, s: u64| (p.to_string(), k, s);
+        let entries = vec![
+            e(".trash", EntryKind::Dir, 0),
+            e(".trash/20-aa-docs", EntryKind::Dir, 0),
+            e(".trash/20-aa-docs/a.txt", EntryKind::File, 3),
+            e(".trash/20-aa-docs/sub", EntryKind::Dir, 0),
+            e(".trash/20-aa-docs/sub/b.txt", EntryKind::File, 4),
+            e(".trash/10-bb-docs2", EntryKind::Dir, 0),
+            e(".trash/10-bb-docs2-x/c.txt", EntryKind::File, 100),
+            e(".trash/30-cc-loose.txt", EntryKind::File, 9),
+            e("docs/live.txt", EntryKind::File, 50),
+        ];
+        let items = trashed_items(&entries);
+        let by_path = |p: &str| items.iter().find(|i| i.trashed_path == p).unwrap();
+        assert_eq!(
+            (
+                by_path(".trash/20-aa-docs").files,
+                by_path(".trash/20-aa-docs").size
+            ),
+            (2, 7)
+        );
+        assert_eq!(
+            (
+                by_path(".trash/10-bb-docs2").files,
+                by_path(".trash/10-bb-docs2").size
+            ),
+            (0, 0)
+        );
+        assert_eq!(by_path(".trash/30-cc-loose.txt").size, 9);
     }
 
     #[test]

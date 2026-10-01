@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Benchmark actual browser helpers against a Git revision (default: HEAD).
 
-Runs a Rust-optimized microbenchmark of row preparation, not disk I/O or painting.
+Runs Rust-optimized microbenchmarks of row preparation and of the trash model
+(the trash-heavy case from audit O-01), not disk I/O or painting.
 Requires only Python, Git and rustc. Temporary build files are removed on exit.
 Usage: python3 scripts/benchmark-browser.py [baseline-revision]
 """
@@ -46,6 +47,24 @@ def module(name, source):
 '''
 
 
+def trash_module(name, source):
+    signatures = ['struct TrashItem', 'fn pct_decode_seg(', 'fn parse_trash_token(',
+                  'fn trashed_subtree_totals(', 'fn trashed_items(']
+    body = '\n'.join(item(source, signature) for signature in signatures)
+    return 'mod ' + name + '_trash { #![allow(dead_code)] use super::*;\n' + body + r'''
+    pub fn items(entries: &[(String, EntryKind, u64)]) -> Vec<(String, String, i64, usize, u64)> {
+        trashed_items(entries).into_iter()
+            .map(|t| (t.trashed_path, t.orig_path, t.deleted_at, t.files, t.size)).collect()
+    }
+    pub fn measure(entries: &[(String, EntryKind, u64)]) -> u128 {
+        let start = std::time::Instant::now();
+        std::hint::black_box(trashed_items(std::hint::black_box(entries)));
+        start.elapsed().as_micros()
+    }
+}
+'''
+
+
 revision = sys.argv[1] if len(sys.argv) > 1 else 'HEAD'
 baseline = subprocess.check_output(['git', 'show', f'{revision}:{SOURCE}'], cwd=ROOT, text=True)
 current = (ROOT / SOURCE).read_text()
@@ -55,8 +74,12 @@ enum EntryKind { File, Dir }
 #[derive(Clone, Copy)]
 enum SortMode { NameAsc, NameDesc, SizeDesc, SizeAsc }
 fn is_trashed(path: &str) -> bool { path == ".trash" || path.starts_with(".trash/") }
+const TRASH_DIR: &str = ".trash";
+use std::collections::HashMap;
+fn parent_dir(path: &str) -> &str { match path.rsplit_once('/') { Some((p, _)) => p, None => "" } }
 '''
 program += module('before', baseline) + module('after', current)
+program += trash_module('before', baseline) + trash_module('after', current)
 program += r'''
 fn main() {
     let mut entries = Vec::new();
@@ -81,6 +104,32 @@ fn main() {
     println!("20,000 entries / 5,000 root folders; seven runs, median");
     println!("baseline: {} us; current: {} us; speedup: {:.2}x", old[3], new[3], old[3] as f64 / new[3] as f64);
     println!("All four sort orders and three queries produce identical rows.");
+
+    // Trash-heavy model preparation (O-01): every trashed entry is a folder
+    // holding one file, plus a live tree of the same size.
+    for &dirs in &[1_000usize, 5_000, 10_000, 20_000] {
+        let mut entries = Vec::new();
+        entries.push((".trash".to_string(), EntryKind::Dir, 0));
+        for i in 0..dirs {
+            let top = format!(".trash/{}-abcd1234-folder%2Fsub-{i}", 1_700_000_000 + i);
+            entries.push((format!("{top}/doc-{i}.txt"), EntryKind::File, i as u64));
+            entries.push((top, EntryKind::Dir, 0));
+            entries.push((format!("live-{i}.txt"), EntryKind::File, 1));
+        }
+        assert_eq!(before_trash::items(&entries), after_trash::items(&entries));
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..3 {
+            old.push(before_trash::measure(&entries));
+            new.push(after_trash::measure(&entries));
+        }
+        old.sort(); new.sort();
+        println!(
+            "trash model, {} entries / {dirs} trashed folders: baseline {} us; current {} us",
+            entries.len(), old[1], new[1]
+        );
+    }
+    println!("The trash model produces identical items (counts and sizes checked).");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='filesec-browser-bench-') as directory:
