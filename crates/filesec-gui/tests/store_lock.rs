@@ -48,6 +48,23 @@ fn child_process_open_probe() {
     }
 }
 
+/// Poll `attempt` for up to two seconds. A child process spawned by another
+/// test in this binary briefly inherits every open descriptor (including other
+/// tests' lock files) between fork and exec, so a just-released lock can stay
+/// held for a moment; anything persistent still fails.
+fn eventually(mut attempt: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if attempt() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn child_open(dir: &Path) -> String {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -77,7 +94,10 @@ fn a_second_process_cannot_open_an_open_store() {
         "{verdict}"
     );
     drop(store);
-    assert_eq!(child_open(&dir), "ok", "the lock is released on drop");
+    assert!(
+        eventually(|| child_open(&dir) == "ok"),
+        "the lock is released on drop"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -93,7 +113,7 @@ fn an_external_lock_holder_is_refused_and_the_same_process_shares() {
     assert!(!holder.try_lock_exclusive().unwrap(), "lock must be held");
     drop((first, second));
     assert!(
-        holder.try_lock_exclusive().unwrap(),
+        eventually(|| holder.try_lock_exclusive().unwrap()),
         "lock must be released"
     );
 
