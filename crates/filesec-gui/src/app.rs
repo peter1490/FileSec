@@ -37,7 +37,7 @@ use crate::store::{
     ANCHOR_RECOVERY_REQUIRED,
 };
 
-use crate::theme::{self, ACCENT, ERR_RED, MUTED, OK_GREEN, WARN_AMBER};
+use crate::theme;
 use crate::wipe::{WipeHandle, Wiper};
 
 const MIN_PASSPHRASE_CHARS: usize = 12;
@@ -419,6 +419,11 @@ struct VerifyForm {
     manual_ok: bool,
 }
 
+struct DeleteVaultForm {
+    vault_id: String,
+    focus_cancel: bool,
+}
+
 /// Unlocked session state. The identity is reference-counted so it can be
 /// shared (read-only) with background worker threads.
 struct Session {
@@ -431,6 +436,10 @@ struct Session {
     views: Vec<ActiveView>,
     new_vault_name: String,
     show_new_vault: bool,
+    vault_search: String,
+    contact_search: String,
+    /// A vault is only deleted after this dialog's explicit confirmation.
+    delete_vault: Option<DeleteVaultForm>,
     new_folder_name: String,
     /// Folder currently being browsed inside the open vault ("" = vault root).
     current_dir: String,
@@ -513,6 +522,9 @@ impl Session {
             views: Vec::new(),
             new_vault_name: String::new(),
             show_new_vault: false,
+            vault_search: String::new(),
+            contact_search: String::new(),
+            delete_vault: None,
             new_folder_name: String::new(),
             current_dir: String::new(),
             show_new_folder: false,
@@ -727,7 +739,9 @@ enum Action {
     CreateVault,
     OpenVault(String),
     CloseVault,
-    DeleteVault(String),
+    RequestDeleteVault(String),
+    CancelDeleteVault,
+    ConfirmDeleteVault,
     ImportContainer,
     AddFiles,
     AddFolder,
@@ -834,7 +848,6 @@ enum Action {
     CancelRestore,
     DoRestore,
     DismissImportInfo,
-    DismissToast,
     /// Unlock by deriving a key from an enrolled security key (passkey).
     UnlockWithPasskey,
     /// Open / cancel the "add security key" dialog.
@@ -1130,21 +1143,30 @@ impl eframe::App for App {
             });
 
         // Floating, auto-dismissing toast (bottom-right).
+        // Keep notifications above the browser's fixed selection controls.
+        let toast_bottom_inset = match &self.state {
+            State::Unlocked(s) if s.open.is_some() && !s.show_trash => 80.0,
+            _ => 16.0,
+        };
+        let mut dismiss_toast = false;
         if let Some(t) = &mut self.toast {
             let now = ctx.input(|i| i.time);
             let shown = *t.shown_at.get_or_insert(now);
             let msg = t.msg.clone();
             let error = t.error;
-            let dismissed = theme::toast(ctx, &msg, error);
-            const TTL: f64 = 4.0;
+            let dismissed = theme::toast(ctx, &msg, error, toast_bottom_inset);
+            const TTL: f64 = 6.0;
             let age = now - shown;
-            if dismissed || age > TTL {
-                action = Some(Action::DismissToast);
-            } else {
+            if dismissed || (!error && age > TTL) {
+                dismiss_toast = true;
+            } else if !error {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(
                     (TTL - age).max(0.05),
                 ));
             }
+        }
+        if dismiss_toast {
+            self.toast = None;
         }
 
         // Busy overlay: dimmed backdrop + centered spinner. A pending shutdown
@@ -1182,11 +1204,8 @@ impl eframe::App for App {
         }
 
         if let Some(a) = action {
-            match a {
-                // The toast can always be dismissed, even mid-job.
-                Action::DismissToast => self.toast = None,
-                _ if !busy => self.dispatch(a, ctx),
-                _ => {}
+            if !busy {
+                self.dispatch(a, ctx);
             }
         }
     }
@@ -1214,18 +1233,22 @@ impl App {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(theme::icon_text(theme::icon::LOCK_KEY, 22.0).color(c.accent));
-            ui.label(RichText::new("FileSec").heading().color(c.accent));
+            ui.label(RichText::new("FileSec").heading().strong());
         });
         ui.label(
-            RichText::new("secure file exchange")
+            RichText::new("Private by design")
                 .small()
                 .color(c.text_muted),
         );
-        ui.add_space(16.0);
+        ui.add_space(24.0);
 
         if let State::Unlocked(s) = &self.state {
             let mut nav_item = |ui: &mut egui::Ui, glyph: &str, label: &str, nav: Nav| {
-                let selected = s.open.is_none() && s.nav == nav;
+                let selected = if s.open.is_some() {
+                    nav == Nav::Vaults
+                } else {
+                    s.nav == nav
+                };
                 if sidebar_nav_item(ui, glyph, label, selected).clicked() {
                     *action = Some(Action::Nav(nav));
                 }
@@ -1236,13 +1259,20 @@ impl App {
             #[cfg(feature = "net")]
             nav_item(ui, theme::icon::SEND, "Transfer", Nav::Transfer);
 
-            // Bottom-pinned: theme shortcut, Settings and Lock.
+            // Bottom-pinned account context and clearly labelled utilities.
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.add_space(2.0);
-                if theme::secondary_button(ui, "Lock").clicked() {
+                if theme::secondary_button_full(ui, "Lock FileSec").clicked() {
                     *action = Some(Action::Lock);
                 }
-                ui.add_space(10.0);
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Identity unlocked")
+                        .small()
+                        .color(c.text_muted),
+                );
+                ui.add(egui::Label::new(RichText::new(&s.identity.name).strong()).truncate());
+                ui.separator();
                 ui.horizontal(|ui| {
                     // One-click light/dark flip. The full three-way control,
                     // including "follow the system", lives on the Settings page;
@@ -1254,30 +1284,11 @@ impl App {
                     } else {
                         (theme::icon::MOON, "Switch to dark", ThemeChoice::Dark)
                     };
-                    if ui
-                        .add(
-                            egui::Button::new(theme::icon_text(glyph, 16.0).color(c.text_muted))
-                                .frame(false),
-                        )
-                        .on_hover_text(hover)
-                        .clicked()
-                    {
+                    if theme::icon_button(ui, glyph, hover).clicked() {
                         *action = Some(Action::SetTheme(choice));
                     }
-                    // Settings has no nav row, so the accent tint is its
-                    // selected-state indicator.
                     let on_settings = s.open.is_none() && s.nav == Nav::Settings;
-                    let gear_color = if on_settings { c.accent } else { c.text_muted };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                theme::icon_text(theme::icon::GEAR, 16.0).color(gear_color),
-                            )
-                            .frame(false),
-                        )
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
+                    if ui.selectable_label(on_settings, "Settings").clicked() {
                         *action = Some(Action::Nav(Nav::Settings));
                     }
                 });
@@ -1692,7 +1703,6 @@ impl App {
             }
             #[cfg(feature = "net")]
             Action::CancelTransfer => self.transfer_command(crate::net::NetCommand::Cancel, false),
-            Action::DismissToast => self.toast = None,
             Action::DismissImportInfo => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.last_import = None;
@@ -1755,6 +1765,9 @@ impl App {
             Action::ToggleNewVault(b) => {
                 if let State::Unlocked(s) = &mut self.state {
                     s.show_new_vault = b;
+                    if b {
+                        ctx.memory_mut(|m| m.request_focus(egui::Id::new("new_vault_name")));
+                    }
                     if !b {
                         s.new_vault_name.clear();
                     }
@@ -2060,7 +2073,34 @@ impl App {
             Action::DisableAutoUnlock => self.spawn_disable_auto_unlock(ctx),
             Action::CreateVault => self.spawn_create_vault(ctx),
             Action::OpenVault(id) => self.spawn_open_vault(ctx, id),
-            Action::DeleteVault(id) => self.spawn_delete_vault(ctx, id),
+            Action::RequestDeleteVault(id) => {
+                if self.checkout_active() {
+                    self.set_toast("Check in or discard your edit first.", true);
+                    return;
+                }
+                if let State::Unlocked(s) = &mut self.state {
+                    if s.registry.vaults.iter().any(|vault| vault.id == id) {
+                        s.delete_vault = Some(DeleteVaultForm {
+                            vault_id: id,
+                            focus_cancel: true,
+                        });
+                    }
+                }
+            }
+            Action::CancelDeleteVault => {
+                if let State::Unlocked(s) = &mut self.state {
+                    s.delete_vault = None;
+                }
+            }
+            Action::ConfirmDeleteVault => {
+                let pending = match &mut self.state {
+                    State::Unlocked(s) => s.delete_vault.take(),
+                    _ => None,
+                };
+                if let Some(form) = pending {
+                    self.spawn_delete_vault(ctx, form.vault_id);
+                }
+            }
             Action::AddFiles => self.spawn_add_files(ctx),
             Action::AddFolder => self.spawn_add_folder(ctx),
             Action::DropPaths(paths) => self.spawn_add_paths(ctx, paths),
@@ -4752,7 +4792,15 @@ fn build_contact_preview(s: &Session, pubid: PublicIdentity) -> ContactPreview {
 fn sidebar_nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool) -> egui::Response {
     let c = theme::colors(ui);
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
     let bg = if selected {
         theme::accent_soft(c)
     } else if resp.hovered() {
@@ -4762,6 +4810,14 @@ fn sidebar_nav_item(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool)
     };
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_SM), bg);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            theme::RADIUS_SM as f32,
+            egui::Stroke::new(1.5_f32, c.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     let fg = if selected { c.accent } else { c.text };
     ui.painter().text(
         egui::pos2(rect.left() + 12.0, rect.center().y),
@@ -5557,7 +5613,7 @@ fn fatal_ui(msg: &str, ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
         ui.heading("FileSec could not start");
         ui.add_space(8.0);
-        ui.colored_label(ERR_RED, msg);
+        ui.colored_label(theme::colors(ui).err, msg);
     });
 }
 
@@ -5588,235 +5644,378 @@ fn with_note(message: &str, note: &str) -> String {
 
 fn anchor_recovery_ui(r: &mut AnchorRecovery, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let c = theme::colors(ui);
-    ui.add_space(40.0);
-    ui.vertical_centered(|ui| {
-        ui.set_max_width(480.0);
-        ui.label(theme::icon_text(theme::icon::LOCK_KEY, 40.0).color(c.warn));
-        ui.add_space(6.0);
-        ui.heading("Rollback protection needs attention");
-        ui.add_space(12.0);
-        theme::card(ui, |ui| {
-            ui.colored_label(c.err, &r.reason);
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "FileSec keeps a record of the newest version of your keystore, contacts, \
-                     registry, and vaults outside this data directory, so an older copy cannot \
-                     be swapped in unnoticed. That record could not be trusted as found.\n\n\
-                     If you did not expect this (no keychain reset, no move to a new machine), \
-                     stop here and check where this data directory came from. Recovering trusts \
-                     the files on disk now as the newest state: an older copy recovered here \
-                     becomes the new reference point. Nothing is deleted or re-encrypted.",
-                )
-                .color(c.text_muted),
-            );
-            ui.add_space(10.0);
-            ui.checkbox(
-                &mut r.confirmed,
-                "This data directory is the current copy I intend to keep",
-            );
-            ui.add_space(6.0);
-            let resp = theme::text_input(ui, &mut r.pass, "Passphrase", true);
-            let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(8.0);
-            if theme::primary_button_full(ui, "Re-establish rollback protection").clicked()
-                || submit
-            {
-                *action = Some(Action::RecoverAnchors);
-            }
-            if let Some(e) = &r.error {
-                ui.add_space(10.0);
-                ui.colored_label(c.err, e);
-            }
+    egui::ScrollArea::vertical()
+        .id_salt("anchor_recovery_scroll")
+        .show(ui, |ui| {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(480.0);
+                ui.label(theme::icon_text(theme::icon::LOCK_KEY, 40.0).color(c.warn));
+                ui.add_space(6.0);
+                ui.heading("Rollback protection needs attention");
+                ui.add_space(12.0);
+                theme::card(ui, |ui| {
+                    ui.colored_label(c.err, &r.reason);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "FileSec keeps a record of the newest version of your keystore, contacts, \
+                             registry, and vaults outside this data directory, so an older copy cannot \
+                             be swapped in unnoticed. That record could not be trusted as found.\n\n\
+                             If you did not expect this (no keychain reset, no move to a new machine), \
+                             stop here and check where this data directory came from. Recovering trusts \
+                             the files on disk now as the newest state: an older copy recovered here \
+                             becomes the new reference point. Nothing is deleted or re-encrypted.",
+                        )
+                        .color(c.text_muted),
+                    );
+                    ui.add_space(10.0);
+                    ui.checkbox(
+                        &mut r.confirmed,
+                        "This data directory is the current copy I intend to keep",
+                    );
+                    ui.add_space(6.0);
+                    let resp = theme::text_input(ui, &mut r.pass, "Passphrase", true);
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(8.0);
+                    let ready = r.confirmed && !r.pass.is_empty();
+                    if ui
+                        .add_enabled_ui(ready, |ui| {
+                            theme::primary_button_full(ui, "Re-establish rollback protection")
+                        })
+                        .inner
+                        .clicked()
+                        || (ready && submit)
+                    {
+                        *action = Some(Action::RecoverAnchors);
+                    }
+                    if let Some(e) = &r.error {
+                        ui.add_space(10.0);
+                        ui.colored_label(c.err, e);
+                    }
+                });
+            });
         });
-    });
 }
-
 fn first_run_ui(f: &mut FirstRun, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let c = theme::colors(ui);
-    ui.add_space(36.0);
-    ui.vertical_centered(|ui| {
-        ui.set_max_width(440.0);
-        ui.label(theme::icon_text(theme::icon::LOCK_KEY, 40.0).color(c.accent));
-        ui.add_space(6.0);
-        ui.heading("Welcome to FileSec");
-        ui.label(
-            RichText::new(
-                "Create your identity. Your private keys never leave this device \
-                 and are encrypted with your passphrase.",
-            )
-            .color(c.text_muted),
-        );
-        ui.add_space(18.0);
-
-        match &mut f.restore {
-            // Restore-from-backup flow: a `.fsecid` file has been picked.
-            Some(r) => {
-                theme::card(ui, |ui| {
-                    ui.label(RichText::new("Restore from a backup").size(16.0).strong());
-                    ui.label(
-                        RichText::new(format!(
-                            "Restoring from {}",
-                            r.path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| r.path.display().to_string())
-                        ))
-                        .color(c.text_muted)
-                        .small(),
-                    );
-                    ui.add_space(12.0);
-                    field_label(ui, "Backup passphrase");
-                    theme::text_input(
-                        ui,
-                        &mut r.backup_pass,
-                        "Passphrase that protects the backup",
-                        true,
-                    );
-                    ui.add_space(10.0);
-                    field_label(ui, "New passphrase for this device");
-                    theme::text_input(ui, &mut r.new_pass, PASSPHRASE_HINT, true);
-                    ui.add_space(10.0);
-                    field_label(ui, "Confirm new passphrase");
-                    theme::text_input(ui, &mut r.new_pass2, "Repeat new passphrase", true);
-                    ui.add_space(14.0);
-                    if let Some(e) = &r.error {
-                        ui.colored_label(c.err, e);
-                        ui.add_space(10.0);
-                    }
-                    if theme::primary_button_full(ui, "Restore identity").clicked() {
-                        *action = Some(Action::DoRestore);
-                    }
-                    ui.add_space(6.0);
-                    if theme::secondary_button_full(ui, "Cancel").clicked() {
-                        *action = Some(Action::CancelRestore);
-                    }
-                });
-            }
-            // Default: create a brand-new identity.
-            None => {
-                theme::card(ui, |ui| {
-                    field_label(ui, "Display name");
-                    theme::text_input(ui, &mut f.name, "e.g. Alice", false);
-                    ui.add_space(10.0);
-                    field_label(ui, "Passphrase");
-                    theme::text_input(ui, &mut f.pass, PASSPHRASE_HINT, true);
-                    ui.add_space(10.0);
-                    field_label(ui, "Confirm passphrase");
-                    theme::text_input(ui, &mut f.pass2, "Repeat passphrase", true);
-                    ui.add_space(14.0);
-                    if let Some(e) = &f.error {
-                        ui.colored_label(c.err, e);
-                        ui.add_space(10.0);
-                    }
-                    if theme::primary_button_full(ui, "Create identity").clicked() {
-                        *action = Some(Action::CreateIdentity);
-                    }
-                    ui.add_space(6.0);
-                    if theme::secondary_button_full(ui, "Restore from a backup…").clicked() {
-                        *action = Some(Action::BeginRestore);
-                    }
-                });
-
-                ui.add_space(12.0);
+    egui::ScrollArea::vertical()
+        .id_salt("setup_scroll")
+        .show(ui, |ui| {
+            ui.add_space((ui.available_height() * 0.04).min(24.0));
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(440.0);
+                ui.label(theme::icon_text(theme::icon::LOCK_KEY, 40.0).color(c.accent));
+                ui.add_space(6.0);
+                ui.heading("Welcome to FileSec");
                 ui.label(
                     RichText::new(
-                        "⚠ There is no password recovery. If you forget your passphrase, \
-                         your vaults cannot be opened.",
+                        "Your identity lets others send files securely to you. \
+                 Your private keys are encrypted on this device.",
                     )
-                    .color(c.warn)
-                    .small(),
+                    .color(c.text_muted),
                 );
-            }
-        }
-    });
+                ui.add_space(18.0);
+
+                match &mut f.restore {
+                    // Restore-from-backup flow: a `.fsecid` file has been picked.
+                    Some(r) => {
+                        theme::card(ui, |ui| {
+                            ui.label(RichText::new("Restore from a backup").size(16.0).strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "Restoring from {}",
+                                    r.path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| r.path.display().to_string())
+                                ))
+                                .color(c.text_muted)
+                                .small(),
+                            );
+                            ui.add_space(12.0);
+                            let mut edited = labelled_input(
+                                ui,
+                                &mut r.backup_pass,
+                                "Passphrase that protects the backup",
+                                true,
+                                "Backup passphrase",
+                            )
+                            .changed();
+                            ui.add_space(10.0);
+                            edited = labelled_input(
+                                ui,
+                                &mut r.new_pass,
+                                PASSPHRASE_HINT,
+                                true,
+                                "New passphrase for this device",
+                            )
+                            .changed()
+                                || edited;
+                            passphrase_feedback(ui, &r.new_pass);
+                            ui.add_space(10.0);
+                            let confirm = labelled_input(
+                                ui,
+                                &mut r.new_pass2,
+                                "Repeat new passphrase",
+                                true,
+                                "Confirm new passphrase",
+                            );
+                            let submit = confirm.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            passphrase_match_feedback(ui, &r.new_pass, &r.new_pass2);
+                            if edited || confirm.changed() {
+                                r.error = None;
+                            }
+                            ui.add_space(14.0);
+                            if let Some(e) = &r.error {
+                                ui.colored_label(c.err, e);
+                                ui.add_space(10.0);
+                            }
+                            let ready = !r.backup_pass.is_empty()
+                                && passphrase_policy_error(&r.new_pass).is_none()
+                                && r.new_pass == r.new_pass2;
+                            if ui
+                                .add_enabled_ui(ready, |ui| {
+                                    theme::primary_button_full(ui, "Restore identity")
+                                })
+                                .inner
+                                .clicked()
+                                || (ready && submit)
+                            {
+                                *action = Some(Action::DoRestore);
+                            }
+                            ui.add_space(6.0);
+                            if theme::secondary_button_full(ui, "Cancel").clicked() {
+                                *action = Some(Action::CancelRestore);
+                            }
+                        });
+                    }
+                    // Default: create a brand-new identity.
+                    None => {
+                        theme::card(ui, |ui| {
+                            let mut edited = labelled_input(
+                                ui,
+                                &mut f.name,
+                                "e.g. Alice",
+                                false,
+                                "Display name",
+                            )
+                            .changed();
+                            ui.add_space(10.0);
+                            edited = labelled_input(
+                                ui,
+                                &mut f.pass,
+                                PASSPHRASE_HINT,
+                                true,
+                                "Passphrase",
+                            )
+                            .changed()
+                                || edited;
+                            passphrase_feedback(ui, &f.pass);
+                            ui.add_space(10.0);
+                            let confirm = labelled_input(
+                                ui,
+                                &mut f.pass2,
+                                "Repeat passphrase",
+                                true,
+                                "Confirm passphrase",
+                            );
+                            let submit = confirm.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            passphrase_match_feedback(ui, &f.pass, &f.pass2);
+                            if edited || confirm.changed() {
+                                f.error = None;
+                            }
+                            ui.add_space(14.0);
+                            if let Some(e) = &f.error {
+                                ui.colored_label(c.err, e);
+                                ui.add_space(10.0);
+                            }
+                            let ready = !f.name.trim().is_empty()
+                                && passphrase_policy_error(&f.pass).is_none()
+                                && f.pass == f.pass2;
+                            if ui
+                                .add_enabled_ui(ready, |ui| {
+                                    theme::primary_button_full(ui, "Create identity")
+                                })
+                                .inner
+                                .clicked()
+                                || (ready && submit)
+                            {
+                                *action = Some(Action::CreateIdentity);
+                            }
+                            ui.add_space(6.0);
+                            if theme::secondary_button_full(ui, "Restore from a backup…").clicked()
+                            {
+                                *action = Some(Action::BeginRestore);
+                            }
+                        });
+
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new(
+                                "⚠ There is no password recovery. If you forget your passphrase, \
+                         your vaults cannot be opened.",
+                            )
+                            .color(c.warn)
+                            .small(),
+                        );
+                    }
+                }
+            });
+        });
 }
 
-/// A small muted field caption above a form input.
-fn field_label(ui: &mut egui::Ui, text: &str) {
+fn labelled_input(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    password: bool,
+    label: &str,
+) -> egui::Response {
+    let caption = ui.label(
+        RichText::new(label)
+            .small()
+            .color(theme::colors(ui).text_muted),
+    );
+    theme::text_input(ui, text, hint, password).labelled_by(caption.id)
+}
+
+fn passphrase_feedback(ui: &mut egui::Ui, pass: &str) {
     let c = theme::colors(ui);
-    ui.label(RichText::new(text).small().color(c.text_muted));
-    ui.add_space(2.0);
+    let (message, color) = if pass.is_empty() {
+        (
+            "Use at least 12 characters. Several unrelated words work well.".to_string(),
+            c.text_muted,
+        )
+    } else if let Some(error) = passphrase_policy_error(pass) {
+        (error, c.warn)
+    } else {
+        ("Passphrase meets the requirements.".to_string(), c.ok)
+    };
+    ui.add(egui::Label::new(RichText::new(message).small().color(color)).wrap());
+}
+
+fn passphrase_match_feedback(ui: &mut egui::Ui, pass: &str, confirmation: &str) {
+    if !confirmation.is_empty() {
+        let c = theme::colors(ui);
+        let (text, color) = if pass == confirmation {
+            ("Passphrases match.", c.ok)
+        } else {
+            ("Passphrases do not match yet.", c.warn)
+        };
+        ui.label(RichText::new(text).small().color(color));
+    }
 }
 
 fn unlock_ui(u: &mut Unlock, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let c = theme::colors(ui);
-    ui.add_space(60.0);
-    ui.vertical_centered(|ui| {
-        ui.set_max_width(420.0);
-        ui.label(theme::icon_text(theme::icon::LOCK, 40.0).color(c.accent));
-        ui.add_space(6.0);
-        ui.heading("Unlock FileSec");
-        ui.add_space(16.0);
-
-        theme::card(ui, |ui| {
-            if u.legacy_recovery {
-                ui.label(
-                    RichText::new(
-                        "One-time security upgrade required. FileSec found authenticated local state from before rollback protection was introduced. Enter your passphrase and confirm recovery; the keystore, contacts, registry, and registered vaults will be re-anchored immediately.",
-                    )
-                    .color(c.warn),
-                );
-                ui.add_space(10.0);
-            }
-            let resp = theme::text_input(ui, &mut u.pass, "Passphrase", true);
-            let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(8.0);
-            let button = if u.legacy_recovery {
-                "Recover and upgrade local state"
-            } else {
-                "Unlock"
-            };
-            if theme::primary_button_full(ui, button).clicked() || submit {
-                *action = Some(Action::Unlock);
-            }
-
-            // Security-key (passkey) unlock, when one is enrolled and this build
-            // supports the hardware.
-            if !u.legacy_recovery && u.has_passkeys && passkey::SUPPORTED {
-                theme::divider_or(ui);
-                theme::text_input(ui, &mut u.pin, "Security-key PIN (if set)", true);
+    egui::ScrollArea::vertical()
+        .id_salt("unlock_scroll")
+        .show(ui, |ui| {
+            ui.add_space((ui.available_height() * 0.10).min(60.0));
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(420.0);
+                ui.label(theme::icon_text(theme::icon::LOCK, 40.0).color(c.accent));
                 ui.add_space(6.0);
-                if theme::secondary_button_full(ui, "🔑  Unlock with security key").clicked() {
-                    *action = Some(Action::UnlockWithPasskey);
-                }
-            } else if !u.legacy_recovery && u.has_passkeys {
-                ui.add_space(10.0);
+                ui.heading("Welcome back");
                 ui.label(
-                    RichText::new(
+                            RichText::new("Unlock your identity to access your vaults.")
+                        .color(c.text_muted),
+                );
+                ui.add_space(16.0);
+
+                theme::card(ui, |ui| {
+                    if u.legacy_recovery {
+                        ui.label(
+                            RichText::new(
+                                "One-time security upgrade required. FileSec found authenticated local \
+                                 state from before rollback protection was introduced. Enter your \
+                                 passphrase and confirm recovery; the keystore, contacts, registry, \
+                                 and registered vaults will be re-anchored immediately.",
+                            )
+                            .color(c.warn),
+                        );
+                        ui.add_space(10.0);
+                    }
+                    let resp = labelled_input(
+                        ui,
+                        &mut u.pass,
+                        "Enter your passphrase",
+                        true,
+                        "Passphrase",
+                    );
+                    if resp.changed() {
+                        u.error = None;
+                    }
+                    if let Some(e) = &u.error {
+                        ui.add_space(10.0);
+                        ui.colored_label(c.err, e);
+                    }
+                    let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.add_space(8.0);
+                    let button = if u.legacy_recovery {
+                        "Recover and upgrade local state"
+                    } else {
+                        "Unlock"
+                    };
+                    if ui
+                        .add_enabled_ui(!u.pass.is_empty(), |ui| {
+                            theme::primary_button_full(ui, button)
+                        })
+                        .inner
+                        .clicked()
+                        || (submit && !u.pass.is_empty())
+                    {
+                        *action = Some(Action::Unlock);
+                    }
+
+                    // Security-key (passkey) unlock, when one is enrolled and this build
+                    // supports the hardware.
+                    if !u.legacy_recovery && u.has_passkeys && passkey::SUPPORTED {
+                        theme::divider_or(ui);
+                        theme::text_input(ui, &mut u.pin, "Security-key PIN (if set)", true);
+                        ui.add_space(6.0);
+                        if theme::secondary_button_full(ui, "🔑  Unlock with security key")
+                            .clicked()
+                        {
+                            *action = Some(Action::UnlockWithPasskey);
+                        }
+                    } else if !u.legacy_recovery && u.has_passkeys {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(
                         "This identity has a security key enrolled, but this build can't use it \
                          (rebuild with --features passkey). Use your passphrase.",
                     )
                     .color(c.text_muted)
                     .small(),
                 );
-            }
+                    }
 
-            // This-device (OS keychain) unlock, when a device token is stored for
-            // this device and this build can read it.
-            if !u.legacy_recovery && u.has_saved && autounlock::SUPPORTED {
-                theme::divider_or(ui);
-                if theme::secondary_button_full(ui, "🔓  Unlock on this device").clicked() {
-                    *action = Some(Action::UnlockWithKeyring);
-                }
-            } else if !u.legacy_recovery && u.has_saved {
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(
-                        "This device has a saved unlock, but this build can't use it \
+                    // This-device (OS keychain) unlock, when a device token is stored for
+                    // this device and this build can read it.
+                    if !u.legacy_recovery && u.has_saved && autounlock::SUPPORTED {
+                        theme::divider_or(ui);
+                        if theme::secondary_button_full(ui, "🔓  Unlock on this device").clicked()
+                        {
+                            *action = Some(Action::UnlockWithKeyring);
+                        }
+                    } else if !u.legacy_recovery && u.has_saved {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(
+                                "This device has a saved unlock, but this build can't use it \
                          (rebuild with --features keyring). Use your passphrase.",
-                    )
-                    .color(c.text_muted)
-                    .small(),
-                );
-            }
-
-            if let Some(e) = &u.error {
-                ui.add_space(10.0);
-                ui.colored_label(c.err, e);
-            }
+                            )
+                            .color(c.text_muted)
+                            .small(),
+                        );
+                    }
+                });
+            });
         });
-    });
 }
 
 fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
@@ -5833,6 +6032,9 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         }
     }
 
+    if s.delete_vault.is_some() {
+        delete_vault_window(s, ui.ctx(), action);
+    }
     if s.move_form.is_some() {
         move_window(s, ui.ctx(), action);
     }
@@ -5875,8 +6077,7 @@ fn session_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 }
 
 fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    let c = theme::colors(ui);
-    theme::section_header(ui, "Vaults", |ui| {
+    theme::section_header(ui, "Your vaults", |ui| {
         if theme::primary_button(ui, "+  New vault").clicked() {
             *action = Some(Action::ToggleNewVault(!s.show_new_vault));
         }
@@ -5884,19 +6085,92 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             *action = Some(Action::ImportContainer);
         }
     });
+    theme::page_description(
+        ui,
+        "Keep files in encrypted vaults. Share a vault securely with the people you choose.",
+    );
+
+    egui::ScrollArea::vertical()
+        .id_salt("vault_list")
+        .show(ui, |ui| vault_list_ui(s, ui, action));
+}
+
+fn vault_list_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let c = theme::colors(ui);
+    if !s.registry.vaults.is_empty() {
+        let files = s
+            .registry
+            .vaults
+            .iter()
+            .fold(0u64, |total, v| total.saturating_add(v.file_count));
+        let bytes = s
+            .registry
+            .vaults
+            .iter()
+            .fold(0u64, |total, v| total.saturating_add(v.total_size));
+        if ui.available_width() < 600.0 {
+            ui.label(
+                RichText::new(format!(
+                    "{} vaults · {files} files · {} of file contents",
+                    s.registry.vaults.len(),
+                    human_size(bytes)
+                ))
+                .color(c.text_muted)
+                .small(),
+            );
+        } else {
+            ui.columns(3, |cols| {
+                theme::card(&mut cols[0], |ui| {
+                    ui.label(
+                        RichText::new(s.registry.vaults.len().to_string())
+                            .size(24.0)
+                            .strong(),
+                    );
+                    ui.label(RichText::new("Vaults").small().color(c.text_muted));
+                });
+                theme::card(&mut cols[1], |ui| {
+                    ui.label(RichText::new(files.to_string()).size(24.0).strong());
+                    ui.label(RichText::new("Files").small().color(c.text_muted));
+                });
+                theme::card(&mut cols[2], |ui| {
+                    ui.label(RichText::new(human_size(bytes)).size(24.0).strong());
+                    ui.label(RichText::new("File contents").small().color(c.text_muted));
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+    }
 
     if s.show_new_vault {
         theme::card(ui, |ui| {
+            ui.label(RichText::new("Create a vault").strong());
+            ui.label(
+                RichText::new("Give this collection a name. You can add files next.")
+                    .small()
+                    .color(c.text_muted),
+            );
+            let input = ui.add(
+                egui::TextEdit::singleline(&mut s.new_vault_name)
+                    .id(egui::Id::new("new_vault_name"))
+                    .hint_text("e.g. Personal documents")
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(12, 9)),
+            );
+            let submit = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let ready = !s.new_vault_name.trim().is_empty();
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut s.new_vault_name)
-                        .hint_text("Vault name")
-                        .desired_width(240.0),
-                );
-                if theme::primary_button(ui, "Create").clicked() {
+                if ui
+                    .add_enabled_ui(ready, |ui| theme::primary_button(ui, "Create vault"))
+                    .inner
+                    .clicked()
+                    || (ready && submit)
+                {
                     *action = Some(Action::CreateVault);
                 }
-                if theme::secondary_button(ui, "Cancel").clicked() {
+                if theme::secondary_button(ui, "Cancel").clicked()
+                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
                     *action = Some(Action::ToggleNewVault(false));
                 }
             });
@@ -5904,55 +6178,201 @@ fn vaults_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     }
 
     if s.registry.vaults.is_empty() {
-        theme::empty_state(
-            ui,
-            theme::icon::VAULT,
-            "No vaults yet",
-            "Create one, or import a .fsec someone sent you.",
-            |ui| {
-                if theme::primary_button(ui, "+  New vault").clicked() {
-                    *action = Some(Action::ToggleNewVault(true));
-                }
-            },
-        );
+        if !s.show_new_vault {
+            theme::empty_state(
+                ui,
+                theme::icon::VAULT,
+                "A private place for your files",
+                "Create your first vault, then add files or drag them in from your computer.",
+                |ui| {
+                    if theme::primary_button(ui, "Create your first vault").clicked() {
+                        *action = Some(Action::ToggleNewVault(true));
+                    }
+                },
+            );
+        }
         return;
     }
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let mut vaults = s.registry.vaults.clone();
-        vaults.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
-        for v in vaults {
+    search_field(ui, &mut s.vault_search, "Find a vault…");
+    let query = s.vault_search.trim().to_lowercase();
+    let mut vaults: Vec<_> = s
+        .registry
+        .vaults
+        .iter()
+        .filter(|v| v.name.to_lowercase().contains(&query))
+        .collect();
+    vaults.sort_by_key(|v| std::cmp::Reverse(v.modified_at));
+    ui.label(
+        RichText::new(format!(
+            "{} vault{} · Recently updated first",
+            vaults.len(),
+            if vaults.len() == 1 { "" } else { "s" }
+        ))
+        .small()
+        .color(c.text_muted),
+    );
+    ui.add_space(4.0);
+    if vaults.is_empty() {
+        theme::empty_state(
+            ui,
+            theme::icon::VAULT,
+            "No matching vaults",
+            "Try another name or clear your search.",
+            |ui| {
+                if theme::secondary_button(ui, "Clear search").clicked() {
+                    s.vault_search.clear();
+                }
+            },
+        );
+    }
+    for vault in vaults {
+        ui.push_id(&vault.id, |ui| {
             theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(theme::icon_text(theme::icon::VAULT, 22.0).color(c.accent));
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&v.name).strong().size(15.0));
-                        ui.label(
-                            RichText::new(format!(
-                                "{} file(s) · {}",
-                                v.file_count,
-                                human_size(v.total_size)
-                            ))
-                            .color(c.text_muted)
-                            .small(),
+                if ui.available_width() >= 620.0 {
+                    ui.horizontal(|ui| {
+                        let details_width = (ui.available_width() - 252.0).max(80.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(details_width, theme::two_line_height(ui, 16.0)),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(details_width);
+                                vault_details(ui, vault);
+                            },
                         );
+                        vault_actions(ui, vault, action);
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::icon_button(ui, theme::icon::TRASH, "Delete vault").clicked() {
-                            *action = Some(Action::DeleteVault(v.id.clone()));
-                        }
-                        if theme::secondary_button(ui, "Send…").clicked() {
-                            *action = Some(Action::BeginExport(v.id.clone()));
-                        }
-                        if theme::primary_button(ui, "Open").clicked() {
-                            *action = Some(Action::OpenVault(v.id.clone()));
-                        }
-                    });
-                });
+                } else {
+                    vault_details(ui, vault);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| vault_actions(ui, vault, action));
+                }
             });
+        });
+    }
+}
+
+fn vault_details(ui: &mut egui::Ui, vault: &VaultMeta) {
+    let c = theme::colors(ui);
+    ui.horizontal(|ui| {
+        ui.label(theme::icon_text(theme::icon::VAULT, 24.0).color(c.accent));
+        let width = (ui.available_width() - 8.0).max(40.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, theme::two_line_height(ui, 16.0)),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(width);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.add(egui::Label::new(RichText::new(&vault.name).strong().size(16.0)).truncate())
+                    .on_hover_text(&vault.name);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{} file{} · {} · Updated {}",
+                            vault.file_count,
+                            if vault.file_count == 1 { "" } else { "s" },
+                            human_size(vault.total_size),
+                            fmt_date(vault.modified_at)
+                        ))
+                        .color(c.text_muted)
+                        .small(),
+                    )
+                    .truncate(),
+                );
+            },
+        );
+    });
+}
+
+fn vault_actions(ui: &mut egui::Ui, vault: &VaultMeta, action: &mut Option<Action>) {
+    if theme::primary_button(ui, "Open vault").clicked() {
+        *action = Some(Action::OpenVault(vault.id.clone()));
+    }
+    if theme::secondary_button(ui, "Send…").clicked() {
+        *action = Some(Action::BeginExport(vault.id.clone()));
+    }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if theme::icon_button(ui, theme::icon::TRASH, "Delete vault…").clicked() {
+            *action = Some(Action::RequestDeleteVault(vault.id.clone()));
         }
     });
+}
+
+fn delete_vault_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Action>) {
+    let Some(form) = &mut s.delete_vault else {
+        return;
+    };
+    let Some(vault) = s
+        .registry
+        .vaults
+        .iter()
+        .find(|vault| vault.id == form.vault_id)
+    else {
+        *action = Some(Action::CancelDeleteVault);
+        return;
+    };
+    let c = theme::colors_for(ctx);
+    let (close, ()) = theme::modal(ctx, "Delete vault?", |ui| {
+        ui.add(egui::Label::new(RichText::new(&vault.name).strong().size(17.0)).wrap());
+        ui.label(
+            RichText::new(format!(
+                "{} files · {}",
+                vault.file_count,
+                human_size(vault.total_size)
+            ))
+            .small()
+            .color(c.text_muted),
+        );
+        ui.add_space(8.0);
+        ui.add(egui::Label::new("This permanently deletes this vault and all files in it, including items in its Trash. This cannot be undone.").wrap());
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            let cancel = theme::secondary_button(ui, "Cancel");
+            if form.focus_cancel {
+                cancel.request_focus();
+                form.focus_cancel = false;
+            }
+            if cancel.clicked() {
+                *action = Some(Action::CancelDeleteVault);
+            }
+            if theme::danger_button(ui, "Delete vault permanently").clicked() {
+                *action = Some(Action::ConfirmDeleteVault);
+            }
+        });
+    });
+    if close {
+        *action = Some(Action::CancelDeleteVault);
+    }
+}
+
+/// Search with a stable field width and an always-reserved clear affordance.
+fn search_field(ui: &mut egui::Ui, query: &mut String, hint: &str) -> egui::Response {
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 64.0).max(40.0);
+        let mut input = ui.add(
+            egui::TextEdit::singleline(query)
+                .hint_text(hint)
+                .desired_width(width)
+                .margin(egui::Margin::symmetric(10, 8)),
+        );
+        if input.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if query.is_empty() {
+                input.surrender_focus();
+            } else {
+                query.clear();
+                input.mark_changed();
+            }
+        }
+        ui.add_enabled_ui(!query.is_empty(), |ui| {
+            if theme::icon_button(ui, theme::icon::CLOSE, "Clear search").clicked() {
+                query.clear();
+                input.mark_changed();
+                input.request_focus();
+            }
+        });
+        input
+    })
+    .inner
 }
 
 fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
@@ -5989,36 +6409,46 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let trash = &model.trash;
     let in_trash = s.show_trash;
 
-    // ---- Header: back, title, and whole-vault actions ----
+    // Navigation and vault actions stay separate from the file tools.
     ui.horizontal(|ui| {
-        if theme::secondary_button(ui, "←  Vaults").clicked() {
+        if theme::secondary_button(ui, "←  All vaults").clicked() {
             *action = Some(Action::CloseVault);
         }
-        ui.add_space(4.0);
-        ui.heading(&name);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // The trash entry point lives in the header in both modes: it opens the
-            // trash view, or (when already there) returns to the files. Plain text,
-            // like the other header buttons — the Phosphor glyph family renders only
-            // via `icon_text`, never inside a button label.
-            let trash_label = if in_trash {
-                "←  Back to files".to_string()
-            } else if trash.is_empty() {
-                "Trash".to_string()
+            let label = if in_trash {
+                "Back to files".to_string()
             } else {
                 format!("Trash ({})", trash.len())
             };
-            if theme::secondary_button(ui, trash_label).clicked() {
+            if theme::secondary_button(ui, label).clicked() {
                 *action = Some(Action::ShowTrash(!in_trash));
             }
             if !in_trash {
-                if theme::primary_button(ui, "Send…").clicked() {
-                    *action = Some(Action::BeginExport(id.clone()));
-                }
-                if theme::secondary_button(ui, "Extract all…").clicked() {
-                    *action = Some(Action::ExtractAll);
-                }
+                ui.menu_button("More", |ui| {
+                    if ui.button("Extract all files…").clicked() {
+                        *action = Some(Action::ExtractAll);
+                        ui.close();
+                    }
+                });
             }
+        });
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !in_trash && theme::primary_button(ui, "Send vault…").clicked() {
+                *action = Some(Action::BeginExport(id.clone()));
+            }
+            let title_width = ui.available_width().max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(title_width, ui.text_style_height(&egui::TextStyle::Heading)),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(title_width);
+                    ui.add(egui::Label::new(RichText::new(&name).heading().strong()).truncate())
+                        .on_hover_text(&name);
+                },
+            );
         });
     });
     ui.add_space(8.0);
@@ -6103,35 +6533,33 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         }
     }
 
-    // ---- Breadcrumb + sort + search ----
+    // Breadcrumbs get their own wrapping line, including for deep folders.
+    ui.horizontal_wrapped(|ui| breadcrumb(ui, &cur, action));
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        breadcrumb(ui, &cur, action);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !s.file_search.is_empty()
-                && theme::icon_button(ui, theme::icon::CLOSE, "Clear search").clicked()
-            {
-                s.file_search.clear();
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut s.file_search)
-                    .hint_text("Search this vault…")
-                    .desired_width(180.0),
-            );
-            egui::ComboBox::from_id_salt("file_sort")
-                .selected_text(s.sort.label())
-                .show_ui(ui, |ui| {
-                    for m in [
-                        SortMode::NameAsc,
-                        SortMode::NameDesc,
-                        SortMode::SizeDesc,
-                        SortMode::SizeAsc,
-                    ] {
-                        if ui.selectable_label(s.sort == m, m.label()).clicked() {
-                            *action = Some(Action::SetSort(m));
-                        }
+        egui::ComboBox::from_id_salt("file_sort")
+            .width(155.0)
+            .selected_text(s.sort.label())
+            .show_ui(ui, |ui| {
+                for m in [
+                    SortMode::NameAsc,
+                    SortMode::NameDesc,
+                    SortMode::SizeDesc,
+                    SortMode::SizeAsc,
+                ] {
+                    if ui.selectable_label(s.sort == m, m.label()).clicked() {
+                        *action = Some(Action::SetSort(m));
                     }
-                });
-        });
+                }
+            });
+        let response = search_field(ui, &mut s.file_search, "Search all files…");
+        if response.changed() {
+            s.selected.clear();
+            s.select_anchor = None;
+        }
+        if !modal_open && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            response.request_focus();
+        }
     });
     ui.add_space(4.0);
 
@@ -6161,27 +6589,31 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
         }
     }
 
-    // ---- Add content (targets the current folder) ----
+    // One primary file action, with less frequent creation tools grouped.
     ui.add_enabled_ui(idle, |ui| {
         ui.horizontal_wrapped(|ui| {
-            if theme::secondary_button(ui, "+  Add files…").clicked() {
+            if theme::primary_button(ui, "+  Add files…").clicked() {
                 *action = Some(Action::AddFiles);
             }
-            if theme::secondary_button(ui, "+  Add folder…").clicked() {
+            if theme::secondary_button(ui, "Add folder…").clicked() {
                 *action = Some(Action::AddFolder);
             }
-            if theme::secondary_button(ui, "+  New folder").clicked() {
-                *action = Some(Action::ToggleNewFolder(!s.show_new_folder));
-            }
-            if theme::secondary_button(ui, "+  New file").clicked() {
-                *action = Some(Action::ToggleNewFile(!s.show_new_file));
-            }
+            ui.menu_button("New…", |ui| {
+                if ui.button("Folder").clicked() {
+                    *action = Some(Action::ToggleNewFolder(!s.show_new_folder));
+                    ui.close();
+                }
+                if ui.button("Text file").clicked() {
+                    *action = Some(Action::ToggleNewFile(!s.show_new_file));
+                    ui.close();
+                }
+            });
         });
     });
 
     if s.show_new_folder && idle {
         theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut s.new_folder_name)
                         .hint_text("Folder name")
@@ -6200,7 +6632,7 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
 
     if s.show_new_file && idle {
         theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut s.new_file_name)
                         .hint_text("Name with extension, e.g. notes.txt")
@@ -6221,7 +6653,7 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     if idle {
         if let Some(target) = s.rename_target.clone() {
             theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("Rename “{}”", shown(leaf_name(&target))))
                             .color(c.text),
@@ -6244,108 +6676,116 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     }
     ui.add_space(6.0);
 
-    // ---- Selection action bar ----
-    if idle && !s.selected.is_empty() {
-        let n = s.selected.len();
-        let selected: Vec<String> = s.selected.iter().cloned().collect();
-        theme::banner(ui, c.accent, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("{n} selected"))
-                        .color(c.accent)
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::secondary_button(ui, "Clear").clicked() {
-                        *action = Some(Action::ClearSelection);
-                    }
-                    if theme::danger_button(ui, "Delete").clicked() {
-                        *action = Some(Action::TrashSelected);
-                    }
-                    if theme::secondary_button(ui, "Move…").clicked() {
-                        *action = Some(Action::BeginMove(selected.clone()));
-                    }
-                    if theme::primary_button(ui, "Extract…").clicked() {
-                        *action = Some(Action::ExtractSelected);
-                    }
-                });
-            });
-        });
-    }
-
     // ---- The file/folder list ----
     let search = s.file_search.clone();
     let searching = !search.trim().is_empty();
     let rows = s.visible_rows(&model, &cur, &search);
 
-    // A vault holding only trashed files still reads as empty here (the live tree
-    // is what the browser shows; the trash has its own view).
-    if !model.has_live {
-        theme::empty_state(
-            ui,
-            theme::icon::FOLDER,
-            "This vault is empty",
-            "Add files or folders — or just drag them in from your computer.",
-            |ui| {
-                if idle && theme::primary_button(ui, "+  Add files…").clicked() {
-                    *action = Some(Action::AddFiles);
-                }
-            },
-        );
-    } else if rows.is_empty() {
-        if searching {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(theme::icon_text(theme::icon::FILE, 40.0).color(c.text_muted));
-                ui.add_space(8.0);
-                ui.label(RichText::new(format!("No files match “{}”", search.trim())).strong());
-            });
-        } else {
+    // Reserve the same footer space in every selection state. Both the row
+    // positions and the scroll viewport stay fixed between double-clicks.
+    let available = ui.available_rect_before_wrap();
+    let footer_height = 44.0_f32.min(available.height().max(0.0));
+    let footer_rect = egui::Rect::from_min_max(
+        egui::pos2(available.left(), available.bottom() - footer_height),
+        available.max,
+    );
+    let list_rect = egui::Rect::from_min_max(
+        available.min,
+        egui::pos2(
+            available.right(),
+            (footer_rect.top() - 8.0).max(available.top()),
+        ),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(list_rect), |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(list_rect));
+        ui.set_min_size(list_rect.size());
+        // A vault holding only trashed files still reads as empty here (the live tree
+        // is what the browser shows; the trash has its own view).
+        if !model.has_live {
             theme::empty_state(
                 ui,
                 theme::icon::FOLDER,
-                "This folder is empty",
-                "Add files here, or drag them in from your computer.",
+                "This vault is empty",
+                "Add files or folders — or just drag them in from your computer.",
                 |ui| {
                     if idle && theme::primary_button(ui, "+  Add files…").clicked() {
                         *action = Some(Action::AddFiles);
                     }
                 },
             );
-        }
-    } else {
-        // An at-a-glance summary of the current view, plus a "select all"
-        // affordance on the right when there's more than one item to select.
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(view_summary(&rows, searching))
-                    .color(c.text_muted)
-                    .small(),
-            );
-            if !searching && idle && rows.len() > 1 {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Select all").color(c.accent).small())
-                                .frame(false),
+        } else if rows.is_empty() {
+            if searching {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(theme::icon_text(theme::icon::FILE, 40.0).color(c.text_muted));
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("No files match “{}”", search.trim())).strong(),
                         )
-                        .clicked()
-                    {
-                        *action = Some(Action::SelectAllVisible);
+                        .wrap(),
+                    );
+                    ui.label(
+                        RichText::new("Search includes every folder in this vault.")
+                            .color(c.text_muted),
+                    );
+                    if theme::secondary_button(ui, "Clear search").clicked() {
+                        s.file_search.clear();
                     }
                 });
+            } else {
+                theme::empty_state(
+                    ui,
+                    theme::icon::FOLDER,
+                    "This folder is empty",
+                    "Add files here, or drag them in from your computer.",
+                    |ui| {
+                        if idle && theme::primary_button(ui, "+  Add files…").clicked() {
+                            *action = Some(Action::AddFiles);
+                        }
+                    },
+                );
             }
-        });
-        ui.add_space(2.0);
-        let (clicked, bg_clicked) =
-            browser_rows_ui(ui, c, &rows, &s.selected, idle, searching, action);
-        // Resolve selection after the scroll area releases its borrow of `s`.
-        if let Some((i, rc)) = clicked {
-            apply_row_click(s, &rows, i, rc, action);
-        } else if bg_clicked && !s.selected.is_empty() {
-            *action = Some(Action::ClearSelection);
+        } else {
+            // An at-a-glance summary of the current view, plus a "select all"
+            // affordance on the right when there's more than one item to select.
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(view_summary(&rows, searching))
+                        .color(c.text_muted)
+                        .small(),
+                );
+                if idle && rows.len() > 1 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Select all").color(c.accent).small(),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            *action = Some(Action::SelectAllVisible);
+                        }
+                    });
+                }
+            });
+            ui.add_space(2.0);
+            let (clicked, bg_clicked) =
+                browser_rows_ui(ui, c, &rows, &s.selected, idle, searching, action);
+            // Resolve selection after the scroll area releases its borrow of `s`.
+            if let Some((i, rc)) = clicked {
+                apply_row_click(s, &rows, i, rc, action);
+            } else if bg_clicked && !s.selected.is_empty() {
+                *action = Some(Action::ClearSelection);
+            }
         }
-    }
+    });
+    ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(footer_rect));
+        selection_footer_ui(ui, &s.selected, idle, action);
+    });
 
     // ---- Drag-and-drop overlay ----
     if hovering_files {
@@ -6377,6 +6817,69 @@ fn browser_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
             c.accent,
         );
     }
+}
+
+/// A fixed footer; its height does not depend on whether anything is selected.
+fn selection_footer_ui(
+    ui: &mut egui::Ui,
+    selected: &HashSet<String>,
+    idle: bool,
+    action: &mut Option<Action>,
+) {
+    let c = theme::colors(ui);
+    egui::Frame::NONE
+        .fill(if selected.is_empty() {
+            c.surface
+        } else {
+            theme::accent_soft(c)
+        })
+        .stroke(egui::Stroke::new(1.0_f32, c.border))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SM))
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add_enabled_ui(idle, |ui| {
+                ui.horizontal(|ui| {
+                    if selected.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Select items for actions · Double-click to open")
+                                    .small()
+                                    .color(c.text_muted),
+                            )
+                            .truncate(),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!("{} selected", selected.len()))
+                                .small()
+                                .strong()
+                                .color(c.accent),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::icon_button(ui, theme::icon::CLOSE, "Clear selection")
+                                .clicked()
+                            {
+                                *action = Some(Action::ClearSelection);
+                            }
+                            if theme::secondary_button(ui, "Trash")
+                                .on_hover_text("Move selected items to Trash")
+                                .clicked()
+                            {
+                                *action = Some(Action::TrashSelected);
+                            }
+                            if theme::secondary_button(ui, "Move…").clicked() {
+                                *action =
+                                    Some(Action::BeginMove(selected.iter().cloned().collect()));
+                            }
+                            if theme::primary_button(ui, "Extract…").clicked() {
+                                *action = Some(Action::ExtractSelected);
+                            }
+                        });
+                    }
+                });
+            });
+        });
 }
 
 /// Render only rows intersecting the viewport. Stable path IDs keep actions
@@ -6448,9 +6951,14 @@ fn breadcrumb(ui: &mut egui::Ui, current: &str, action: &mut Option<Action>) {
                 ui.label(RichText::new("/").color(c.text_muted));
             }
             if i == last {
-                ui.label(RichText::new(label).strong().color(c.text));
+                ui.add(egui::Label::new(RichText::new(label).strong().color(c.text)).truncate())
+                    .on_hover_text(label);
             } else if ui
-                .add(egui::Button::new(RichText::new(label).color(c.accent)).frame(false))
+                .add(
+                    egui::Button::new(RichText::new(label).color(c.accent))
+                        .frame(false)
+                        .truncate(),
+                )
                 .clicked()
             {
                 *action = Some(Action::EnterDir(target.clone()));
@@ -6776,8 +7284,8 @@ fn apply_row_click(
 }
 
 /// One row in the file browser: a full-width, hover/selected-highlighted surface
-/// with a type-tinted icon, a name + secondary line, and trailing quick actions
-/// revealed on hover. The body click is *returned* (a [`RowClick`]); trailing
+/// with a type-tinted icon, centered name/detail block, and trailing quick actions.
+/// The body click is *returned* (a [`RowClick`]); trailing
 /// buttons and the right-click menu emit their actions directly.
 fn entry_row(
     ui: &mut egui::Ui,
@@ -6791,6 +7299,14 @@ fn entry_row(
     let is_dir = row.kind == EntryKind::Dir;
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            &row.path,
+        )
+    });
     // `contains_pointer` (geometric) rather than `hovered` (which a child button
     // on top would steal) so the trailing actions stay visible while you reach for
     // them, and the whole-row highlight doesn't flicker.
@@ -6804,7 +7320,7 @@ fn entry_row(
     };
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(theme::RADIUS_SM), bg);
-    if selected {
+    if selected || resp.has_focus() {
         ui.painter().rect_stroke(
             rect,
             egui::CornerRadius::same(theme::RADIUS_SM),
@@ -6827,107 +7343,60 @@ fn entry_row(
     } else {
         (theme::icon::FILE, file_tint(leaf_name(&row.path), c))
     };
-    cui.label(theme::icon_text(glyph, 18.0).color(col));
+    cui.add(egui::Label::new(theme::icon_text(glyph, 18.0).color(col)).selectable(false));
     cui.add_space(8.0);
-    cui.vertical(|ui| {
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(shown(leaf_name(&row.path)))
-                .color(c.text)
-                .size(14.5),
-        );
-        let secondary = if is_dir {
-            format!(
-                "{} item{}",
-                row.children,
-                if row.children == 1 { "" } else { "s" }
+    let name_width = (cui.available_width() - if is_dir { 48.0 } else { 88.0 }).max(40.0);
+    cui.allocate_ui_with_layout(
+        egui::vec2(name_width, theme::two_line_height(ui, 14.5)),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(name_width);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(
+                egui::Label::new(
+                    RichText::new(shown(leaf_name(&row.path)))
+                        .color(c.text)
+                        .size(14.5),
+                )
+                .selectable(false)
+                .truncate(),
             )
-        } else if searching {
-            let parent = parent_dir(&row.path);
-            if parent.is_empty() {
-                human_size(row.size)
+            .on_hover_text(&row.path);
+            let secondary = if is_dir {
+                format!(
+                    "{} item{}",
+                    row.children,
+                    if row.children == 1 { "" } else { "s" }
+                )
+            } else if searching && !parent_dir(&row.path).is_empty() {
+                format!("{} · {}", human_size(row.size), parent_dir(&row.path))
             } else {
-                format!("{} · {}", human_size(row.size), parent)
-            }
-        } else {
-            human_size(row.size)
-        };
-        ui.label(RichText::new(secondary).color(c.text_muted).small());
+                human_size(row.size)
+            };
+            ui.add(
+                egui::Label::new(RichText::new(secondary).color(c.text_muted).small())
+                    .selectable(false)
+                    .truncate(),
+            );
+        },
+    );
+    if !is_dir && theme::icon_button(&mut cui, theme::icon::EYE, "View file read-only").clicked() {
+        *action = Some(Action::ViewFile(row.path.clone()));
+    }
+    let menu = cui.menu_button("...", |ui| entry_actions(ui, row, idle, action));
+    menu.response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Actions for {}", leaf_name(&row.path)),
+        )
     });
-    // Trailing actions, added right-to-left. Shown on hover or when selected. The
-    // full set (incl. Rename / Move) also lives in the right-click menu below.
-    cui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let show = hovered || selected;
-        if is_dir {
-            if show
-                && idle
-                && theme::icon_button(ui, theme::icon::TRASH, "Move folder to Trash").clicked()
-            {
-                *action = Some(Action::Trash(row.path.clone()));
-            }
-        } else {
-            if show && idle && theme::icon_button(ui, theme::icon::TRASH, "Move to Trash").clicked()
-            {
-                *action = Some(Action::Trash(row.path.clone()));
-            }
-            if show && theme::icon_button(ui, theme::icon::SAVE, "Save as…").clicked() {
-                *action = Some(Action::SaveEntryAs(row.path.clone()));
-            }
-            if show
-                && idle
-                && theme::icon_button(ui, theme::icon::EDIT, "Check out & edit").clicked()
-            {
-                *action = Some(Action::CheckOut(row.path.clone()));
-            }
-            if show
-                && idle
-                && theme::icon_button(ui, theme::icon::EYE, "View read-only (auto-wiped on close)")
-                    .clicked()
-            {
-                *action = Some(Action::ViewFile(row.path.clone()));
-            }
-        }
-    });
-
-    // Right-click menu: the same actions, plus Rename / Move which have no hover
-    // button. egui closes the menu automatically when an item is clicked.
-    resp.context_menu(|ui| {
-        if is_dir {
-            if ui.button("Open").clicked() {
-                *action = Some(Action::EnterDir(row.path.clone()));
-            }
-        } else {
-            if ui.button("View").clicked() {
-                *action = Some(Action::ViewFile(row.path.clone()));
-            }
-            if idle && ui.button("Quick edit (in app)").clicked() {
-                *action = Some(Action::QuickEdit(row.path.clone()));
-            }
-            if idle && ui.button("Check out & edit").clicked() {
-                *action = Some(Action::CheckOut(row.path.clone()));
-            }
-            if ui.button("Save as…").clicked() {
-                *action = Some(Action::SaveEntryAs(row.path.clone()));
-            }
-        }
-        if idle {
-            ui.separator();
-            if ui.button("Rename…").clicked() {
-                *action = Some(Action::BeginRename(row.path.clone()));
-            }
-            if ui.button("Move to…").clicked() {
-                *action = Some(Action::BeginMove(vec![row.path.clone()]));
-            }
-            ui.separator();
-            if ui.button("Delete").clicked() {
-                *action = Some(Action::Trash(row.path.clone()));
-            }
-        }
-    });
+    resp.context_menu(|ui| entry_actions(ui, row, idle, action));
 
     // Report the body click; the browser resolves selection / open. Modifiers are
     // read at click time so shift / ⌘ / Ctrl emulate a real file explorer.
-    if resp.double_clicked() {
+    if resp.double_clicked() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+    {
         RowClick::Double
     } else if resp.clicked() {
         let (shift, toggle) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
@@ -6937,75 +7406,164 @@ fn entry_row(
     }
 }
 
-fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
-    let cc = theme::colors(ui);
-    theme::section_header(ui, "Contacts", |_ui| {});
-    ui.label(
-        RichText::new("Import someone's public key, then verify their safety number out-of-band (in person or over a trusted channel) before sending them anything.")
-            .color(cc.text_muted),
-    );
-    ui.add_space(10.0);
-
-    theme::card(ui, |ui| {
-        egui::CollapsingHeader::new("Add a contact")
-            .default_open(s.contacts.contacts.is_empty())
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                if theme::secondary_button(ui, "Load from .fsecpub file…").clicked() {
-                    *action = Some(Action::PreviewContactFile);
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("…or paste a public key:")
-                        .color(cc.text_muted)
-                        .small(),
-                );
-                theme::text_area(
-                    ui,
-                    &mut s.contact_paste,
-                    "-----BEGIN FILESEC PUBLIC KEY-----",
-                    4,
-                );
-                ui.add_space(6.0);
-                if theme::primary_button(ui, "Preview key…").clicked() {
-                    *action = Some(Action::PreviewContactPaste);
-                }
-                ui.label(
-                    RichText::new(
-                        "You'll see who the key belongs to and can confirm before it's added.",
-                    )
-                    .color(cc.text_muted)
-                    .small(),
-                );
-            });
-    });
-
-    if s.contacts.contacts.is_empty() {
-        theme::empty_state(
-            ui,
-            theme::icon::CONTACTS,
-            "No contacts yet",
-            "Add someone's public key above so you can send them vaults.",
-            |_ui| {},
-        );
-        return;
+/// Shared by the visible actions menu and the row's context menu.
+fn entry_actions(ui: &mut egui::Ui, row: &Row, idle: bool, action: &mut Option<Action>) {
+    let path = &row.path;
+    let mut chosen = None;
+    if row.kind == EntryKind::Dir {
+        if ui.button("Open folder").clicked() {
+            chosen = Some(Action::EnterDir(path.clone()));
+        }
+    } else {
+        if ui.button("View read-only").clicked() {
+            chosen = Some(Action::ViewFile(path.clone()));
+        }
+        if idle && ui.button("Quick edit in FileSec…").clicked() {
+            chosen = Some(Action::QuickEdit(path.clone()));
+        }
+        if idle && ui.button("Check out & edit…").clicked() {
+            chosen = Some(Action::CheckOut(path.clone()));
+        }
+        if ui.button("Save as…").clicked() {
+            chosen = Some(Action::SaveEntryAs(path.clone()));
+        }
     }
+    if idle {
+        ui.separator();
+        if ui.button("Rename…").clicked() {
+            chosen = Some(Action::BeginRename(path.clone()));
+        }
+        if ui.button("Move to folder…").clicked() {
+            chosen = Some(Action::BeginMove(vec![path.clone()]));
+        }
+        ui.separator();
+        if ui.button("Move to Trash").clicked() {
+            chosen = Some(Action::Trash(path.clone()));
+        }
+    }
+    if let Some(chosen) = chosen {
+        *action = Some(chosen);
+        ui.close();
+    }
+}
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        let contacts = s.contacts.contacts.clone();
-        for c in contacts {
-            let fpr_hex = hex(&c.fingerprint());
-            let display_name = if c.identity.name.is_empty() {
-                "(unnamed)"
-            } else {
-                &c.identity.name
-            };
+fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    let c = theme::colors(ui);
+    theme::section_header(ui, "Contacts", |_ui| {});
+    theme::page_description(
+        ui,
+        "Choose who can receive your vaults. Compare safety numbers in person or over \
+         a trusted channel before marking a contact as verified.",
+    );
+    egui::ScrollArea::vertical()
+        .id_salt("contacts_scroll")
+        .show(ui, |ui| {
             theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                egui::CollapsingHeader::new("Add a contact")
+                    .default_open(s.contacts.contacts.is_empty())
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        if theme::secondary_button(ui, "Choose public key file…").clicked() {
+                            *action = Some(Action::PreviewContactFile);
+                        }
+                        ui.label(
+                            RichText::new("Accepts .fsecpub files, or paste a public key below.")
+                                .color(c.text_muted)
+                                .small(),
+                        );
+                        theme::text_area(
+                            ui,
+                            &mut s.contact_paste,
+                            "-----BEGIN FILESEC PUBLIC KEY-----",
+                            3,
+                        );
+                        ui.add_enabled_ui(!s.contact_paste.trim().is_empty(), |ui| {
+                            if theme::primary_button(ui, "Preview contact…").clicked() {
+                                *action = Some(Action::PreviewContactPaste);
+                            }
+                        });
+                        ui.label(
+                            RichText::new("Review the identity before adding it to your contacts.")
+                                .color(c.text_muted)
+                                .small(),
+                        );
+                    });
+            });
+
+            if s.contacts.contacts.is_empty() {
+                theme::empty_state(
+                    ui,
+                    theme::icon::CONTACTS,
+                    "Secure sharing starts with a contact",
+                    "Ask someone for their FileSec public key and add it above.",
+                    |_ui| {},
+                );
+                return;
+            }
+            let verified = s
+                .contacts
+                .contacts
+                .iter()
+                .filter(|c| c.trust == Trust::Verified)
+                .count();
+            ui.label(
+                RichText::new(format!(
+                    "{} contacts · {verified} verified",
+                    s.contacts.contacts.len()
+                ))
+                .small()
+                .color(c.text_muted),
+            );
+            search_field(
+                ui,
+                &mut s.contact_search,
+                "Find a contact by name or fingerprint…",
+            );
+            ui.add_space(4.0);
+            let query = s.contact_search.trim().to_lowercase();
+            let mut contacts: Vec<_> = s
+                .contacts
+                .contacts
+                .iter()
+                .filter(|contact| {
+                    contact.identity.name.to_lowercase().contains(&query)
+                        || hex(&contact.fingerprint()).contains(&query)
+                })
+                .collect();
+            contacts.sort_by_cached_key(|contact| contact.identity.name.to_lowercase());
+            if contacts.is_empty() {
+                theme::empty_state(
+                    ui,
+                    theme::icon::CONTACTS,
+                    "No matching contacts",
+                    "Try another name or fingerprint.",
+                    |ui| {
+                        if theme::secondary_button(ui, "Clear search").clicked() {
+                            s.contact_search.clear();
+                        }
+                    },
+                );
+            }
+            for contact in contacts {
+                let fpr_hex = hex(&contact.fingerprint());
+                let name = if contact.identity.name.is_empty() {
+                    "Unnamed contact"
+                } else {
+                    &contact.identity.name
+                };
+                ui.push_id(&fpr_hex, |ui| {
+                    theme::card(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(display_name).strong().size(15.0));
-                            match c.trust {
+                            ui.label(theme::icon_text(theme::icon::CONTACTS, 22.0).color(c.accent));
+                            let width = (ui.available_width() - 110.0).max(40.0);
+                            ui.add_sized(
+                                [width, 24.0],
+                                egui::Label::new(RichText::new(name).strong().size(16.0))
+                                    .halign(egui::Align::Min)
+                                    .truncate(),
+                            )
+                            .on_hover_text(name);
+                            match contact.trust {
                                 Trust::Verified => {
                                     theme::badge(ui, "Verified", theme::BadgeKind::Ok)
                                 }
@@ -7014,40 +7572,55 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                                 }
                             };
                         });
-                        ui.label(
-                            RichText::new(c.identity.safety_number())
-                                .monospace()
-                                .color(cc.text_muted)
-                                .small(),
-                        );
-                        if let (Trust::Verified, Some(t)) = (c.trust, c.verified_at) {
+                        ui.label(RichText::new("Safety number").small().color(c.text_muted));
+                        safety_number_ui(ui, &contact.identity.safety_number());
+                        if let (Trust::Verified, Some(t)) = (contact.trust, contact.verified_at) {
                             ui.label(
-                                RichText::new(format!("verified {}", fmt_date(t)))
-                                    .color(cc.text_muted)
-                                    .small(),
+                                RichText::new(format!("Verified {}", fmt_date(t)))
+                                    .small()
+                                    .color(c.text_muted),
                             );
                         }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::icon_button(ui, theme::icon::TRASH, "Remove").clicked() {
-                            *action = Some(Action::RemoveContact(fpr_hex.clone()));
-                        }
-                        match c.trust {
-                            Trust::Verified => {
-                                if theme::secondary_button(ui, "Unverify").clicked() {
-                                    *action =
-                                        Some(Action::SetTrust(fpr_hex.clone(), Trust::Unverified));
+                        ui.horizontal(|ui| {
+                            match contact.trust {
+                                Trust::Verified => {
+                                    if theme::secondary_button(ui, "Mark unverified").clicked() {
+                                        *action = Some(Action::SetTrust(
+                                            fpr_hex.clone(),
+                                            Trust::Unverified,
+                                        ));
+                                    }
+                                }
+                                Trust::Unverified => {
+                                    if theme::primary_button(ui, "Verify contact…").clicked() {
+                                        *action = Some(Action::BeginVerify(fpr_hex.clone()));
+                                    }
                                 }
                             }
-                            Trust::Unverified => {
-                                if theme::primary_button(ui, "Verify…").clicked() {
-                                    *action = Some(Action::BeginVerify(fpr_hex.clone()));
-                                }
-                            }
-                        }
-                    });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::icon_button(ui, theme::icon::TRASH, "Remove contact…")
+                                        .clicked()
+                                    {
+                                        *action = Some(Action::RemoveContact(fpr_hex.clone()));
+                                    }
+                                },
+                            );
+                        });
+                    })
                 });
-            });
+            }
+        });
+}
+
+/// Keep safety-number groups intact while allowing a narrow window to wrap them.
+fn safety_number_ui(ui: &mut egui::Ui, number: &str) {
+    let c = theme::colors(ui);
+    ui.horizontal_wrapped(|ui| {
+        let groups: Vec<_> = number.split('-').collect();
+        for group in groups.chunks(4) {
+            ui.label(RichText::new(group.join("-")).monospace().color(c.accent));
         }
     });
 }
@@ -7055,35 +7628,24 @@ fn contacts_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
 fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) {
     let cc = theme::colors(ui);
     let pubid = s.identity.public();
-    theme::section_header(ui, "My Identity", |_ui| {});
+    theme::section_header(ui, "My identity", |_ui| {});
+    theme::page_description(ui, "Share your public key to receive vaults. Keep a backup of your private identity somewhere safe.");
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         theme::card(ui, |ui| {
-            egui::Grid::new("ident")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Name").color(cc.text_muted));
-                    ui.label(RichText::new(&s.identity.name).strong());
-                    ui.end_row();
-                    ui.label(RichText::new("Fingerprint").color(cc.text_muted));
-                    ui.label(RichText::new(pubid.fingerprint_hex()).monospace().small());
-                    ui.end_row();
-                });
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Safety number (read this aloud to verify with others):")
-                    .color(cc.text_muted)
-                    .small(),
-            );
-            ui.label(RichText::new(pubid.safety_number()).monospace().color(cc.accent));
+            ui.label(RichText::new(&s.identity.name).strong().size(18.0));
+            ui.label(RichText::new("Safety number · compare this with your contacts").color(cc.text_muted).small());
+            safety_number_ui(ui, &pubid.safety_number());
+            egui::CollapsingHeader::new("Identity fingerprint").show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(pubid.fingerprint_hex()).monospace().small()).wrap());
+            });
 
             // Post-quantum status + one-click upgrade (pqc builds only).
             #[cfg(feature = "pqc")]
             {
                 ui.add_space(10.0);
                 if s.identity.is_hybrid_capable() {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(theme::icon_text(theme::icon::SHIELD, 16.0).color(cc.accent));
                         ui.label(
                             RichText::new(
@@ -7093,7 +7655,7 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                         );
                     });
                 } else {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
                             RichText::new("Post-quantum: not enabled (classical identity)")
                                 .color(cc.text_muted),
@@ -7105,7 +7667,7 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                 }
             }
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if theme::secondary_button(ui, "Copy public key").clicked() {
                     *action = Some(Action::CopyPubKey);
                 }
@@ -7175,7 +7737,7 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                     ui.label(RichText::new("No security keys enrolled.").color(cc.text_muted));
                 } else {
                     for (i, pk) in s.passkeys.iter().enumerate() {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(theme::icon_text(theme::icon::KEY, 16.0).color(cc.text_muted));
                             ui.label(RichText::new(pk.label.as_str()).strong());
                             ui.label(
@@ -7226,7 +7788,7 @@ fn identity_ui(s: &mut Session, ui: &mut egui::Ui, action: &mut Option<Action>) 
                 }
                 ui.add_space(8.0);
                 if s.auto_unlock {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(theme::icon_text(theme::icon::LOCK_KEY, 15.0).color(cc.ok));
                         ui.colored_label(cc.ok, "Auto-unlock is on for this device.");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -7767,7 +8329,7 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
         ui.add_space(6.0);
         if s.contacts.contacts.is_empty() {
             ui.colored_label(
-                MUTED,
+                theme::colors(ui).text_muted,
                 "You have no contacts yet — add one first, or just include yourself.",
             );
         }
@@ -7830,11 +8392,15 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                         "Hybrid PQC needs a post-quantum identity — upgrade yours in “My \
                              Identity” to enable it.",
                     )
-                    .color(MUTED)
+                    .color(theme::colors(ui).text_muted)
                     .small(),
                 );
             }
-            ui.label(RichText::new(form.suite.label()).color(MUTED).small());
+            ui.label(
+                RichText::new(form.suite.label())
+                    .color(theme::colors(ui).text_muted)
+                    .small(),
+            );
             if form.suite.is_hybrid() {
                 let missing: Vec<&str> = s
                     .contacts
@@ -7853,10 +8419,13 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                     })
                     .collect();
                 if missing.is_empty() {
-                    ui.colored_label(MUTED, "Every recipient also gets post-quantum protection.");
+                    ui.colored_label(
+                        theme::colors(ui).text_muted,
+                        "Every recipient also gets post-quantum protection.",
+                    );
                 } else {
                     ui.colored_label(
-                            ERR_RED,
+                            theme::colors(ui).err,
                             format!(
                                 "⚠ No post-quantum key for: {}. Pick another suite or ask them to re-share.",
                                 missing.join(", ")
@@ -7885,14 +8454,14 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
             })
             .collect();
         if !unverified.is_empty() {
-            ui.colored_label(ERR_RED, "⚠ Unverified recipients");
+            ui.colored_label(theme::colors(ui).err, "⚠ Unverified recipients");
             ui.label(
                 RichText::new(
                     "You haven't confirmed these keys out-of-band, so anyone could have \
                      supplied them. Confirm each one for this export only, or verify it in \
                      Contacts first.",
                 )
-                .color(MUTED)
+                .color(theme::colors(ui).text_muted)
                 .small(),
             );
             for (fpr, name, safety) in &unverified {
@@ -7903,7 +8472,12 @@ fn export_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                 {
                     *action = Some(Action::ConfirmUnverifiedRecipient(fpr.clone(), confirmed));
                 }
-                ui.label(RichText::new(safety).monospace().small().color(MUTED));
+                ui.label(
+                    RichText::new(safety)
+                        .monospace()
+                        .small()
+                        .color(theme::colors(ui).text_muted),
+                );
             }
         }
         ui.add_space(6.0);
@@ -7953,26 +8527,29 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
         let fpr_hex = info.sender_fpr_hex.clone();
         match (&info.sender_name, info.verified) {
             (Some(name), true) => {
-                ui.colored_label(OK_GREEN, format!("✔ {name} (verified contact)"));
+                ui.colored_label(theme::colors(ui).ok, format!("✔ {name} (verified contact)"));
             }
             (Some(name), false) => {
                 ui.colored_label(
-                    WARN_AMBER,
+                    theme::colors(ui).warn,
                     format!("● {name} — a known but UNVERIFIED contact"),
                 );
                 ui.label(
                     RichText::new("Verify their safety number before you trust this content.")
-                        .color(MUTED)
+                        .color(theme::colors(ui).text_muted)
                         .small(),
                 );
             }
             (None, _) => {
-                ui.colored_label(ERR_RED, "● Unknown sender — not in your contacts");
+                ui.colored_label(
+                    theme::colors(ui).err,
+                    "● Unknown sender — not in your contacts",
+                );
                 ui.label(
                     RichText::new(
                         "Add them as a contact, then verify their safety number out-of-band.",
                     )
-                    .color(MUTED)
+                    .color(theme::colors(ui).text_muted)
                     .small(),
                 );
             }
@@ -7981,7 +8558,7 @@ fn import_info_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<
             RichText::new(format!("fingerprint: {}", info.sender_fpr_hex))
                 .monospace()
                 .small()
-                .color(MUTED),
+                .color(theme::colors(ui).text_muted),
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -8042,7 +8619,7 @@ fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
         ui.label(
             RichText::new(preview.pubid.safety_number())
                 .monospace()
-                .color(ACCENT),
+                .color(theme::colors(ui).accent),
         );
         ui.add_space(8.0);
         ui.separator();
@@ -8052,18 +8629,18 @@ fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
                     RichText::new(
                         "New contact. You'll verify their safety number before trusting them.",
                     )
-                    .color(MUTED),
+                    .color(theme::colors(ui).text_muted),
                 );
             }
             PreviewStatus::Existing { verified: true } => {
                 ui.colored_label(
-                    OK_GREEN,
+                    theme::colors(ui).ok,
                     "Already a verified contact — nothing will change.",
                 );
             }
             PreviewStatus::Existing { verified: false } => {
                 ui.colored_label(
-                    MUTED,
+                    theme::colors(ui).text_muted,
                     "Already a contact (unverified) — nothing will change.",
                 );
             }
@@ -8072,14 +8649,14 @@ fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
                 verified: true,
             } => {
                 ui.colored_label(
-                    ERR_RED,
+                    theme::colors(ui).err,
                     format!("⚠ This renames a VERIFIED contact: \"{old}\" → \"{name}\"."),
                 );
                 ui.label(
                         RichText::new(
                             "The keys are identical, so verification still holds — but confirm you expected this rename.",
                         )
-                        .color(MUTED)
+                        .color(theme::colors(ui).text_muted)
                         .small(),
                     );
             }
@@ -8088,13 +8665,13 @@ fn contact_preview_window(s: &mut Session, ctx: &egui::Context, action: &mut Opt
                 verified: false,
             } => {
                 ui.colored_label(
-                    WARN_AMBER,
+                    theme::colors(ui).warn,
                     format!("Display name will change: \"{old}\" → \"{name}\"."),
                 );
             }
             PreviewStatus::SelfKey => {
                 ui.colored_label(
-                    ERR_RED,
+                    theme::colors(ui).err,
                     "⚠ This is your OWN public key — you don't need to add yourself.",
                 );
             }
@@ -8143,12 +8720,16 @@ fn verify_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
                 RichText::new(
                     "Compare this safety number with the contact over a trusted channel — in person, a video call, or a line you already trust. Mark verified only once both sides match exactly.",
                 )
-                .color(MUTED),
+                .color(theme::colors(ui).text_muted),
             );
         ui.add_space(8.0);
         ui.label("Their safety number should read:");
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&form.safety_number).monospace().color(ACCENT));
+            ui.label(
+                RichText::new(&form.safety_number)
+                    .monospace()
+                    .color(theme::colors(ui).accent),
+            );
             if ui.small_button("Copy").clicked() {
                 *action = Some(Action::CopyVerifySafetyNumber);
             }
@@ -8162,9 +8743,9 @@ fn verify_window(s: &mut Session, ctx: &egui::Context, action: &mut Option<Actio
         );
         if !form.input.trim().is_empty() {
             if typed_match {
-                ui.colored_label(OK_GREEN, "✔ Matches.");
+                ui.colored_label(theme::colors(ui).ok, "✔ Matches.");
             } else {
-                ui.colored_label(ERR_RED, "✗ Does not match — do not verify.");
+                ui.colored_label(theme::colors(ui).err, "✗ Does not match — do not verify.");
             }
         }
         ui.add_space(4.0);
@@ -9513,6 +10094,394 @@ mod ui_smoke {
         let _ = ctx.end_pass();
     }
 
+    fn app_frame(ctx: &egui::Context, app: &mut App, input: egui::RawInput) -> egui::FullOutput {
+        let mut frame = eframe::Frame::_new_kittest();
+        ctx.run(input, |ctx| eframe::App::update(app, ctx, &mut frame))
+    }
+
+    fn minimum_window_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 520.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn assert_buttons_fit(output: &egui::FullOutput) {
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree");
+        for (_, node) in &tree.nodes {
+            if node.role() == egui::accesskit::Role::Button {
+                if let Some(rect) = node.bounds() {
+                    assert!(
+                        rect.x0 >= 0.0 && rect.x1 <= 720.5,
+                        "Button {:?} falls outside the window: {rect:?}",
+                        node.label()
+                    );
+                }
+            }
+        }
+    }
+
+    fn accessible_bounds(
+        output: &egui::FullOutput,
+        label: &str,
+        button: bool,
+    ) -> egui::accesskit::Rect {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                (node.label() == Some(label) || node.value() == Some(label))
+                    && (node.role() == egui::accesskit::Role::Button) == button
+            })
+            .unwrap_or_else(|| panic!("Missing accessible element: {label}"))
+            .1
+            .bounds()
+            .unwrap()
+    }
+
+    fn pointer_input(pos: egui::Pos2, time: f64, pressed: Option<bool>) -> egui::RawInput {
+        let mut input = minimum_window_input();
+        input.time = Some(time);
+        input.events.push(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = pressed {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        input
+    }
+
+    fn vault_test_app() -> (App, std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "filesec-ui-regression-{}",
+            hex(&filesec_core::secret::random_array::<8>().unwrap())
+        ));
+        let store = Arc::new(Store::at_with_secure_storage(&dir, None).unwrap());
+        let mut app = exit_test_app();
+        let identity = app.ident_arc().unwrap();
+        let vault_id = new_vault_id().unwrap();
+        let mut vault = Vault::new("Centering example", 0);
+        vault
+            .add_file("Documents/notes.txt", b"hello".to_vec(), None, None)
+            .unwrap();
+        vault
+            .add_file("report.txt", b"report".to_vec(), None, None)
+            .unwrap();
+        store.save_vault(&identity, &vault_id, &vault).unwrap();
+        let reader = store.open_vault(&identity, &vault_id).unwrap();
+        if let State::Unlocked(s) = &mut app.state {
+            s.registry.upsert(VaultMeta {
+                id: vault_id.clone(),
+                name: reader.name().into(),
+                created_at: 0,
+                modified_at: 0,
+                file_count: reader.file_count() as u64,
+                total_size: reader.total_size(),
+            });
+            store.save_registry(&identity, &s.registry).unwrap();
+            s.open = Some(OpenVault {
+                id: vault_id.clone(),
+                reader,
+            });
+        }
+        app.store = Some(store);
+        (app, dir, vault_id)
+    }
+
+    #[test]
+    fn selection_keeps_rows_stationary_and_double_click_opens_the_same_folder() {
+        let ctx = test_ctx();
+        ctx.enable_accesskit();
+        let (mut app, dir, _) = vault_test_app();
+        app_frame(&ctx, &mut app, minimum_window_input());
+        let output = app_frame(&ctx, &mut app, minimum_window_input());
+        let before = accessible_bounds(&output, "Documents", true);
+        let file_before = accessible_bounds(&output, "report.txt", true);
+        let title = accessible_bounds(&output, "Documents", false);
+        let detail = accessible_bounds(&output, "1 item", false);
+        assert!(
+            ((title.y0 + detail.y1) / 2.0 - (before.y0 + before.y1) / 2.0).abs() <= 1.0,
+            "File names and details must be centered within their row"
+        );
+        let pos = egui::pos2(
+            (before.x0 + 60.0) as f32,
+            ((before.y0 + before.y1) / 2.0) as f32,
+        );
+        app_frame(&ctx, &mut app, pointer_input(pos, 1.0, None));
+        app_frame(&ctx, &mut app, pointer_input(pos, 1.02, Some(true)));
+        app_frame(&ctx, &mut app, pointer_input(pos, 1.04, Some(false)));
+        assert!(
+            matches!(&app.state, State::Unlocked(s) if s.selected.contains("Documents")),
+            "Row: {before:?}; point: {pos:?}; selection: {:?}; current folder: {:?}",
+            match &app.state {
+                State::Unlocked(s) => Some(&s.selected),
+                _ => None,
+            },
+            match &app.state {
+                State::Unlocked(s) => Some(&s.current_dir),
+                _ => None,
+            }
+        );
+        let output = app_frame(&ctx, &mut app, pointer_input(pos, 1.05, None));
+        assert_eq!(before, accessible_bounds(&output, "Documents", true));
+        assert_eq!(file_before, accessible_bounds(&output, "report.txt", true));
+        assert_buttons_fit(&output);
+        app.set_toast("Saved successfully.", false);
+        app_frame(&ctx, &mut app, pointer_input(pos, 1.052, None));
+        let output = app_frame(&ctx, &mut app, pointer_input(pos, 1.054, None));
+        let notification = accessible_bounds(&output, "Dismiss notification", true);
+        let extract = accessible_bounds(&output, "Extract…", true);
+        assert!(
+            notification.y1 + 10.0 <= extract.y0,
+            "Notifications must not cover selection actions"
+        );
+        app.toast = None;
+        app.dispatch(Action::ClearSelection, &ctx);
+        let output = app_frame(&ctx, &mut app, pointer_input(pos, 1.06, None));
+        assert_eq!(before, accessible_bounds(&output, "Documents", true));
+        app_frame(&ctx, &mut app, pointer_input(pos, 1.10, Some(true)));
+        app_frame(&ctx, &mut app, pointer_input(pos, 1.12, Some(false)));
+        assert!(
+            matches!(&app.state, State::Unlocked(s) if s.current_dir == "Documents"),
+            "The second click must still hit the original folder"
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn vault_deletion_requires_the_dialogs_explicit_confirmation() {
+        let ctx = test_ctx();
+        ctx.enable_accesskit();
+        let (mut app, dir, vault_id) = vault_test_app();
+        if let State::Unlocked(s) = &mut app.state {
+            s.open = None;
+        }
+        app.dispatch(Action::ConfirmDeleteVault, &ctx);
+        assert!(
+            app.job.is_none(),
+            "A confirmation without a pending dialog must do nothing"
+        );
+        app.dispatch(Action::RequestDeleteVault(vault_id.clone()), &ctx);
+        assert!(
+            app.job.is_none(),
+            "Requesting deletion must not start disk work"
+        );
+        app_frame(&ctx, &mut app, minimum_window_input());
+        let mut escape = minimum_window_input();
+        escape.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        app_frame(&ctx, &mut app, escape);
+        assert!(
+            matches!(&app.state, State::Unlocked(s) if s.delete_vault.is_none() && s.registry.vaults.len() == 1)
+        );
+        assert!(app.job.is_none());
+        assert!(app
+            .store
+            .as_ref()
+            .unwrap()
+            .open_vault(&app.ident_arc().unwrap(), &vault_id)
+            .is_ok());
+        app.dispatch(Action::RequestDeleteVault(vault_id.clone()), &ctx);
+        app_frame(&ctx, &mut app, minimum_window_input());
+        let outside = egui::pos2(710.0, 510.0);
+        app_frame(&ctx, &mut app, pointer_input(outside, 1.0, None));
+        app_frame(&ctx, &mut app, pointer_input(outside, 1.02, Some(true)));
+        app_frame(&ctx, &mut app, pointer_input(outside, 1.04, Some(false)));
+        assert!(
+            matches!(&app.state, State::Unlocked(s) if s.delete_vault.is_none() && s.registry.vaults.len() == 1)
+        );
+        assert!(
+            app.job.is_none(),
+            "Clicking outside the dialog must cancel deletion"
+        );
+        app.dispatch(Action::RequestDeleteVault(vault_id.clone()), &ctx);
+        let output = app_frame(&ctx, &mut app, minimum_window_input());
+        let confirm = accessible_bounds(&output, "Delete vault permanently", true);
+        let pos = egui::pos2(
+            ((confirm.x0 + confirm.x1) / 2.0) as f32,
+            ((confirm.y0 + confirm.y1) / 2.0) as f32,
+        );
+        app_frame(&ctx, &mut app, pointer_input(pos, 2.0, None));
+        app_frame(&ctx, &mut app, pointer_input(pos, 2.02, Some(true)));
+        app_frame(&ctx, &mut app, pointer_input(pos, 2.04, Some(false)));
+        let job = app
+            .job
+            .take()
+            .expect("Explicit confirmation starts deletion");
+        let report = job
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            matches!(&report.outcome, Outcome::Deleted { .. }),
+            "Deletion failed: {:?}",
+            report.toast
+        );
+        app.apply(report);
+        assert!(
+            matches!(&app.state, State::Unlocked(s) if s.registry.vaults.is_empty() && s.delete_vault.is_none())
+        );
+        assert!(app
+            .store
+            .as_ref()
+            .unwrap()
+            .open_vault(&app.ident_arc().unwrap(), &vault_id)
+            .is_err());
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn vault_text_and_notifications_are_vertically_centered_with_their_controls() {
+        let ctx = test_ctx();
+        ctx.enable_accesskit();
+        let (mut app, dir, _) = vault_test_app();
+        if let State::Unlocked(s) = &mut app.state {
+            s.open = None;
+        }
+        let mut input = minimum_window_input();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1040.0, 700.0),
+        ));
+        app_frame(&ctx, &mut app, input.clone());
+        let output = app_frame(&ctx, &mut app, input.clone());
+        let title = accessible_bounds(&output, "Centering example", false);
+        let details = accessible_bounds(&output, "2 files · 11 B · Updated 1970-01-01", false);
+        let open = accessible_bounds(&output, "Open vault", true);
+        let text_center = (title.y0 + details.y1) / 2.0;
+        assert!(
+            (text_center - (open.y0 + open.y1) / 2.0).abs() <= 1.0,
+            "Text block and buttons must share a center: text={text_center}, button={open:?}"
+        );
+        app.set_toast("A notification with enough text to wrap onto more than one line and keep both icons centered.", false);
+        app_frame(&ctx, &mut app, input.clone());
+        let output = app_frame(&ctx, &mut app, input);
+        let text = accessible_bounds(&output, "A notification with enough text to wrap onto more than one line and keep both icons centered.", false);
+        let close = accessible_bounds(&output, "Dismiss notification", true);
+        assert!(
+            ((text.y0 + text.y1) / 2.0 - (close.y0 + close.y1) / 2.0).abs() <= 1.0,
+            "Notification text and close button must share a center: {text:?}, {close:?}"
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_names_keep_page_actions_inside_the_minimum_window() {
+        let ctx = test_ctx();
+        ctx.enable_accesskit();
+        let mut app = exit_test_app();
+        if let State::Unlocked(s) = &mut app.state {
+            s.registry.vaults.push(VaultMeta {
+                id: "sample".into(),
+                name: "A very long vault name ".repeat(10),
+                created_at: 0,
+                modified_at: 0,
+                file_count: 12,
+                total_size: 1024,
+            });
+            s.contacts.upsert(
+                Identity::generate("Long contact name ".repeat(10), 0)
+                    .unwrap()
+                    .public(),
+                0,
+            );
+        }
+        for nav in [Nav::Vaults, Nav::Contacts, Nav::Identity, Nav::Settings] {
+            if let State::Unlocked(s) = &mut app.state {
+                s.nav = nav;
+            }
+            assert_buttons_fit(&app_frame(&ctx, &mut app, minimum_window_input()));
+        }
+        if let State::Unlocked(s) = &mut app.state {
+            s.nav = Nav::Vaults;
+            s.show_new_vault = true;
+        }
+        assert_buttons_fit(&app_frame(&ctx, &mut app, minimum_window_input()));
+    }
+
+    #[test]
+    fn an_expiring_toast_does_not_swallow_navigation_and_errors_stay_visible() {
+        let ctx = test_ctx();
+        ctx.enable_accesskit();
+        let mut app = exit_test_app();
+        app.set_toast("Saved", false);
+        let mut input = minimum_window_input();
+        input.time = Some(0.0);
+        let output = app_frame(&ctx, &mut app, input);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let contacts = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Contacts"))
+            .expect("Contacts navigation")
+            .1
+            .bounds()
+            .unwrap();
+        let pos = egui::pos2(
+            ((contacts.x0 + contacts.x1) / 2.0) as f32,
+            ((contacts.y0 + contacts.y1) / 2.0) as f32,
+        );
+        // Move, press, and release in separate frames, as a native pointer does.
+        let mut input = minimum_window_input();
+        input.time = Some(5.8);
+        input.events = vec![egui::Event::PointerMoved(pos)];
+        app_frame(&ctx, &mut app, input);
+        let mut input = minimum_window_input();
+        input.time = Some(5.9);
+        input.events = vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        app_frame(&ctx, &mut app, input);
+        let mut input = minimum_window_input();
+        input.time = Some(6.1);
+        input.events = vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        app_frame(&ctx, &mut app, input);
+        assert!(matches!(&app.state, State::Unlocked(s) if s.nav == Nav::Contacts));
+        assert!(app.toast.is_none());
+        app.toast = Some(Toast {
+            msg: "Action failed. Please try again.".into(),
+            error: true,
+            shown_at: Some(0.0),
+        });
+        let mut input = minimum_window_input();
+        input.time = Some(60.0);
+        app_frame(&ctx, &mut app, input);
+        assert!(
+            app.toast.is_some(),
+            "Errors need to remain available to read and dismiss"
+        );
+    }
+
     #[test]
     fn passphrase_policy_rejects_short_and_weak_inputs() {
         assert_eq!(
@@ -9832,7 +10801,7 @@ mod ui_smoke {
         });
         // Overlays that own the whole context (Area + Modal).
         ctx.begin_pass(egui::RawInput::default());
-        let _ = crate::theme::toast(&ctx, "Saved.", false);
+        let _ = crate::theme::toast(&ctx, "Saved.", false, 16.0);
         let _ = crate::theme::modal(&ctx, "Dialog", |ui| ui.label("body"));
         let _ = ctx.end_pass();
     }
@@ -9974,6 +10943,45 @@ mod ui_smoke {
         move_window(&mut s, &ctx, &mut action);
         let _ = ctx.end_pass();
         s.move_form = None;
+
+        // Exercise the actual application layout at its minimum window size,
+        // including selection/trash actions and the search keyboard shortcut.
+        ctx.enable_accesskit();
+        let mut app = exit_test_app();
+        app.state = State::Unlocked(Box::new(s));
+        for trash in [false, true] {
+            if let State::Unlocked(s) = &mut app.state {
+                s.show_trash = trash;
+                s.selected.insert("folder".into());
+            }
+            assert_buttons_fit(&app_frame(&ctx, &mut app, minimum_window_input()));
+        }
+        if let State::Unlocked(s) = &mut app.state {
+            s.show_trash = false;
+        }
+        let mut input = minimum_window_input();
+        input.modifiers = egui::Modifiers::COMMAND;
+        input.events.push(egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        app_frame(&ctx, &mut app, input);
+        let mut input = minimum_window_input();
+        input.events.push(egui::Event::Text("a".into()));
+        assert_buttons_fit(&app_frame(&ctx, &mut app, input));
+        let State::Unlocked(session) = app.state else {
+            panic!("session")
+        };
+        let mut s = *session;
+        assert_eq!(s.file_search, "a");
+        assert!(
+            s.selected.is_empty(),
+            "A new search must clear the previous selection"
+        );
+        s.file_search.clear();
 
         // Empty-vault state.
         let empty_vid = new_vault_id().unwrap();

@@ -55,12 +55,12 @@ impl Colors {
             border: Color32::from_rgb(0x2c, 0x31, 0x3c),
             text: Color32::from_rgb(0xe6, 0xe8, 0xed),
             text_muted: Color32::from_rgb(0x8a, 0x90, 0x9c),
-            accent: Color32::from_rgb(0x4c, 0x8d, 0xf0),
+            accent: Color32::from_rgb(0x6d, 0xa5, 0xff),
             accent_hi: Color32::from_rgb(0x6a, 0xa3, 0xf5),
             ok: Color32::from_rgb(0x3f, 0xb9, 0x68),
             warn: Color32::from_rgb(0xd9, 0xa3, 0x3d),
             err: Color32::from_rgb(0xe0, 0x5d, 0x5d),
-            on_accent: Color32::WHITE,
+            on_accent: Color32::from_rgb(0x0c, 0x1c, 0x34),
         }
     }
 
@@ -76,8 +76,8 @@ impl Colors {
             text_muted: Color32::from_rgb(0x5e, 0x65, 0x73),
             accent: Color32::from_rgb(0x2f, 0x6f, 0xe0),
             accent_hi: Color32::from_rgb(0x1f, 0x5f, 0xd6),
-            ok: Color32::from_rgb(0x2e, 0x9e, 0x55),
-            warn: Color32::from_rgb(0xb5, 0x7e, 0x16),
+            ok: Color32::from_rgb(0x20, 0x76, 0x3e),
+            warn: Color32::from_rgb(0x8a, 0x5b, 0x09),
             err: Color32::from_rgb(0xcf, 0x44, 0x44),
             on_accent: Color32::WHITE,
         }
@@ -117,7 +117,7 @@ pub const WARN_AMBER: Color32 = Color32::from_rgb(0xd9, 0xa3, 0x3d);
 pub const MUTED: Color32 = Color32::from_rgb(0x80, 0x87, 0x93);
 pub const ACCENT: Color32 = Color32::from_rgb(0x3f, 0x83, 0xe6);
 
-pub const RADIUS: u8 = 8;
+pub const RADIUS: u8 = 10;
 pub const RADIUS_SM: u8 = 6;
 pub const SIDEBAR_W: f32 = 216.0;
 
@@ -245,7 +245,7 @@ fn apply(style: &mut egui::Style, c: &Colors) {
     sp.button_padding = Vec2::new(12.0, 7.0);
     sp.window_margin = Margin::same(14);
     sp.menu_margin = Margin::same(8);
-    sp.interact_size = Vec2::new(0.0, 30.0);
+    sp.interact_size = Vec2::new(0.0, 34.0);
     sp.indent = 18.0;
 
     // Type scale — larger and cleaner than the tiny egui defaults.
@@ -371,6 +371,14 @@ pub fn icon_text(glyph: &str, size: f32) -> egui::RichText {
 // Widget helpers
 // ---------------------------------------------------------------------------
 
+/// The actual height of a title and a small detail line, separated by two points.
+/// Horizontal rows need this height up front to center the whole text block.
+pub fn two_line_height(ui: &egui::Ui, title_size: f32) -> f32 {
+    ui.fonts(|fonts| fonts.row_height(&egui::FontId::proportional(title_size)))
+        + ui.text_style_height(&egui::TextStyle::Small)
+        + 2.0
+}
+
 /// A bordered, rounded, padded surface. Use to group list rows and form sections.
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let c = colors(ui);
@@ -378,12 +386,16 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .fill(c.surface)
         .stroke(egui::Stroke::new(1.0_f32, c.border))
         .corner_radius(egui::CornerRadius::same(RADIUS))
-        .inner_margin(egui::Margin::same(12))
+        .inner_margin(egui::Margin::same(16))
         .outer_margin(egui::Margin {
             bottom: 8,
             ..Default::default()
         })
-        .show(ui, add)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), add)
+                .inner
+        })
         .inner
 }
 
@@ -420,7 +432,11 @@ pub fn danger_button(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Respo
     ui.add(
         egui::Button::new(
             egui::RichText::new(label.into())
-                .color(Color32::WHITE)
+                .color(if ui.visuals().dark_mode {
+                    c.on_accent
+                } else {
+                    Color32::WHITE
+                })
                 .strong(),
         )
         .fill(c.err)
@@ -535,11 +551,23 @@ pub fn badge(ui: &mut egui::Ui, text: impl Into<String>, kind: BadgeKind) -> egu
 
 /// A screen heading with a right-aligned action area.
 pub fn section_header(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
+    if ui.available_width() < 600.0 {
         ui.heading(title);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
-    });
-    ui.add_space(6.0);
+        ui.horizontal_wrapped(right);
+    } else {
+        ui.horizontal(|ui| {
+            ui.heading(title);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+        });
+    }
+    ui.add_space(8.0);
+}
+
+/// Supporting copy below a page heading, with a consistent reading rhythm.
+pub fn page_description(ui: &mut egui::Ui, text: impl Into<String>) {
+    let c = colors(ui);
+    ui.add(egui::Label::new(egui::RichText::new(text.into()).color(c.text_muted)).wrap());
+    ui.add_space(16.0);
 }
 
 /// A centered placeholder for empty lists: muted icon, title, subtitle, and a CTA.
@@ -551,7 +579,7 @@ pub fn empty_state(
     cta: impl FnOnce(&mut egui::Ui),
 ) {
     let c = colors(ui);
-    ui.add_space(48.0);
+    ui.add_space((ui.available_height() * 0.12).clamp(12.0, 48.0));
     ui.vertical_centered(|ui| {
         ui.label(icon_text(glyph, 44.0).color(c.text_muted));
         ui.add_space(10.0);
@@ -566,8 +594,15 @@ pub fn empty_state(
 /// A borderless icon button tinted with the muted text colour. `hover` is its tooltip.
 pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hover: &str) -> egui::Response {
     let c = colors(ui);
-    ui.add(egui::Button::new(icon_text(glyph, 15.0).color(c.text_muted)).frame(false))
-        .on_hover_text(hover)
+    let response = ui.add(
+        egui::Button::new(icon_text(glyph, 17.0).color(c.text_muted))
+            .frame(false)
+            .min_size(egui::vec2(32.0, 32.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hover)
+    });
+    response.on_hover_text(hover)
 }
 
 /// An accent-tinted banner (rounded, soft fill) for transient status messages.
@@ -615,16 +650,19 @@ pub fn modal<R>(
                 .shadow(shadow(8, 28, 140)),
         )
         .show(ctx, |ui| {
-            ui.set_max_width(460.0);
+            ui.set_max_width((ctx.screen_rect().width() - 64.0).clamp(160.0, 460.0));
             ui.label(egui::RichText::new(title).size(18.0).strong());
             ui.add_space(10.0);
-            add(ui)
+            egui::ScrollArea::vertical()
+                .max_height((ctx.screen_rect().height() - 140.0).max(100.0))
+                .show(ui, add)
+                .inner
         });
     (resp.should_close(), resp.inner)
 }
 
 /// A floating toast anchored bottom-right. Returns `true` if the user dismissed it.
-pub fn toast(ctx: &egui::Context, msg: &str, error: bool) -> bool {
+pub fn toast(ctx: &egui::Context, msg: &str, error: bool, bottom_inset: f32) -> bool {
     let c = if ctx.theme() == egui::Theme::Dark {
         Colors::dark()
     } else {
@@ -634,9 +672,10 @@ pub fn toast(ctx: &egui::Context, msg: &str, error: bool) -> bool {
     let mut dismissed = false;
     egui::Area::new(egui::Id::new("filesec_toast"))
         .order(egui::Order::Foreground)
-        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -bottom_inset))
         .interactable(true)
         .show(ctx, |ui| {
+            ui.set_max_width((ctx.screen_rect().width() - 64.0).clamp(160.0, 420.0));
             egui::Frame::NONE
                 .fill(c.surface_hi)
                 .stroke(egui::Stroke::new(1.0_f32, accent))
@@ -649,17 +688,22 @@ pub fn toast(ctx: &egui::Context, msg: &str, error: bool) -> bool {
                             icon_text(if error { icon::WARNING } else { icon::CHECK }, 16.0)
                                 .color(accent),
                         );
-                        ui.label(egui::RichText::new(msg).color(c.text));
-                        ui.add_space(4.0);
-                        if ui
-                            .add(
-                                egui::Button::new(icon_text(icon::CLOSE, 13.0).color(c.text_muted))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
-                            dismissed = true;
-                        }
+                        let text_width = (ui.available_width() - 44.0).max(80.0);
+                        let text = ui.painter().layout(
+                            msg.to_owned(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            c.text,
+                            text_width,
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_width, text.size().y),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(text_width);
+                                ui.label(text);
+                            },
+                        );
+                        dismissed = icon_button(ui, icon::CLOSE, "Dismiss notification").clicked();
                     });
                 });
         });
