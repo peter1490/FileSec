@@ -73,7 +73,7 @@ pqc = ["filesec-core/pqc"]
 # Direct peer-to-peer network transfer (the `net` module: sockets, NAT-PMP port
 # mapping, and the Transfer UI). Forwards the core handshake/record layer. NAT
 # traversal is a small vendored NAT-PMP client, so this pulls **no new
-# dependencies** and stays on the 1.86 MSRV. Off by default, so the standard
+# dependencies** and stays on the 1.87 MSRV. Off by default, so the standard
 # build links no networking code.
 net = ["filesec-core/net"]
 # Opt-in hardware passkey unlock (FIDO2 `hmac-secret`). Pulls a USB-HID FIDO2
@@ -99,19 +99,19 @@ filesec-core = { path = "../filesec-core" }
 # Cross-process advisory file locks (flock / LockFileEx) and free-space
 # queries. Enforces a single active writer per data directory (audit FS-05).
 # Pure Rust over rustix 1.x / windows-sys 0.59, both already in the graph;
-# declares a 1.75 MSRV, so it stays within the 1.86 toolchain.
+# declares a 1.75 MSRV, so it stays within the 1.87 toolchain.
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 rfd = "0.17.2"
 serde = { version = "1.0.228", features = ["derive"] }
 walkdir = "2.5.0"
-# Pinned to match filesec-core (Rust 1.86 MSRV); wipes passphrases held in UI state.
+# Pinned to match filesec-core (Rust 1.87 MSRV); wipes passphrases held in UI state.
 zeroize = "1.8.2"
 
-# Hardware passkey backend (opt-in via the `passkey` feature). Pinned to 3.5.7:
-# 3.5.8+ call `u*::is_multiple_of` (stabilized in Rust 1.87) in their hmac-secret
-# code and so won't build on our 1.86 MSRV. 3.5.7 has the full hmac-secret API
-# and uses `ring` for crypto, so getrandom stays 0.2. Vendors hidapi (C) and is
-# compiled only when the feature is enabled.
+# Hardware passkey backend (opt-in via the `passkey` feature). Keep the
+# validated 3.5.7 client while the compiler floor moves to Rust 1.87 for the
+# ctutils security fix. A newer USB-HID client needs separate hardware testing.
+# It uses `ring` for crypto, so getrandom stays 0.2, and only this optional
+# feature compiles the vendored C hidapi library.
 ctap-hid-fido2 = { version = "=3.5.7", optional = true }
 
 # OS-keychain backend (opt-in via the `keyring` feature). 3.6 declares a 1.75
@@ -119,7 +119,7 @@ ctap-hid-fido2 = { version = "=3.5.7", optional = true }
 # macOS gets `security-framework`, Windows `windows-sys`, Linux the D-Bus Secret
 # Service (which drags in `zbus` — already required on Linux by rfd/directories,
 # so it doesn't raise the Linux MSRV further; the macOS/Windows hosts never
-# compile it). 4.x needs Rust 1.88, so it is held at 3.6 for the 1.86 MSRV.
+# compile it). 4.x needs Rust 1.88, so it is held at 3.6 for the 1.87 MSRV.
 [target.'cfg(target_os = "macos")'.dependencies.keyring]
 version = "3.6"
 optional = true
@@ -143,7 +143,7 @@ features = ["sync-secret-service", "crypto-rust"]
 # Embeds the app icon into the Windows `filesec.exe` (see build.rs).
 # `default-features = false` drops winresource's `toml` feature, leaving it
 # dependency-free — no toml/winnow MSRV exposure; it declares no rust-version
-# and builds on the 1.86 MSRV. The build script no-ops unless targeting Windows,
+# and builds on the 1.87 MSRV. The build script no-ops unless targeting Windows,
 # so the macOS/Linux builds are unaffected. Installer-side icon: packaging/windows.
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }

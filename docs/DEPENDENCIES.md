@@ -22,13 +22,14 @@ decision with an owner, not a permanent waiver:
 | RUSTSEC-2026-0194, RUSTSEC-2026-0195 | quick-xml 0.39.4 | DoS (vulnerability) | Linux only, via accesskit's AT-SPI backend; parses the local accessibility bus, not untrusted files or network input | @peter1490 | 2027-01-31 | egui/accesskit upgrade (quick-xml ≥ 0.41) |
 | RUSTSEC-2026-0009 | time 0.3.41 | DoS (vulnerability) | `passkey` feature only (x509 certificate dates built from ASN.1 numbers); the RFC 2822 parser is never called | @peter1490 | 2027-01-31 | MSRV ≥ 1.88, then `cargo update -p time` |
 | RUSTSEC-2026-0192 | ttf-parser 0.25.1 | unmaintained | egui 0.32 text stack; no maintained drop-in | @peter1490 | 2027-01-31 | egui upgrade replacing ttf-parser |
+| RUSTSEC-2026-0370, RUSTSEC-2026-0371, RUSTSEC-2026-0372 | zvariant 5.12.0, zbus_names 4.3.2, zvariant_derive 5.12.0 | unmaintained | Standalone crates merged into zbus 6; no patched standalone releases. Linux AT-SPI dependencies still require zbus 5, outside FileSec container/network parsers | @peter1490 | 2027-01-31 | accesskit/AT-SPI migration to zbus 6 |
 | RUSTSEC-2024-0436 | paste 1.0.15 | unmaintained (audit-only) | compile-time proc-macro reachable only via wgpu-hal/metal, which no shipped build compiles | @peter1490 | 2027-01-31 | eframe/wgpu upgrade |
 
 ## Upgrade plan (compiler and UI stack)
 
 Every accepted advisory above, the winit Windows multi-monitor workaround, and
 `keyring` 3.x (whose Windows backend cannot request local-machine credential
-persistence) trace back to one constraint: the **Rust 1.86 MSRV** pins eframe/egui
+persistence) trace back to one constraint: the **Rust 1.87 MSRV** pins eframe/egui
 0.32, winit 0.30, accesskit, `time` < 0.3.47, `keyring` 3.6, and
 `ctap-hid-fido2` 3.5.7. Retiring them is one planned change, not a series of
 exceptions:
@@ -46,8 +47,33 @@ exceptions:
 4. **`keyring` 4.x**: re-evaluate whether Windows credentials can be stored with
    `CRED_PERSIST_LOCAL_MACHINE`; only then claim device binding on Windows again
    (see `autounlock.rs`).
-5. Remove each retired ID from `deny.toml` and `.cargo/audit.toml`; the
+5. **Migrate the Linux AT-SPI D-Bus stack to zbus 6** once upstream accesskit
+   supports its merged `wire` and `names` modules. Do not force a zbus major
+   version into dependencies that still use the zbus 5 APIs. The three October
+   maintenance notices describe this upstream consolidation, not a newly
+   reported runtime vulnerability.
+6. Remove each retired ID from `deny.toml` and `.cargo/audit.toml`; the
    unsuppressed report must then show no accepted exceptions for them.
 
 Until then, each review-by date forces a fresh look at whether the reachability
 argument still holds and whether a patched release now fits the toolchain.
+
+## October 2026 cryptography dependency fix
+
+Both lockfiles now select `ctutils` 0.4.4 instead of 0.4.2, fixing
+[RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385.html).
+This transitive dependency is used by the ML-KEM/ML-DSA feature graph. The fix
+removes secret-dependent branches in mask generation and certain comparisons;
+it is not an advisory exception. The patched crate requires Rust 1.87, so the
+workspace minimum and the macOS/Windows minimum-toolchain CI checks move to
+1.87 together. The withdrawn `clipboard-win` 5.4.1 release is also replaced by
+5.4.3 in the desktop lockfile. Linux keeps its existing 1.88 minimum. Vault and identity formats
+are unchanged.
+
+The separate maintenance notices for
+[zvariant](https://rustsec.org/advisories/RUSTSEC-2026-0370.html),
+[zbus_names](https://rustsec.org/advisories/RUSTSEC-2026-0371.html), and
+[zvariant_derive](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) are
+tracked in the table above with an owner, expiry date, and upstream migration
+condition. The [upstream consolidation announcement](https://github.com/z-galaxy/zbus/issues/2043)
+explains why there are no patched standalone releases.

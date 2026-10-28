@@ -23,8 +23,14 @@ ignore = [
     # via egui/accesskit, not untrusted input.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # Maintenance-only: standalone D-Bus crates merged into zbus 6. Linux's
+    # accesskit/AT-SPI stack still requires zbus 5; see the dated entries in
+    # deny.toml. No new vulnerability is suppressed by these exceptions.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
     # time 0.3.41 — RFC 2822 parser DoS; patched only in >= 0.3.47 (needs Rust
-    # 1.88 > our 1.86 MSRV); RFC 2822 path unreached (passkey x509 cert dates).
+    # 1.88 > our 1.87 MSRV); RFC 2822 path unreached (passkey x509 cert dates).
     "RUSTSEC-2026-0009",
     # audit-only: owner: @peter1490; review-by: 2027-01-31; paste 1.0.15 is an
     # unmaintained compile-time proc-macro reachable only via wgpu-hal/metal,

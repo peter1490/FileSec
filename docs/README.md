@@ -160,7 +160,7 @@ and a saved device unlock all keep working.
 > The passkey backend talks to the key over USB HID via `ctap-hid-fido2`, which
 > vendors the C `hidapi` library — it is **only** compiled with
 > `--features passkey`, needs a physical key to test, and is pinned to a version
-> that builds on the project's Rust 1.86 MSRV. The keyslot crypto itself lives in
+> that builds on the project's Rust 1.87 MSRV. The keyslot crypto itself lives in
 > `filesec-core` with no hardware dependency and is fully unit-tested.
 
 #### Opt-in keyring auto-unlock (`--features keyring`)
@@ -343,10 +343,11 @@ security-relevant belongs in the keychain or the encrypted store instead.
 
 ## Build & run
 
-Minimum supported Rust: **1.86 on macOS and Windows, 1.88 on Linux** (there
+Minimum supported Rust: **1.87 on macOS and Windows, 1.88 on Linux** (there
 `rfd`'s desktop-portal backend uses `Default` for raw pointers, stabilized in
-1.88). CI checks exactly these minimums with every shipped feature (the `msrv`
-job), while builds, tests, and releases use one newer pinned toolchain
+1.88). The macOS/Windows minimum includes the patched `ctutils` dependency for
+RUSTSEC-2026-0385. CI checks exactly these minimums with every shipped feature
+(the `msrv` job), while builds, tests, and releases use one newer pinned toolchain
 (`RUST_TOOLCHAIN` in the workflows).
 
 ```sh

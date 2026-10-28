@@ -57,8 +57,18 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "owner: @peter1490; review-by: 2027-01-31; quick-xml DoS, Linux AT-SPI bus only (no untrusted input); drop with the egui/accesskit upgrade" },
     { id = "RUSTSEC-2026-0195", reason = "owner: @peter1490; review-by: 2027-01-31; quick-xml DoS, Linux AT-SPI bus only (no untrusted input); drop with the egui/accesskit upgrade" },
 
+    # Upstream merged these standalone crates into zbus 6. These are
+    # maintenance-only notices, with no patched standalone releases or reported
+    # vulnerability. The Linux AT-SPI accessibility stack still requires the
+    # zbus 5 APIs; a forced major-version override would break that stack.
+    # These are desktop D-Bus dependencies, not FileSec's container or peer
+    # protocol parsers. Retire these entries when accesskit migrates to zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "owner: @peter1490; review-by: 2027-01-31; zvariant maintenance-only notice after merger into zbus 6; Linux AT-SPI stack requires zbus 5; drop with the accesskit/zbus 6 migration (docs/DEPENDENCIES.md)" },
+    { id = "RUSTSEC-2026-0371", reason = "owner: @peter1490; review-by: 2027-01-31; zbus_names maintenance-only notice after merger into zbus 6; Linux AT-SPI stack requires zbus 5; drop with the accesskit/zbus 6 migration" },
+    { id = "RUSTSEC-2026-0372", reason = "owner: @peter1490; review-by: 2027-01-31; zvariant_derive maintenance-only notice after merger into zbus 6; Linux AT-SPI stack requires zbus 5; drop with the accesskit/zbus 6 migration" },
+
     # time 0.3.41 — stack-exhaustion DoS in the RFC 2822 date parser, patched only
-    # in >= 0.3.47, which requires Rust 1.88 (above FileSec's 1.86 MSRV — every
+    # in >= 0.3.47, which requires Rust 1.88 (above FileSec's 1.87 MSRV — every
     # patched release raised the MSRV). Pulled only by the passkey feature
     # (ctap-hid-fido2 -> x509-parser -> asn1-rs -> time) to hold certificate
     # validity dates, which asn1-rs builds from ASN.1 numeric components; the

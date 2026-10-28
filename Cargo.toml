@@ -15,7 +15,7 @@ resolver = "2"
 members = ["crates/filesec-core", "crates/filesec-gui", "crates/filesec-pqc"]
 default-members = ["crates/filesec-core", "crates/filesec-gui"]
 # `fuzz/` is a detached cargo-fuzz crate (its own workspace + Cargo.lock). It is
-# nightly-only (libfuzzer-sys) and must never be pulled into the MSRV-1.86 stable
+# nightly-only (libfuzzer-sys) and must never be pulled into the MSRV-1.87 stable
 # build, the locked default build, or the cargo-deny/audit supply-chain scan.
 exclude = ["fuzz"]
 
@@ -28,7 +28,8 @@ version = "0.4.6"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["FileSec contributors"]
-rust-version = "1.86"
+# ctutils >= 0.4.4 fixes RUSTSEC-2026-0385 and requires Rust 1.87.
+rust-version = "1.87"
 repository = "https://github.com/peter1490/FileSec"
 
 # Release profile tuned for a small, fast single binary per OS.
