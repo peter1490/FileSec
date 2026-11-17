@@ -30,6 +30,7 @@ container, a public key, or network input.
 | RUSTSEC-2024-0384 | instant 0.1.13 | unmaintained | Timing shim inside GPUI Base; no input parsing | @peter1490 | 2027-05-31 | GPUI Kit replacing it (e.g. web-time) |
 | RUSTSEC-2024-0436 | paste 1.0.15 | unmaintained | Compile-time proc-macro in GPUI Component; nothing of it is in the binary | @peter1490 | 2027-05-31 | GPUI Component replacing it |
 | RUSTSEC-2026-0206 | rustybuzz 0.20.1 | unmaintained | Text shaping inside usvg, which renders GPUI's compiled-in SVG icons (FileSec never renders user content) | @peter1490 | 2027-05-31 | usvg moving to harfrust |
+| RUSTSEC-2026-0543 | chrono 0.4.45 | unmaintained | GPUI's clock timestamps and date helpers, and GPUI Component's calendar/date-picker widgets (unused by FileSec). FileSec has no chrono dependency of its own and never passes vault, container, or network data to it; no successor release exists | @peter1490 | 2027-05-31 | GPUI and GPUI Component moving to jiff or time |
 | RUSTSEC-2025-0134 | rustls-pemfile 2.2.0 | unmaintained (audit-only) | Only via GPUI Kit's asset-fetching HTTP client, which is in `Cargo.lock` but in no shipped target's build; FileSec makes no HTTP requests | @peter1490 | 2027-05-31 | GPUI Kit dropping rustls-pemfile |
 
 Retired by the GPUI migration: RUSTSEC-2026-0009 (`time` < 0.3.47 — the raised
@@ -71,8 +72,8 @@ Still open:
 2. **`ctap-hid-fido2`**: lift the 3.5.7 pin to a newer release and re-test with a
    physical key.
 3. **Upgrade GPUI Kit** as its releases retire the toolkit exceptions above
-   (watch for usvg on harfrust, skrifa-based fonts, zbus 6, and wayland-scanner
-   on quick-xml ≥ 0.41). Bump `gpui-kit` (which moves the `gpui-pre-*` pins with
+   (watch for usvg on harfrust, skrifa-based fonts, zbus 6, wayland-scanner on
+   quick-xml ≥ 0.41, and GPUI dropping chrono). Bump `gpui-kit` (which moves the `gpui-pre-*` pins with
    it), re-run the UI tests and the `msrv` job, and remove each retired ID from
    `deny.toml` and `.cargo/audit.toml`; the unsuppressed report must then show
    no accepted exceptions for them.

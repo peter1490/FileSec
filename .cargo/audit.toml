@@ -38,6 +38,9 @@ ignore = [
     # rustybuzz 0.20.1 — unmaintained; inside usvg rendering GPUI's bundled SVG
     # icons, never user content.
     "RUSTSEC-2026-0206",
+    # chrono 0.4.45 — unmaintained, no successor release; GPUI timestamps and
+    # GPUI Component's date widgets (unused by FileSec), never untrusted input.
+    "RUSTSEC-2026-0543",
     # audit-only: owner: @peter1490; review-by: 2027-05-31; rustls-pemfile 2.2.0
     # is unmaintained and reachable only through GPUI Kit's asset-fetching HTTP
     # client (gpui-pre-reqwest), which is in Cargo.lock but in no shipped

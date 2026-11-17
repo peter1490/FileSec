@@ -84,6 +84,14 @@ ignore = [
     # user content: FileSec does not preview files). Drop when GPUI's usvg moves
     # to harfrust.
     { id = "RUSTSEC-2026-0206", reason = "owner: @peter1490; review-by: 2027-05-31; unmaintained rustybuzz inside usvg rendering GPUI's bundled SVG icons (no user content); drop when usvg moves to harfrust" },
+
+    # chrono 0.4.45 — unmaintained (no vulnerability; no successor release, the
+    # advisory recommends jiff or time). GPUI uses it for clock timestamps and
+    # small date helpers, and GPUI Component for its calendar/date-picker
+    # widgets, which FileSec does not use. FileSec has no chrono dependency of
+    # its own (it formats dates itself) and never hands vault, container, or
+    # network data to it. Drop when GPUI and GPUI Component move off chrono.
+    { id = "RUSTSEC-2026-0543", reason = "owner: @peter1490; review-by: 2027-05-31; unmaintained chrono used by GPUI for timestamps and GPUI Component's date widgets (unused by FileSec; no untrusted input); drop when GPUI moves to jiff/time" },
 ]
 
 [licenses]
