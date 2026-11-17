@@ -1,9 +1,11 @@
 # Verify that a built FileSec executable embeds the required application
 # manifest (RT_MANIFEST, resource type 24, id 1) declaring per-monitor-v2 DPI
-# awareness, which GPUI needs to render crisply on every monitor — see
-# crates/filesec-gui/build_support/windows_resources.rs (audit FS-15). The
-# check reads the resource back out of the final .exe with the Windows SDK's
-# mt.exe, so it tests what ships, not what the build script intended.
+# awareness, which GPUI needs to render crisply on every monitor (audit FS-15).
+# The manifest is embedded by GPUI's own build script (gpui-pre's
+# `windows-manifest` feature), not by FileSec — see
+# crates/filesec-gui/build_support/windows_resources.rs — so this check is what
+# guarantees it. It reads the resource back out of the final .exe with the
+# Windows SDK's mt.exe, so it tests what ships, not what a build script intended.
 #
 # Usage: ./packaging/windows/verify_resources.ps1 -File target/release/filesec.exe
 param(

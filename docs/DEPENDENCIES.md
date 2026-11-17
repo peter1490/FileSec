@@ -55,8 +55,10 @@ instead of trusting manifests. The pinned CI and release toolchain
 also retired the egui-era constraints recorded here before:
 
 - **winit 0.30's Windows multi-monitor loop** is gone, and with it the
-  system-DPI manifest workaround: the executables now declare per-monitor-v2
-  awareness, which GPUI expects (`build_support/windows_resources.rs`).
+  system-DPI manifest workaround: the executables now carry GPUI's own
+  per-monitor-v2 manifest, which `gpui-pre` embeds (FileSec embeds only the
+  icon; see `build_support/windows_resources.rs`), and CI verifies it in each
+  built `.exe`.
 - **egui's text stack** (ab_glyph → owned_ttf_parser) and **rfd** (with GTK on
   Linux) are no longer linked; file dialogs are GPUI's native prompts.
 - **`time` < 0.3.47** is no longer forced (see above).
