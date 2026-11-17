@@ -3,8 +3,9 @@
 See [the September 2026 security review](SECURITY_AUDIT.md) for implemented hardening, measured browser improvements, validation results, and remaining dependency exceptions.
 
 A native desktop app for securely exchanging files between parties using
-public/private-key cryptography. Built in pure Rust (egui), with no webview and
-no JavaScript. The **standard build is fully offline**; an optional **networking
+public/private-key cryptography. Built in pure Rust on
+[GPUI](https://gpui.rs) — Zed's GPU-accelerated UI framework — with no webview
+and no JavaScript. The **standard build is fully offline**; an optional **networking
 build** adds direct, server-less peer-to-peer transfer to a verified contact
 (see [Direct transfer](#direct-transfer-networking-build)).
 
@@ -159,8 +160,8 @@ and a saved device unlock all keep working.
 
 > The passkey backend talks to the key over USB HID via `ctap-hid-fido2`, which
 > vendors the C `hidapi` library — it is **only** compiled with
-> `--features passkey`, needs a physical key to test, and is pinned to a version
-> that builds on the project's Rust 1.87 MSRV. The keyslot crypto itself lives in
+> `--features passkey`, needs a physical key to test, and is pinned to the
+> hardware-validated 3.5.7 release. The keyslot crypto itself lives in
 > `filesec-core` with no hardware dependency and is fully unit-tested.
 
 #### Opt-in keyring auto-unlock (`--features keyring`)
@@ -275,7 +276,7 @@ and a thin GUI:
 crates/
   filesec-core/   # all cryptography + the .fsec container format. NO GUI.
                   # forbids unsafe, denies unwrap/expect/panic. Fuzz/audit target.
-  filesec-gui/    # egui/eframe desktop app (lib + classical `filesec` binary).
+  filesec-gui/    # GPUI desktop app (lib + classical `filesec` binary).
   filesec-pqc/    # same GUI compiled with the post-quantum suites on
                   # (the `filesec-pqc` binary). Built separately so PQC features
                   # never leak into the classical binary.
@@ -321,6 +322,32 @@ refuse up front, with the amount needed, rather than failing part-way. The
 64 GiB inbound-transfer cap bounds what a peer may declare; it is not a disk
 reservation.
 
+**The UI layer (GPUI).** `filesec-gui` is a [GPUI](https://gpui.rs) application
+built through the [GPUI Kit](https://gpui-kit.com) facade (`gpui-kit` pins the
+matching GPUI snapshot and the GPUI Component library). The window's root view,
+`app::FileSecApp`, owns the whole state machine; every screen is a pure function
+of that state that builds elements and wires their handlers to an `Action`, and
+`dispatch` applies it. Crypto and I/O never run on the UI thread: a job runs on a
+worker thread and wakes the UI through a small `Repaint` pump (a one-slot channel
+drained by a foreground GPUI task), which also carries network-transfer events
+and shutdown-wipe progress. Native file dialogs are GPUI's asynchronous prompts,
+so an action that needs a path opens the dialog and continues in a follow-up
+action (`ImportContainer` → `ImportContainerFrom(path)`) while the UI stays inert
+behind it. GPUI's prompts take no file-type filters; a save without an extension
+gets the type's extension (`.fsec`, `.fsecpub`, `.fsecid`).
+
+Text fields are long-lived input entities. Passphrases and PINs never go through
+GPUI Component's editor (which keeps a rope and an undo history that cannot be
+scrubbed): they use `secret_input::SecretInput`, a masked single-line field whose
+value is one `Zeroizing<String>` rebuilt into a fresh zeroizing buffer on every
+edit. It never copies to the clipboard, only ever shapes and paints `•` bullets,
+and answers IME/accessibility text queries with bullets too. When a form leaves
+the screen (unlocked, cancelled, locked), `scrub_fields` wipes its secrets — the
+equivalent of the old forms' zeroize-on-drop. The quick editor's plaintext lives
+in a GPUI Component textarea while it is open (its buffer, like any toolkit's
+text layout cache, is not zeroizable); the loaded original is kept in a
+`Zeroizing` buffer and the textarea is emptied the moment the editor closes.
+
 Data lives in the per-OS application directory (override with the
 `FILESEC_DATA_DIR` environment variable):
 
@@ -343,12 +370,14 @@ security-relevant belongs in the keychain or the encrypted store instead.
 
 ## Build & run
 
-Minimum supported Rust: **1.87 on macOS and Windows, 1.88 on Linux** (there
-`rfd`'s desktop-portal backend uses `Default` for raw pointers, stabilized in
-1.88). The macOS/Windows minimum includes the patched `ctutils` dependency for
-RUSTSEC-2026-0385. CI checks exactly these minimums with every shipped feature
-(the `msrv` job), while builds, tests, and releases use one newer pinned toolchain
-(`RUST_TOOLCHAIN` in the workflows).
+Minimum supported Rust: **1.95 on Linux and Windows, 1.98 on macOS**. The
+floors come from GPUI itself, which uses `std::hint::cold_path` (stabilized in
+1.95) and, in its macOS backend, `Option::map_or_default` (stabilized in 1.98).
+Both are higher than any `rust-version` declared in the dependency graph, and
+`rust-version` in `Cargo.toml` states only the lower one. CI checks exactly each
+OS's minimum with every shipped feature (the `msrv` job), while builds, tests,
+and releases use one pinned toolchain (`RUST_TOOLCHAIN` in the workflows). On Linux, install the system development packages listed under
+[Cross-platform notes](#cross-platform-notes) first.
 
 ```sh
 # Run the desktop app (classical)
@@ -443,15 +472,45 @@ The security-critical logic lives in `filesec-core` and is covered by:
 - GUI persistence layer: keystore/vault/registry/contacts round-trips,
   confidentiality (a different identity cannot read your self-encrypted vault),
   and filesystem extraction — all without opening a window.
+- GUI behaviour, in headless GPUI windows (GPUI Kit's test harness: real layout,
+  hit testing, focus, and keyboard dispatch, no display server): every screen and
+  dialog renders; row selection with plain/⌘/Shift clicks keeps rows stationary
+  and a double-click opens; vault deletion needs the dialog's explicit
+  confirmation (Escape and a backdrop click cancel); actions stay inside the
+  minimum window; toasts never cover the selection footer and errors persist;
+  the browser renders only visible rows; keyboard shortcuts and search;
+  passphrase fields are wiped when their form closes; theme choices apply and
+  persist; and a close request is held while plaintext temps are shredded.
 
 ---
 
 ## Cross-platform notes
 
-One egui codebase targets Windows, macOS, and Linux from a single source. The
-default `glow` (OpenGL) backend is the most portable. On Linux, the windowing
-stack needs system libraries (X11/Wayland + OpenGL); install your distro's
-development packages for those.
+One GPUI codebase targets Windows, macOS, and Linux. GPUI renders with Metal on
+macOS, DirectX 11 on Windows, and Vulkan (through wgpu) on Linux, under both
+Wayland and X11. Running on Linux therefore needs a Vulkan driver (Mesa's
+`mesa-vulkan-drivers` covers most GPUs and provides a software rasterizer when
+there is no GPU); the `.deb` packages depend on `libvulkan1`. Building on Linux
+needs the development packages for xkbcommon (with its X11 extension), xcb,
+Wayland, fontconfig and freetype, plus D-Bus (keyring) and udev (passkey) — on
+Debian/Ubuntu:
+
+```sh
+sudo apt-get install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libxcb1-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
+  libdbus-1-dev libudev-dev
+```
+
+Windows release builds compile GPUI's HLSL shaders with `fxc.exe` from the
+Windows SDK (present on the CI runners). On Linux the window's icon comes from
+the installed `.desktop` file (matched by the `filesec` / `filesec-pqc` app id),
+on Windows from the executable's embedded icon, and on macOS from the `.app`
+bundle.
+
+The UI ships its own static Inter instances (Regular, SemiBold, Bold — derived
+from the upstream variable font by `scripts/derive_inter_instances.py`) rather
+than the variable font, because GPUI's Linux text stack renders only a variable
+font's default instance; static faces give the same weights everywhere.
 
 ---
 

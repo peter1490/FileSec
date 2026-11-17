@@ -32,7 +32,7 @@ LICENSE_PREFIXES = ("license", "licence", "copying", "notice", "copyright", "unl
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FONTS_DIR = os.path.join(REPO_ROOT, "crates", "filesec-gui", "assets", "fonts")
 EMBEDDED_ASSETS = (
-    ("Inter (InterVariable.ttf)", "OFL-1.1", "Inter-LICENSE.txt"),
+    ("Inter (Inter-Regular/SemiBold/Bold.ttf, static instances of InterVariable)", "OFL-1.1", "Inter-LICENSE.txt"),
     ("Phosphor Icons (Phosphor.ttf)", "MIT", "Phosphor-LICENSE.txt"),
 )
 

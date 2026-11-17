@@ -37,7 +37,7 @@ env:
   CARGO_TERM_COLOR: always
   # Same pinned toolchain as ci.yml (bump both together). Releases must not
   # float with `stable` (FS-14).
-  RUST_TOOLCHAIN: 1.97.0
+  RUST_TOOLCHAIN: 1.98.0
 
 jobs:
   # ------------------------------------------------------------- Validation
@@ -225,8 +225,9 @@ jobs:
         shell: bash
         run: cargo build --locked --release $BUILD_ARGS
 
-      # Both variants must carry the system-DPI-aware manifest (FS-15). Read it
-      # back out of the final executable rather than trusting the build script.
+      # Both variants must carry the per-monitor-v2 DPI-aware manifest (FS-15),
+      # which GPUI's build embeds. Read it back out of the final executable
+      # rather than trusting a build script.
       - name: Verify embedded Windows resources
         shell: pwsh
         run: ./packaging/windows/verify_resources.ps1 -File "target/release/$env:BIN.exe"
@@ -318,9 +319,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
-            libudev-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
+            libdbus-1-dev libudev-dev
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

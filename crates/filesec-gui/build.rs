@@ -1,8 +1,9 @@
-// Embed the application icon and the required DPI-awareness manifest into the
-// Windows `.exe` (shared with filesec-pqc; see build_support/windows_resources.rs).
-// The icon is what Explorer, the taskbar and pinned shortcuts show; the
-// manifest works around a winit multi-monitor bug and is mandatory, so failing
-// to embed it fails the build.
+// Embed the application icon into the Windows `.exe` (shared with filesec-pqc;
+// see build_support/windows_resources.rs). The icon is what Explorer, the
+// taskbar and pinned shortcuts show (GPUI takes the window icon from the
+// executable); failing to embed it fails the build. The application manifest
+// (per-monitor-v2 DPI awareness, Common Controls v6) is embedded by GPUI itself;
+// CI and the release job verify it in each final `.exe`.
 
 #[path = "build_support/windows_resources.rs"]
 mod windows_resources;

@@ -17,46 +17,69 @@ decision with an owner, not a permanent waiver:
 
 ## Accepted advisories
 
+Since the move from egui/eframe to GPUI (see below), every accepted advisory
+lives in the UI toolkit's graph — GPUI and GPUI Kit, pinned together as
+`gpui-kit = "=0.10.0"`. None is on a path that parses a vault, a `.fsec`
+container, a public key, or network input.
+
 | Advisory | Crate | Kind | Why accepted | Owner | Review by | Retired by |
 |---|---|---|---|---|---|---|
-| RUSTSEC-2026-0194, RUSTSEC-2026-0195 | quick-xml 0.39.4 | DoS (vulnerability) | Linux only, via accesskit's AT-SPI backend; parses the local accessibility bus, not untrusted files or network input | @peter1490 | 2027-01-31 | egui/accesskit upgrade (quick-xml ≥ 0.41) |
-| RUSTSEC-2026-0009 | time 0.3.41 | DoS (vulnerability) | `passkey` feature only (x509 certificate dates built from ASN.1 numbers); the RFC 2822 parser is never called | @peter1490 | 2027-01-31 | MSRV ≥ 1.88, then `cargo update -p time` |
-| RUSTSEC-2026-0192 | ttf-parser 0.25.1 | unmaintained | egui 0.32 text stack; no maintained drop-in | @peter1490 | 2027-01-31 | egui upgrade replacing ttf-parser |
-| RUSTSEC-2026-0370, RUSTSEC-2026-0371, RUSTSEC-2026-0372 | zvariant 5.12.0, zbus_names 4.3.2, zvariant_derive 5.12.0 | unmaintained | Standalone crates merged into zbus 6; no patched standalone releases. Linux AT-SPI dependencies still require zbus 5, outside FileSec container/network parsers | @peter1490 | 2027-01-31 | accesskit/AT-SPI migration to zbus 6 |
-| RUSTSEC-2024-0436 | paste 1.0.15 | unmaintained (audit-only) | compile-time proc-macro reachable only via wgpu-hal/metal, which no shipped build compiles | @peter1490 | 2027-01-31 | eframe/wgpu upgrade |
+| RUSTSEC-2026-0194, RUSTSEC-2026-0195 | quick-xml 0.39.4 | DoS (vulnerability) | Build time only: the `wayland-scanner` proc-macro parses the Wayland protocol XML bundled in the wayland-protocols crates. Nothing parses XML with it at run time (accesskit already uses the patched 0.41) | @peter1490 | 2027-05-31 | wayland-scanner on quick-xml ≥ 0.41 |
+| RUSTSEC-2026-0192 | ttf-parser 0.25.1 | unmaintained | GPUI's Linux text stack (cosmic-text → fontdb) and usvg; parses the bundled and installed system fonts only | @peter1490 | 2027-05-31 | GPUI text/SVG stack on skrifa |
+| RUSTSEC-2026-0370, RUSTSEC-2026-0371, RUSTSEC-2026-0372 | zvariant, zbus_names, zvariant_derive (4.x and 5.x) | unmaintained | Standalone crates merged into zbus 6; no patched standalone releases. GPUI's Linux D-Bus users (AT-SPI, portal, notifications, Secret Service) still require zbus 5; not FileSec container or network parsers | @peter1490 | 2027-05-31 | zbus 6 migration upstream |
+| RUSTSEC-2024-0384 | instant 0.1.13 | unmaintained | Timing shim inside GPUI Base; no input parsing | @peter1490 | 2027-05-31 | GPUI Kit replacing it (e.g. web-time) |
+| RUSTSEC-2024-0436 | paste 1.0.15 | unmaintained | Compile-time proc-macro in GPUI Component; nothing of it is in the binary | @peter1490 | 2027-05-31 | GPUI Component replacing it |
+| RUSTSEC-2026-0206 | rustybuzz 0.20.1 | unmaintained | Text shaping inside usvg, which renders GPUI's compiled-in SVG icons (FileSec never renders user content) | @peter1490 | 2027-05-31 | usvg moving to harfrust |
+| RUSTSEC-2026-0543 | chrono 0.4.45 | unmaintained | GPUI's clock timestamps and date helpers, and GPUI Component's calendar/date-picker widgets (unused by FileSec). FileSec has no chrono dependency of its own and never passes vault, container, or network data to it; no successor release exists | @peter1490 | 2027-05-31 | GPUI and GPUI Component moving to jiff or time |
+| RUSTSEC-2025-0134 | rustls-pemfile 2.2.0 | unmaintained (audit-only) | Only via GPUI Kit's asset-fetching HTTP client, which is in `Cargo.lock` but in no shipped target's build; FileSec makes no HTTP requests | @peter1490 | 2027-05-31 | GPUI Kit dropping rustls-pemfile |
 
-## Upgrade plan (compiler and UI stack)
+Retired by the GPUI migration: RUSTSEC-2026-0009 (`time` < 0.3.47 — the raised
+toolchain floor allowed `time` 0.3.55). `rustix` was moved to 1.1.6 for
+RUSTSEC-2026-0486 (unsound, fixed upstream) rather than accepted.
 
-Every accepted advisory above, the winit Windows multi-monitor workaround, and
-`keyring` 3.x (whose Windows backend cannot request local-machine credential
-persistence) trace back to one constraint: the **Rust 1.87 MSRV** pins eframe/egui
-0.32, winit 0.30, accesskit, `time` < 0.3.47, `keyring` 3.6, and
-`ctap-hid-fido2` 3.5.7. Retiring them is one planned change, not a series of
-exceptions:
+## The UI stack and the toolchain floor
 
-1. **Raise the MSRV to the oldest toolchain the target stack needs** (≥ 1.88 for
-   `time` 0.3.47 and `keyring` 4; check eframe's current `rust-version`), update
-   `rust-version`, the `msrv` CI job, and the README.
-2. **Upgrade eframe/egui** to a release on winit ≥ 0.31 (fixes
-   rust-windowing/winit#4041) with accesskit on quick-xml ≥ 0.41 and a font
-   stack without ttf-parser. Then **revert the system-DPI manifest** in
-   `crates/filesec-gui/build_support/windows_resources.rs` to per-monitor
-   awareness and re-test mixed-DPI monitor movement on Windows 11 24H2.
-3. **`cargo update -p time`** to ≥ 0.3.47; lift the `ctap-hid-fido2` pin to the
-   newest release that builds on the new MSRV and re-test with a physical key.
-4. **`keyring` 4.x**: re-evaluate whether Windows credentials can be stored with
+The desktop app moved from egui/eframe 0.32 to [GPUI](https://gpui.rs) (Zed's
+UI framework) through the [GPUI Kit](https://gpui-kit.com) facade, which bundles
+a matched GPUI snapshot (published as the `gpui-pre-*` crates) and the GPUI
+Component library. The two are pinned exactly together: a newer `gpui-pre`
+snapshot alone is not supported by a given Kit release.
+
+That move set new toolchain floors: **Rust 1.95 on Linux and Windows, 1.98 on
+macOS**. GPUI itself uses `std::hint::cold_path` (stable in 1.95), and its macOS
+backend (`gpui-pre-macos`) also uses `Option::map_or_default` (stable in 1.98).
+Both are higher than any `rust-version` its crates declare (the highest is
+`oo7`'s 1.92), which is why CI's `msrv` job measures each floor by building
+every shipped feature on macOS, Windows, and Linux with exactly that toolchain
+instead of trusting manifests. The pinned CI and release toolchain
+(`RUST_TOOLCHAIN`) moved from 1.97.0 to 1.98.0 for the same reason. The move
+also retired the egui-era constraints recorded here before:
+
+- **winit 0.30's Windows multi-monitor loop** is gone, and with it the
+  system-DPI manifest workaround: the executables now carry GPUI's own
+  per-monitor-v2 manifest, which `gpui-pre` embeds (FileSec embeds only the
+  icon; see `build_support/windows_resources.rs`), and CI verifies it in each
+  built `.exe`.
+- **egui's text stack** (ab_glyph → owned_ttf_parser) and **rfd** (with GTK on
+  Linux) are no longer linked; file dialogs are GPUI's native prompts.
+- **`time` < 0.3.47** is no longer forced (see above).
+
+Still open:
+
+1. **`keyring` 4.x**: re-evaluate whether Windows credentials can be stored with
    `CRED_PERSIST_LOCAL_MACHINE`; only then claim device binding on Windows again
-   (see `autounlock.rs`).
-5. **Migrate the Linux AT-SPI D-Bus stack to zbus 6** once upstream accesskit
-   supports its merged `wire` and `names` modules. Do not force a zbus major
-   version into dependencies that still use the zbus 5 APIs. The three October
-   maintenance notices describe this upstream consolidation, not a newly
-   reported runtime vulnerability.
-6. Remove each retired ID from `deny.toml` and `.cargo/audit.toml`; the
-   unsuppressed report must then show no accepted exceptions for them.
+   (see `autounlock.rs`). Needs hardware/OS testing, independent of the UI.
+2. **`ctap-hid-fido2`**: lift the 3.5.7 pin to a newer release and re-test with a
+   physical key.
+3. **Upgrade GPUI Kit** as its releases retire the toolkit exceptions above
+   (watch for usvg on harfrust, skrifa-based fonts, zbus 6, wayland-scanner on
+   quick-xml ≥ 0.41, and GPUI dropping chrono). Bump `gpui-kit` (which moves the `gpui-pre-*` pins with
+   it), re-run the UI tests and the `msrv` job, and remove each retired ID from
+   `deny.toml` and `.cargo/audit.toml`; the unsuppressed report must then show
+   no accepted exceptions for them.
 
 Until then, each review-by date forces a fresh look at whether the reachability
-argument still holds and whether a patched release now fits the toolchain.
+argument still holds and whether a patched release is available.
 
 ## October 2026 cryptography dependency fix
 
@@ -68,7 +91,9 @@ it is not an advisory exception. The patched crate requires Rust 1.87, so the
 workspace minimum and the macOS/Windows minimum-toolchain CI checks move to
 1.87 together. The withdrawn `clipboard-win` 5.4.1 release is also replaced by
 5.4.3 in the desktop lockfile. Linux keeps its existing 1.88 minimum. Vault and identity formats
-are unchanged.
+are unchanged. (Superseded: the GPUI migration later raised the floor to 1.95 on
+Linux and Windows and 1.98 on macOS; see "The UI stack and the toolchain floor"
+above.)
 
 The separate maintenance notices for
 [zvariant](https://rustsec.org/advisories/RUSTSEC-2026-0370.html),

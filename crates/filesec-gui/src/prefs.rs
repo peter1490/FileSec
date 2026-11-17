@@ -45,10 +45,10 @@ impl Default for Prefs {
 
 /// Which appearance the user picked.
 ///
-/// Mirrors `egui::ThemePreference` deliberately rather than reusing it: this
-/// module is the persistence model and stays free of any UI dependency, so
-/// [`crate::store`] can round-trip it without pulling egui in. The mapping to
-/// egui lives in [`crate::theme::apply_choice`].
+/// Deliberately a plain enum rather than a toolkit type: this module is the
+/// persistence model and stays free of any UI dependency, so [`crate::store`]
+/// can round-trip it without pulling GPUI in. The mapping onto the UI lives in
+/// [`crate::theme::apply_choice`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeChoice {
     /// Follow the OS appearance. The default, and what every build before this

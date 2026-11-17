@@ -4,12 +4,12 @@
 //! port mapping); a sender dials a chosen **verified contact** at an IP/port. The
 //! authenticated, forward-secret handshake lives in `filesec_core::transport`;
 //! this module owns the sockets, NAT mapping, threading, and the bridge to the
-//! egui UI. It is compiled only with the `net` feature.
+//! GPUI UI. It is compiled only with the `net` feature.
 //!
 //! Each transfer runs on its own dedicated `std::thread` (no async runtime),
 //! talking to the UI thread over two channels: [`NetEvent`]s flow up, [`NetCommand`]s
-//! flow down. The UI drains events non-blocking each frame; the net thread wakes
-//! the UI via `egui::Context::request_repaint` on every event.
+//! flow down. The UI drains events non-blocking whenever it is woken; the net
+//! thread wakes it via [`Repaint::request_repaint`] on every event.
 
 mod concurrency;
 mod listener;
@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use filesec_core::contacts::ContactBook;
 use filesec_core::{Identity, PublicIdentity, SuiteId};
 
+use crate::repaint::Repaint;
 use crate::store::{Store, VaultMeta};
 
 /// Receiver-side configuration for listen mode.
@@ -177,7 +178,7 @@ pub enum NetCommand {
 #[derive(Clone)]
 struct Emitter {
     tx: mpsc::Sender<NetEvent>,
-    ctx: egui::Context,
+    repaint: Repaint,
 }
 
 impl Emitter {
@@ -185,7 +186,7 @@ impl Emitter {
     /// (the worker should then stop).
     fn emit(&self, event: NetEvent) -> bool {
         let ok = self.tx.send(event).is_ok();
-        self.ctx.request_repaint();
+        self.repaint.request_repaint();
         ok
     }
 }
@@ -231,11 +232,14 @@ pub fn start_listener(
     identity: Arc<Identity>,
     store: Arc<Store>,
     contacts: ContactBook,
-    ctx: egui::Context,
+    repaint: Repaint,
 ) -> NetHandle {
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let emitter = Emitter { tx: event_tx, ctx };
+    let emitter = Emitter {
+        tx: event_tx,
+        repaint,
+    };
     let contacts = Arc::new(contacts);
     let join = thread::spawn(move || {
         if let Err(msg) = listener::run(config, identity, store, contacts, &emitter, &cmd_rx) {
@@ -255,11 +259,14 @@ pub fn start_sender(
     config: SendConfig,
     identity: Arc<Identity>,
     store: Arc<Store>,
-    ctx: egui::Context,
+    repaint: Repaint,
 ) -> NetHandle {
     let (event_tx, event_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let emitter = Emitter { tx: event_tx, ctx };
+    let emitter = Emitter {
+        tx: event_tx,
+        repaint,
+    };
     let join = thread::spawn(move || {
         if let Err(msg) = sender::run(config, &identity, &store, &emitter, &cmd_rx) {
             emitter.emit(NetEvent::Error(msg));

@@ -14,12 +14,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-/// One file to shred, plus the context to wake so the UI can reflect progress.
-/// `ctx` is `None` when the job is queued from `on_exit`, where the window is
-/// already gone and a repaint would go nowhere.
+use crate::repaint::Repaint;
+
+/// One file to shred, plus the handle to wake so the UI can reflect progress.
+/// `repaint` is `None` when the job is queued from the quit hook, where the
+/// window is already gone and a repaint would go nowhere.
 struct WipeJob {
     path: PathBuf,
-    ctx: Option<egui::Context>,
+    repaint: Option<Repaint>,
 }
 
 /// The cheap, cloneable enqueue side. Handed to background jobs and to the
@@ -36,21 +38,21 @@ impl WipeHandle {
     ///
     /// Best-effort, like [`crate::store::secure_wipe`] itself: if the worker is
     /// gone the file is left for the next unlock's `clean_checkout_dir` sweep.
-    pub fn enqueue(&self, ctx: &egui::Context, path: PathBuf) {
-        self.send(path, Some(ctx.clone()));
+    pub fn enqueue(&self, repaint: &Repaint, path: PathBuf) {
+        self.send(path, Some(repaint.clone()));
     }
 
-    /// Queue `path` without waking any UI — for `on_exit`, where the window has
-    /// already been torn down.
+    /// Queue `path` without waking any UI — for the quit hook, where the window
+    /// has already been torn down.
     pub fn enqueue_quiet(&self, path: PathBuf) {
         self.send(path, None);
     }
 
-    fn send(&self, path: PathBuf, ctx: Option<egui::Context>) {
+    fn send(&self, path: PathBuf, repaint: Option<Repaint>) {
         // Count it in *before* handing it over, so `Wiper::pending() == 0` can
         // never be observed while a queued file is still on disk.
         self.pending.fetch_add(1, Ordering::SeqCst);
-        if self.tx.send(WipeJob { path, ctx }).is_err() {
+        if self.tx.send(WipeJob { path, repaint }).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -76,8 +78,8 @@ impl Wiper {
                 worker_pending.fetch_sub(1, Ordering::SeqCst);
                 // Wake the UI so a shutdown overlay (or anything else watching
                 // `pending`) updates as the queue drains.
-                if let Some(ctx) = job.ctx {
-                    ctx.request_repaint();
+                if let Some(repaint) = job.repaint {
+                    repaint.request_repaint();
                 }
             }
         });
@@ -96,8 +98,8 @@ impl Wiper {
     }
 
     /// Queue `path` for secure deletion and return immediately.
-    pub fn enqueue(&self, ctx: &egui::Context, path: PathBuf) {
-        self.handle.enqueue(ctx, path);
+    pub fn enqueue(&self, repaint: &Repaint, path: PathBuf) {
+        self.handle.enqueue(repaint, path);
     }
 
     /// Queue `path` without waking any UI. See [`WipeHandle::enqueue_quiet`].
@@ -112,7 +114,7 @@ impl Wiper {
 
     /// Close the queue and wait up to `timeout` for it to drain.
     ///
-    /// Last-resort only: the shutdown gate in `App::update` normally drains the
+    /// Last-resort only: the shutdown gate (`FileSecApp`'s close handler) drains the
     /// queue with the UI still painting, so by the time this runs there is
     /// usually nothing left. `JoinHandle::join` has no timeout, hence the
     /// sleep-poll. Whatever survives the timeout is picked up by the next
@@ -149,7 +151,7 @@ mod tests {
 
     #[test]
     fn enqueued_files_are_wiped_and_pending_returns_to_zero() {
-        let ctx = egui::Context::default();
+        let ctx = Repaint::noop();
         let mut wiper = Wiper::new();
         let paths: Vec<PathBuf> = (0..4).map(|i| tmp_file(&format!("{i}"))).collect();
         for p in &paths {
@@ -164,7 +166,7 @@ mod tests {
 
     #[test]
     fn enqueue_does_not_block_the_caller() {
-        let ctx = egui::Context::default();
+        let ctx = Repaint::noop();
         let wiper = Wiper::new();
         let path = tmp_file("nonblocking");
         wiper.enqueue(&ctx, path.clone());
@@ -180,7 +182,7 @@ mod tests {
 
     #[test]
     fn wiping_a_missing_file_is_harmless() {
-        let ctx = egui::Context::default();
+        let ctx = Repaint::noop();
         let mut wiper = Wiper::new();
         wiper.enqueue(
             &ctx,

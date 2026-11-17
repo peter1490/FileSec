@@ -24,7 +24,7 @@ env:
   # One pinned toolchain for CI and releases (bump it in release.yml together).
   # A floating `stable` let new lints and compiler behavior change what a
   # given commit builds into.
-  RUST_TOOLCHAIN: 1.97.0
+  RUST_TOOLCHAIN: 1.98.0
 
 # Supply-chain note: every third-party GitHub Action is pinned by commit SHA with
 # the human-readable version in a trailing comment, so a moved or compromised tag
@@ -49,20 +49,22 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # eframe/winit + rfd need a few system libraries to build on Linux.
+      # GPUI's Linux backend links xkbcommon (+ the X11 extension), xcb,
+      # fontconfig and freetype, and talks Wayland; the keyring feature needs
+      # D-Bus and the passkey feature's hidapi needs udev. The UI tests run on
+      # GPUI's headless test platform, so no display server is required.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
-            libudev-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
+            libdbus-1-dev libudev-dev
 
-      # Linux needs rustc >= 1.88 (rfd's portal backend; see the `msrv` job);
-      # macOS/Windows build on the 1.87 MSRV (checked by the `msrv` job). The pinned RUST_TOOLCHAIN
-      # satisfies all and the locked deps still apply. The action is pinned by
-      # SHA, so the toolchain must be named explicitly.
+      # The pinned RUST_TOOLCHAIN is newer than the declared MSRV (checked by
+      # the `msrv` job) and the locked deps still apply. The action is pinned
+      # by SHA, so the toolchain must be named explicitly.
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -158,13 +160,14 @@ jobs:
       - name: Test (all shipped features together)
         run: cargo test --workspace --all-features --locked
 
-  # The declared minimum toolchain (`rust-version = "1.87"` in Cargo.toml). The
-  # other jobs build with the newer pinned toolchain, which cannot catch a
-  # dependency or language feature that silently raised the real minimum.
-  # macOS and Windows build on 1.87; Linux needs 1.88 because rfd's Linux
-  # portal backend relies on `Default` for raw pointers (stabilized in 1.88; its
-  # zbus dependency alone needs 1.87). Documented in README.md. Covers the
-  # shipped feature graph.
+  # The minimum toolchain per OS. `rust-version = "1.95"` in Cargo.toml is the
+  # lowest of them. The other jobs build with the pinned toolchain, which cannot
+  # catch a dependency or language feature that silently raised the real
+  # minimum. The floors come from GPUI, and no crate's declared `rust-version`
+  # reflects them: `std::hint::cold_path` (stable in 1.95) everywhere, plus
+  # `Option::map_or_default` (stable in 1.98) in the macOS backend. So they are
+  # measured here, on every OS, with every shipped feature. Documented in
+  # docs/README.md.
   msrv:
     timeout-minutes: 45
     name: msrv (${{ matrix.os }}, ${{ matrix.toolchain }})
@@ -174,11 +177,11 @@ jobs:
       matrix:
         include:
           - os: macos-15
-            toolchain: 1.87.0
+            toolchain: 1.98.0
           - os: windows-2025
-            toolchain: 1.87.0
+            toolchain: 1.95.0
           - os: ubuntu-24.04
-            toolchain: 1.88.0
+            toolchain: 1.95.0
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -187,9 +190,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev \
-            libudev-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
+            libdbus-1-dev libudev-dev
 
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-07
         with:

@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='Native egui/eframe desktop app for FileSec secure file exchange.'
+            Description='Native GPUI desktop app for FileSec secure file exchange.'
             Manufacturer='FileSec contributors'
             InstallerVersion='450'
             Languages='1033'

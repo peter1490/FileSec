@@ -230,23 +230,21 @@ block every build); instead the review process is:
    primitives (`aes-gcm`, `chacha20poly1305`, `x25519-dalek`, `ed25519-dalek`,
    `ml-kem`, `ml-dsa`, `blake3`, `argon2`, `ring`) or untrusted-input parsing
    (`ciborium`, `x509-parser`, `quick-xml`, the container/transport parsers) is
-   reviewed by hand before its version is bumped, and the MSRV-1.86 pin is
-   re-checked (see [`Cargo.toml`](../Cargo.toml)).
+   reviewed by hand before its version is bumped, and the MSRV (1.95 on Linux
+   and Windows, 1.98 on macOS, set by GPUI) is re-checked by the CI `msrv` job
+   (see [`Cargo.toml`](../Cargo.toml)).
 3. **License policy is explicit.** The allow-list in `deny.toml` lists every
    license currently present in the graph; adding a crate under any other license
    is a deliberate, reviewed decision.
 4. **Advisory exceptions are justified and time-boxed.** The `ignore` lists in
    `deny.toml` and `.cargo/audit.toml` are kept in lockstep, and each entry
    documents the reachability analysis and the condition under which it is
-   dropped. As of this writing the accepted exceptions are all
-   low-reachability transitive advisories that cannot be fixed under the 1.86
-   MSRV / pinned-egui constraints:
-   - `RUSTSEC-2026-0192` — `ttf-parser` unmaintained (no patch; egui text stack).
-   - `RUSTSEC-2026-0194` / `-0195` — `quick-xml` DoS, patched only in ≥ 0.41
-     (major); Linux AT-SPI via egui/accesskit, not untrusted input.
-   - `RUSTSEC-2026-0009` — `time` RFC-2822 parser DoS, patched only in ≥ 0.3.47
-     which requires Rust 1.88; the vulnerable path is unreached (passkey X.509
-     cert dates).
+   dropped. As of this writing every accepted exception is a low-reachability
+   transitive advisory in the GPUI toolkit's graph — unmaintained crates in its
+   Linux text, SVG-icon, D-Bus and timing code, a compile-time proc-macro, and a
+   `quick-xml` DoS reachable only at build time inside `wayland-scanner`. The
+   table with owners, review dates, and retirement conditions is in
+   [DEPENDENCIES.md](DEPENDENCIES.md).
 
 ## Packaging assets
 
@@ -256,7 +254,7 @@ packaging/
   macos/verify_macos.sh      # post-packaging check of the archive's binary, the .dmg, and the app inside it
   windows/filesec.nsi        # NSIS installer (variant chosen via /D defines)
   windows/sign.ps1           # Authenticode signing helper
-  windows/verify_resources.ps1  # checks each built .exe embeds the DPI manifest (RT_MANIFEST)
+  windows/verify_resources.ps1  # checks each built .exe embeds GPUI's DPI manifest (RT_MANIFEST)
 crates/filesec-gui/packaging/filesec.desktop       # Linux .desktop (cargo-deb)
 crates/filesec-pqc/packaging/filesec-pqc.desktop   #   "
 crates/filesec-gui/wix/main.wxs                    # committed WiX source (deterministic .msi)
@@ -303,14 +301,23 @@ device-binding guarantee, so the UI shows a caveat. See
 
 ## Windows resources (icon + DPI manifest)
 
-Both executables embed the same icon and the same system-DPI-aware application
-manifest from `crates/filesec-gui/build_support/windows_resources.rs` (the
-workaround for winit's Windows 11 24H2 multi-monitor resize loop). The manifest
-is required, so a build that cannot embed it **fails**; the release and CI
-Windows jobs then read the manifest back out of each final `.exe`
-(`packaging/windows/verify_resources.ps1`). For a check-only cross build from a
-host without a Windows resource compiler, set
+Both executables embed the same icon from
+`crates/filesec-gui/build_support/windows_resources.rs`; GPUI also takes the
+window icon from the executable. A build that cannot embed it **fails**. For a
+check-only cross build from a host without a Windows resource compiler, set
 `FILESEC_ALLOW_MISSING_WINDOWS_RESOURCES=1` — never for a binary that will run.
+
+The application manifest comes from GPUI itself: gpui-kit builds `gpui-pre` with
+its default `windows-manifest` feature, which links GPUI's manifest into every
+executable that uses it (and fails GPUI's build if it cannot). It declares
+per-monitor-v2 DPI awareness, the Common Controls v6 dependency, `asInvoker`,
+Windows 10 compatibility and the segment heap. GPUI renders at each monitor's
+scale and handles `WM_DPICHANGED`; without the manifest Windows would
+bitmap-stretch the window. FileSec must not embed a manifest of its own, since a
+second `RT_MANIFEST` #1 fails the link. Because the manifest comes from a
+dependency, the release and CI Windows jobs read it back out of each final
+`.exe` (`packaging/windows/verify_resources.ps1`) and fail unless it declares
+`PerMonitorV2` and the Common Controls dependency.
 
 ## Third-party notices
 
@@ -318,7 +325,7 @@ Every distribution carries `THIRD_PARTY_NOTICES.txt`, generated per binary and
 target by [`scripts/third_party_notices.py`](../scripts/third_party_notices.py)
 from the locked dependency graph: each linked crate with its version, SPDX
 expression, and the full text of every license/notice file it ships (including
-nested ones such as egui's bundled font licenses), plus the Inter and Phosphor
+nested ones such as bundled font and icon licenses), plus the Inter and Phosphor
 font licenses. Identical texts are printed once and referenced by id; a crate
 that ships no license file is pointed at a standard text of its license.
 
