@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "filesec-core"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "filesec-gui"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "async-channel",
  "blake3",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "filesec-pqc"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "filesec-gui",
  "winresource",
