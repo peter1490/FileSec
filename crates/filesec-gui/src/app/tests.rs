@@ -1253,7 +1253,8 @@ fn embedded_asset_notices_carry_the_license_texts() {
         .map(|(_, text)| *text)
         .collect();
     assert!(all.contains("SIL OPEN FONT LICENSE Version 1.1"));
-    assert!(all.contains("Phosphor Icons"));
+    assert!(all.contains("Lucide Icons"));
+    assert!(all.contains("ISC License"));
     assert!(all.contains("Permission is hereby granted"));
 }
 

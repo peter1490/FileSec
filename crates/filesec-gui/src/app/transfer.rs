@@ -9,16 +9,15 @@ use filesec_core::contacts::{ContactBook, Trust};
 use filesec_core::identity::Identity;
 use filesec_core::util::hex;
 
-use crate::theme::{self, icon};
+use crate::theme::{self, ico, icon};
 
 use super::fields;
 use super::model::human_size;
 use super::views::{any, checkbox, dropdown, View};
 use super::{Action, FileSecApp, Session, State};
 
-/// A comfortable max width for the transfer forms so they neither stretch
-/// across a wide window nor collapse to their content on the left.
-const TRANSFER_COL_W: f32 = 540.0;
+/// Content width from which Receive and Send sit side by side.
+const TWO_COLUMN_MIN_W: f32 = 760.0;
 
 /// All direct-transfer UI state: the running transfer, if any, plus the
 /// receive/send form choices (the typed fields live in `Fields`). Lives in the
@@ -468,44 +467,58 @@ fn transfer_is_busy(active: &ActiveTransfer) -> bool {
 
 pub(super) fn transfer(s: &Session, v: &View) -> impl IntoElement {
     let c = v.c;
-    let mut column = div()
-        .w_full()
-        .max_w(px(TRANSFER_COL_W))
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(theme::text(
-            "Send a vault straight to a verified contact over the network — no server in \
-             between. Keep both apps open during the transfer.",
-            c.text_muted,
-        ))
-        .child(div().h(px(4.0)));
-    column = match &s.transfer.active {
-        Some(active) => column.child(active_transfer_card(active, v)),
-        None => column.child(receive_card(s, v)).child(send_card(s, v)),
-    };
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .child(theme::section_header("Transfer", None, v.wide(), c))
-        .child(super::views::page_scroll("transfer-scroll").child(column))
+    let mut body = vec![any(theme::page_description(
+        "Send a vault straight to a verified contact over the network — no server in \
+         between. Keep both apps open during the transfer.",
+        c,
+    ))];
+    match &s.transfer.active {
+        Some(active) => body.push(any(active_transfer_card(active, v))),
+        // Wide enough: the two directions side by side, so neither is a long
+        // narrow column next to empty space.
+        None if v.width >= px(TWO_COLUMN_MIN_W) => body.push(any(theme::row()
+            .w_full()
+            .items_start()
+            .gap(px(16.0))
+            .child(receive_card(s, v).flex_1().min_w_0())
+            .child(send_card(s, v).flex_1().min_w_0()))),
+        None => {
+            body.push(any(receive_card(s, v)));
+            body.push(any(send_card(s, v)));
+        }
+    }
+    super::views::page("transfer-scroll", "Transfer", None, body, v)
 }
 
-fn card_title(glyph: &'static str, title: &'static str, v: &View) -> Div {
+fn card_title(glyph: icon::Glyph, title: &'static str, subtitle: &'static str, v: &View) -> Div {
     theme::row()
-        .child(theme::icon_text(glyph, 18.0, v.c.accent))
-        .child(theme::strong(title, px(15.0), v.c.text))
+        .w_full()
+        .gap(px(12.0))
+        .child(theme::icon_tile(
+            glyph,
+            34.0,
+            v.c.accent,
+            theme::accent_soft(v.c),
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(theme::strong(title, theme::TEXT_H2, v.c.text))
+                .child(theme::muted(subtitle, v.c)),
+        )
 }
 
 fn receive_card(s: &Session, v: &View) -> Div {
     let c = v.c;
-    let mut card = theme::card(c)
-        .child(card_title(icon::DOWNLOAD, "Receive", v))
-        .child(theme::muted(
-            "Wait for a contact you choose to send you a vault.",
-            c,
-        ));
+    let mut card = theme::card(c).child(card_title(
+        icon::DOWNLOAD,
+        "Receive",
+        "Wait for a contact you choose to send you a vault.",
+        v,
+    ));
     let verified = verified_contacts(s);
     if verified.is_empty() {
         return card.child(theme::muted(
@@ -559,8 +572,9 @@ fn receive_card(s: &Session, v: &View) -> Div {
         ));
     }
     card.child(
-        theme::row().child(
+        theme::row().justify_end().child(
             theme::primary_button("start-listen", "Start listening")
+                .icon(ico(icon::DOWNLOAD))
                 .on_click(v.on(Action::StartListen)),
         ),
     )
@@ -568,7 +582,12 @@ fn receive_card(s: &Session, v: &View) -> Div {
 
 fn send_card(s: &Session, v: &View) -> Div {
     let c = v.c;
-    let card = theme::card(c).child(card_title(icon::SEND, "Send", v));
+    let card = theme::card(c).child(card_title(
+        icon::SEND,
+        "Send",
+        "Send one of your vaults to a verified contact.",
+        v,
+    ));
     let verified = verified_contacts(s);
     if verified.is_empty() {
         return card.child(theme::muted(
@@ -667,8 +686,11 @@ fn send_card(s: &Session, v: &View) -> Div {
             ));
     }
     card.child(
-        theme::row()
-            .child(theme::primary_button("start-send", "Send").on_click(v.on(Action::StartSend))),
+        theme::row().justify_end().child(
+            theme::primary_button("start-send", "Send")
+                .icon(ico(icon::SEND))
+                .on_click(v.on(Action::StartSend)),
+        ),
     )
 }
 
@@ -682,7 +704,10 @@ fn addr_row(id: &'static str, label: &'static str, addr: &str, v: &View) -> Div 
             c.text,
             v.cx,
         ))
-        .child(theme::small_button(id, "Copy").on_click(v.on(Action::CopyText(addr.to_string()))))
+        .child(
+            theme::icon_button(id, icon::COPY, "Copy address", c)
+                .on_click(v.on(Action::CopyText(addr.to_string()))),
+        )
 }
 
 fn active_transfer_card(active: &ActiveTransfer, v: &View) -> Div {
@@ -723,7 +748,7 @@ fn active_transfer_card(active: &ActiveTransfer, v: &View) -> Div {
                             .font_weight(gpui_kit::FontWeight::BOLD),
                     )
                     .child(
-                        theme::small_button("copy-code", "Copy")
+                        theme::icon_button("copy-code", icon::COPY, "Copy transfer code", c)
                             .on_click(v.on(Action::CopyText(lv.transfer_code.clone()))),
                     ),
             )
@@ -769,37 +794,64 @@ fn active_transfer_card(active: &ActiveTransfer, v: &View) -> Div {
 pub(super) fn offer_dialog(s: &Session, v: &View) -> Option<AnyElement> {
     let c = v.c;
     let offer = s.transfer.active.as_ref().and_then(|a| a.offer.as_ref())?;
-    let width = (v.window_width - px(64.0)).clamp(px(160.0), px(460.0));
-    let card = theme::modal_card("offer-card", "Incoming transfer", width, v.height, c)
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
         .child(theme::text(
             format!("{} wants to send you:", offer.sender),
-            c.text,
-        ))
-        .child(theme::strong(
-            offer.filename.clone(),
-            theme::TEXT_BODY,
-            c.text,
-        ))
-        .child(theme::muted(human_size(offer.size), c))
-        .child(theme::muted(
-            "Only accept files you're expecting from this contact.",
-            c,
+            c.text_muted,
         ))
         .child(
-            theme::wrap_row()
-                .pt(px(6.0))
+            theme::row()
+                .w_full()
+                .gap(px(12.0))
+                .p(px(12.0))
+                .rounded(theme::RADIUS)
+                .border_1()
+                .border_color(c.border_subtle)
+                .child(theme::icon_tile(
+                    icon::VAULT,
+                    36.0,
+                    c.accent,
+                    theme::accent_soft(c),
+                ))
                 .child(
-                    theme::primary_button("accept-offer", "Accept")
-                        .on_click(v.on(Action::AcceptIncoming)),
-                )
-                .child(
-                    theme::secondary_button("reject-offer", "Reject")
-                        .on_click(v.on(Action::RejectIncoming)),
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(theme::one_line(theme::strong(
+                            offer.filename.clone(),
+                            theme::TEXT_BODY,
+                            c.text,
+                        )))
+                        .child(theme::muted(human_size(offer.size), c)),
                 ),
+        )
+        .child(theme::callout(
+            icon::INFO,
+            "Only accept files you're expecting from this contact.",
+            c.text_muted,
+            c,
+        ));
+    let footer = super::views::dialogs::footer()
+        .child(
+            theme::secondary_button("reject-offer", "Decline")
+                .on_click(v.on(Action::RejectIncoming)),
+        )
+        .child(
+            theme::primary_button("accept-offer", "Accept")
+                .icon(ico(icon::DOWNLOAD))
+                .on_click(v.on(Action::AcceptIncoming)),
         );
-    Some(
-        theme::backdrop("offer-backdrop", 130)
-            .child(card)
-            .into_any_element(),
-    )
+    Some(super::views::dialogs::modal(
+        "offer",
+        "Incoming transfer",
+        None,
+        body,
+        footer,
+        v,
+    ))
 }

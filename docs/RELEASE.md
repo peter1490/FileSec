@@ -325,9 +325,10 @@ Every distribution carries `THIRD_PARTY_NOTICES.txt`, generated per binary and
 target by [`scripts/third_party_notices.py`](../scripts/third_party_notices.py)
 from the locked dependency graph: each linked crate with its version, SPDX
 expression, and the full text of every license/notice file it ships (including
-nested ones such as bundled font and icon licenses), plus the Inter and Phosphor
-font licenses. Identical texts are printed once and referenced by id; a crate
-that ships no license file is pointed at a standard text of its license.
+nested ones such as bundled font and icon licenses), plus the licenses of the
+embedded Inter font and Lucide icons. Identical texts are printed once and
+referenced by id; a crate that ships no license file is pointed at a standard
+text of its license.
 
 | Format | Where the notices are |
 |--------|-----------------------|

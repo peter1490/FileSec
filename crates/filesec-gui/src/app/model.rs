@@ -839,6 +839,26 @@ pub(super) fn file_tint(name: &str, c: theme::Colors) -> Hsla {
     }
 }
 
+/// The icon for a file, by category (plain documents get the text glyph).
+pub(super) fn file_glyph(name: &str) -> theme::icon::Glyph {
+    use theme::icon;
+    match file_category(name) {
+        FileCat::Image => icon::FILE_IMAGE,
+        FileCat::Media => icon::FILE_MEDIA,
+        FileCat::Archive => icon::FILE_ARCHIVE,
+        FileCat::Code => icon::FILE_CODE,
+        FileCat::Other => {
+            let ext = name.rsplit_once('.').map(|(_, e)| e.to_lowercase());
+            match ext.as_deref() {
+                Some("txt" | "md" | "rtf" | "pdf" | "doc" | "docx" | "odt" | "csv" | "log") => {
+                    icon::FILE_TEXT
+                }
+                _ => icon::FILE,
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trash model: soft delete. A "deleted" entry is *moved* (a manifest-only,
 // O(1) rename — no blob is rewritten or decrypted) into the hidden `.trash/`

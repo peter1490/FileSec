@@ -44,9 +44,9 @@ ignore = [
 
     # ttf-parser 0.25.1 — unmaintained (no vulnerability, no patch exists).
     # Reached through GPUI's Linux text stack (cosmic-text -> fontdb) and its SVG
-    # icon renderer (usvg). It parses the bundled Inter/Phosphor faces and the
-    # system's installed fonts — never a font from a vault or a peer. Drop when
-    # GPUI's text and SVG stacks move to skrifa/read-fonts.
+    # icon renderer (usvg). It parses the bundled Inter faces and the system's
+    # installed fonts — never a font from a vault or a peer. Drop when GPUI's text
+    # and SVG stacks move to skrifa/read-fonts.
     { id = "RUSTSEC-2026-0192", reason = "owner: @peter1490; review-by: 2027-05-31; unmaintained ttf-parser via GPUI's Linux text stack and usvg (bundled/system fonts only); drop when GPUI moves to skrifa (docs/DEPENDENCIES.md)" },
 
     # quick-xml 0.39.4 — two DoS advisories, patched only in >= 0.41.0 (major).
@@ -100,7 +100,7 @@ ignore = [
 # tables; MPL-2.0 covers option-ext (via the directories crate); 0BSD is
 # enum-iterator (via GPUI Component). Adding a crate whose license is not listed
 # here is intentionally a build failure — vet it and add it explicitly. (The
-# embedded Inter/Phosphor fonts are assets, not crates; their OFL-1.1 and MIT
+# embedded Inter fonts and Lucide icons are assets; their OFL-1.1 and ISC/MIT
 # texts ship in THIRD_PARTY_NOTICES.txt and the About page.)
 allow = [
     "MIT",

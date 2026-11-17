@@ -1,11 +1,15 @@
 //! The window frame around the screens: the sidebar, page routing, the toast,
-//! and the busy overlay.
+//! the busy overlay, and (macOS) the strip that moves the window.
+
+use std::cell::Cell;
+use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::Selectable;
+use gpui_kit::component::Sizable;
 use gpui_kit::{
-    div, prelude::*, px, AnyElement, Div, ElementId, Pixels, SharedString, TestSupportExt,
+    div, prelude::*, px, AnyElement, Div, ElementId, MouseButton, Pixels, SharedString,
+    TestSupportExt,
 };
 
 use crate::prefs::ThemeChoice;
@@ -14,11 +18,13 @@ use crate::theme::{self, icon};
 use super::{browser, contacts, identity, settings, vaults, View};
 use crate::app::{Action, Nav, Session};
 
-/// One sidebar navigation row: icon + label, with selected/hover states.
+/// One sidebar navigation row: icon + label (+ an optional count), with
+/// selected/hover states.
 fn nav_item(
     id: &'static str,
-    glyph: &'static str,
+    glyph: icon::Glyph,
     label: &'static str,
+    count: Option<usize>,
     nav: Nav,
     s: &Session,
     v: &View,
@@ -29,13 +35,20 @@ fn nav_item(
     } else {
         s.nav == nav
     };
-    let fg = if selected { c.accent } else { c.text };
+    let (fg, icon_fg) = if selected {
+        (c.text, c.accent)
+    } else {
+        (c.text_muted, c.text_muted)
+    };
+    let selected_bg = if c.dark { c.surface_hi } else { c.surface };
     Button::new(id)
         .ghost()
-        .selected(selected)
         .w_full()
-        .h(px(42.0))
+        .h(px(34.0))
         .accessibility_label(label)
+        .when(selected, |b| {
+            b.bg(selected_bg).border_1().border_color(c.border_subtle)
+        })
         .child(
             div()
                 .w_full()
@@ -43,14 +56,21 @@ fn nav_item(
                 .flex_row()
                 .items_center()
                 .gap(px(10.0))
-                .pl(px(4.0))
-                .child(theme::icon_text(glyph, 18.0, fg))
+                .child(theme::icon_text(glyph, 16.0, icon_fg))
                 .child(
                     div()
+                        .flex_1()
                         .text_size(theme::TEXT_BODY)
+                        .when(selected, |d| d.font_weight(gpui_kit::FontWeight::SEMIBOLD))
                         .text_color(fg)
                         .child(label),
-                ),
+                )
+                .children(count.filter(|n| *n > 0).map(|n| {
+                    div()
+                        .text_size(theme::TEXT_SMALL)
+                        .text_color(c.text_subtle)
+                        .child(n.to_string())
+                })),
         )
         .on_click(v.on(Action::Nav(nav)))
 }
@@ -60,34 +80,51 @@ pub(in crate::app) fn sidebar(s: &Session, v: &View) -> gpui_kit::Stateful<Div> 
     let c = v.c;
     let dark = theme::is_dark(v.cx);
     let (glyph, hover, choice) = if dark {
-        (icon::SUN, "Switch to light", ThemeChoice::Light)
+        (icon::SUN, "Switch to light appearance", ThemeChoice::Light)
     } else {
-        (icon::MOON, "Switch to dark", ThemeChoice::Dark)
+        (icon::MOON, "Switch to dark appearance", ThemeChoice::Dark)
     };
-    let on_settings = s.open.is_none() && s.nav == Nav::Settings;
 
+    // The brand shares the page header's strip; on macOS it sits to the right
+    // of the traffic lights.
     let brand = div()
+        .flex_none()
+        .h(theme::HEADER_H)
+        .pl(if crate::UNIFIED_TITLEBAR {
+            px(84.0)
+        } else {
+            px(18.0)
+        })
+        .pr(px(12.0))
         .flex()
-        .flex_col()
-        .gap(px(2.0))
-        .pt(px(4.0))
-        .pb(px(24.0))
-        .child(
-            theme::row()
-                .child(theme::icon_text(icon::LOCK_KEY, 22.0, c.accent))
-                .child(theme::strong("FileSec", theme::TEXT_HEADING, c.text)),
-        )
-        .child(theme::small("Private by design", c.text_muted));
+        .flex_row()
+        .items_center()
+        .gap(px(9.0))
+        .child(theme::logo_mark(22.0, c))
+        .child(theme::strong("FileSec", px(15.0), c.text));
+
+    let section = |label: &'static str| {
+        div()
+            .px(px(10.0))
+            .pt(px(14.0))
+            .pb(px(6.0))
+            .text_size(px(11.5))
+            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+            .text_color(c.text_subtle)
+            .child(label)
+    };
 
     #[allow(unused_mut)]
     let mut nav = div()
         .flex()
         .flex_col()
         .gap(px(2.0))
+        .child(section("Library"))
         .child(nav_item(
             "nav-vaults",
             icon::VAULT,
             "Vaults",
+            Some(s.registry.vaults.len()),
             Nav::Vaults,
             s,
             v,
@@ -96,15 +133,8 @@ pub(in crate::app) fn sidebar(s: &Session, v: &View) -> gpui_kit::Stateful<Div> 
             "nav-contacts",
             icon::CONTACTS,
             "Contacts",
+            Some(s.contacts.contacts.len()),
             Nav::Contacts,
-            s,
-            v,
-        ))
-        .child(nav_item(
-            "nav-identity",
-            icon::IDENTITY,
-            "My Identity",
-            Nav::Identity,
             s,
             v,
         ));
@@ -114,45 +144,76 @@ pub(in crate::app) fn sidebar(s: &Session, v: &View) -> gpui_kit::Stateful<Div> 
             "nav-transfer",
             icon::SEND,
             "Transfer",
+            None,
             Nav::Transfer,
             s,
             v,
         ));
     }
+    nav = nav
+        .child(section("Account"))
+        .child(nav_item(
+            "nav-identity",
+            icon::IDENTITY,
+            "My identity",
+            None,
+            Nav::Identity,
+            s,
+            v,
+        ))
+        .child(nav_item(
+            "nav-settings",
+            icon::GEAR,
+            "Settings",
+            None,
+            Nav::Settings,
+            s,
+            v,
+        ));
 
-    // Bottom-pinned account context and clearly labelled utilities.
-    let bottom = div()
+    // Who is unlocked, and the two session-wide controls. The theme flip stays
+    // usable during a check-out, when navigating away is refused.
+    let account = div()
+        .flex_none()
+        .m(px(10.0))
+        .p(px(8.0))
+        .rounded(theme::RADIUS)
+        .border_1()
+        .border_color(c.border_subtle)
+        .bg(c.surface)
         .flex()
-        .flex_col()
-        .gap(px(6.0))
+        .flex_row()
+        .items_center()
+        .gap(px(9.0))
+        .child(theme::avatar(&s.identity.name, 30.0, c))
         .child(
-            theme::row()
-                .gap(px(4.0))
-                // One-click light/dark flip. The full three-way control,
-                // including "follow the system", lives on the Settings page;
-                // this shortcut stays usable during a check-out, when
-                // navigating away is refused.
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(theme::one_line(theme::strong(
+                    s.identity.name.clone(),
+                    px(13.0),
+                    c.text,
+                )))
                 .child(
-                    theme::icon_button("theme-toggle", glyph, hover, c)
-                        .on_click(v.on(Action::SetTheme(choice))),
-                )
-                .child(
-                    Button::new("nav-settings")
-                        .ghost()
-                        .selected(on_settings)
-                        .label("Settings")
-                        .on_click(v.on(Action::Nav(Nav::Settings))),
+                    theme::row()
+                        .gap(px(5.0))
+                        .child(theme::dot(c.ok))
+                        .child(theme::small("Unlocked", c.text_muted)),
                 ),
         )
-        .child(theme::separator(c))
-        .child(theme::small("Identity unlocked", c.text_muted))
-        .child(theme::one_line(theme::strong(
-            s.identity.name.clone(),
-            theme::TEXT_BODY,
-            c.text,
-        )))
-        .child(div().h(px(2.0)))
-        .child(theme::secondary_button_full("lock", "Lock FileSec").on_click(v.on(Action::Lock)));
+        .child(
+            theme::icon_button("theme-toggle", glyph, hover, c)
+                .small()
+                .on_click(v.on(Action::SetTheme(choice))),
+        )
+        .child(
+            theme::icon_button("lock", icon::LOCK, "Lock FileSec", c)
+                .small()
+                .on_click(v.on(Action::Lock)),
+        );
 
     div()
         .id("sidebar")
@@ -160,13 +221,21 @@ pub(in crate::app) fn sidebar(s: &Session, v: &View) -> gpui_kit::Stateful<Div> 
         .flex_none()
         .h_full()
         .bg(c.sidebar)
-        .p(px(12.0))
+        .border_r_1()
+        .border_color(c.border_subtle)
         .flex()
         .flex_col()
         .child(brand)
-        .child(nav)
-        .child(div().flex_1())
-        .child(bottom)
+        .child(
+            div()
+                .id("sidebar-nav")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(10.0))
+                .child(nav),
+        )
+        .child(account)
 }
 
 /// The main area for the unlocked session.
@@ -184,14 +253,15 @@ pub(in crate::app) fn session(s: &mut Session, v: &View) -> AnyElement {
     }
 }
 
-/// The floating toast, anchored bottom-right.
+/// The floating toast, anchored bottom-right. Errors stay until dismissed;
+/// the close button is always there.
 pub(in crate::app) fn toast(msg: String, error: bool, bottom_inset: Pixels, v: &View) -> Div {
     let c = v.c;
-    let max_w = (v.width - px(64.0)).clamp(px(160.0), px(420.0));
+    let max_w = (v.window_width - px(48.0)).clamp(px(160.0), px(440.0));
     div()
         .absolute()
         .bottom(bottom_inset)
-        .right(px(16.0))
+        .right(px(20.0))
         .max_w(max_w)
         .child(
             theme::toast_card(error, c)
@@ -202,6 +272,7 @@ pub(in crate::app) fn toast(msg: String, error: bool, bottom_inset: Pixels, v: &
                         .id(ElementId::Name("toast-text".into()))
                         .flex_1()
                         .min_w_0()
+                        .py(px(4.0))
                         .text_size(theme::TEXT_BODY)
                         .text_color(c.text)
                         .child(SharedString::from(msg))
@@ -209,27 +280,67 @@ pub(in crate::app) fn toast(msg: String, error: bool, bottom_inset: Pixels, v: &
                 )
                 .child(
                     theme::icon_button("toast-dismiss", icon::CLOSE, "Dismiss notification", c)
+                        .small()
                         .on_click(v.on(Action::DismissToast)),
                 ),
         )
 }
 
-/// The busy overlay: dimmed backdrop + centred spinner and label.
+/// The busy overlay: dimmed backdrop + a centred card with a spinner and
+/// what is happening.
 pub(in crate::app) fn busy_overlay(label: String, v: &View) -> AnyElement {
     let c = v.c;
-    theme::backdrop("busy", 140)
+    theme::backdrop("busy", if c.dark { 120 } else { 70 })
         .child(
-            theme::row()
-                .gap(px(10.0))
-                .bg(c.surface)
-                .border_1()
-                .border_color(c.border)
-                .rounded(theme::RADIUS)
-                .px(px(18.0))
-                .py(px(14.0))
+            theme::float_card(c)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(20.0))
+                .py(px(16.0))
+                .max_w(px(420.0))
                 .child(Spinner::new().color(c.accent))
                 .child(theme::text(label, c.text)),
         )
         .test_support()
         .into_any_element()
+}
+
+/// The invisible strip under the top [`theme::HEADER_H`] of the window that
+/// moves it (macOS unified titlebar only). It sits beneath every header, so
+/// a press on a button there is the button's (buttons prevent the default);
+/// a press on empty header space drags the window, and a double-click zooms
+/// it as the system titlebar would.
+pub(in crate::app) fn window_drag_strip(flag: Rc<Cell<bool>>) -> Div {
+    let down = flag.clone();
+    let up = flag.clone();
+    let out = flag.clone();
+    let moved = flag;
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .w_full()
+        .h(theme::HEADER_H)
+        .on_mouse_down(MouseButton::Left, move |event, window, _| {
+            if window.default_prevented() {
+                down.set(false);
+            } else if event.click_count >= 2 {
+                down.set(false);
+                window.titlebar_double_click();
+            } else {
+                down.set(true);
+            }
+        })
+        .on_mouse_up(MouseButton::Left, move |_, _, _| up.set(false))
+        .on_mouse_down_out(move |_, _, _| out.set(false))
+        .on_mouse_move(move |event, window, _| {
+            if event.pressed_button != Some(MouseButton::Left) {
+                moved.set(false);
+            } else if moved.get() {
+                moved.set(false);
+                window.start_window_move();
+            }
+        })
 }

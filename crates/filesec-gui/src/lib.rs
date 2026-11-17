@@ -18,12 +18,29 @@ pub mod theme;
 pub mod wipe;
 
 use gpui_kit::{
-    px, size, App, AppContext, Bounds, SharedString, TitlebarOptions, WindowBounds, WindowOptions,
+    point, px, size, App, AppContext, Bounds, SharedString, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 
 /// The default and minimum window sizes (logical pixels).
-pub const WINDOW_SIZE: (f32, f32) = (1040.0, 700.0);
+pub const WINDOW_SIZE: (f32, f32) = (1100.0, 720.0);
 pub const WINDOW_MIN_SIZE: (f32, f32) = (720.0, 520.0);
+
+/// Whether the window draws its own (unified) titlebar: on macOS the content
+/// runs under a transparent titlebar, the traffic lights sit over the
+/// sidebar, and the top [`theme::HEADER_H`] strip moves the window. Windows
+/// and Linux keep the system titlebar, which already behaves natively.
+pub const UNIFIED_TITLEBAR: bool = cfg!(target_os = "macos");
+
+/// The titlebar for the one window. On macOS the traffic lights are centred
+/// vertically in the page-header strip.
+fn titlebar(title: SharedString) -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some(title),
+        appears_transparent: UNIFIED_TITLEBAR,
+        traffic_light_position: UNIFIED_TITLEBAR.then(|| point(px(18.0), px(21.0))),
+    }
+}
 
 /// The desktop-environment application id. It matches the `.desktop` file each
 /// package installs (`packaging/*.desktop`), which is how Linux shells find the
@@ -54,18 +71,20 @@ pub fn init(cx: &mut App) {
 pub fn run(title: &str) {
     let title: SharedString = title.to_string().into();
     // GPUI Component draws its own glyphs (checkmarks, carets, the spinner)
-    // from SVG assets; GPUI Kit's default asset bundle provides them.
+    // from SVG assets; `AppAssets` is GPUI Kit's default bundle plus the
+    // Lucide icons the app's own screens use.
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(theme::AppAssets)
         .run(move |cx: &mut App| {
             init(cx);
             let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(title.clone()),
-                    ..Default::default()
-                }),
+                titlebar: Some(titlebar(title.clone())),
+                // The unified titlebar moves the window itself (see
+                // `views::shell::window_drag_strip`), so AppKit must not also
+                // claim the strip — that would swallow clicks on its buttons.
+                app_owns_titlebar_drag: UNIFIED_TITLEBAR,
                 window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
                 app_id: Some(app_id().to_string()),
                 ..Default::default()
