@@ -370,12 +370,13 @@ security-relevant belongs in the keychain or the encrypted store instead.
 
 ## Build & run
 
-Minimum supported Rust: **1.95** on every platform. The floor comes from GPUI
-itself, which uses `std::hint::cold_path` (stabilized in 1.95) — higher than any
-`rust-version` declared in the dependency graph. CI checks exactly this minimum
-with every shipped feature on macOS, Windows, and Linux (the `msrv` job), while
-builds, tests, and releases use one newer pinned toolchain (`RUST_TOOLCHAIN` in
-the workflows). On Linux, install the system development packages listed under
+Minimum supported Rust: **1.95 on Linux and Windows, 1.98 on macOS**. The
+floors come from GPUI itself, which uses `std::hint::cold_path` (stabilized in
+1.95) and, in its macOS backend, `Option::map_or_default` (stabilized in 1.98).
+Both are higher than any `rust-version` declared in the dependency graph, and
+`rust-version` in `Cargo.toml` states only the lower one. CI checks exactly each
+OS's minimum with every shipped feature (the `msrv` job), while builds, tests,
+and releases use one pinned toolchain (`RUST_TOOLCHAIN` in the workflows). On Linux, install the system development packages listed under
 [Cross-platform notes](#cross-platform-notes) first.
 
 ```sh

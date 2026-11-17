@@ -29,11 +29,13 @@ version = "0.4.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["FileSec contributors"]
-# The GPUI stack sets the floor: GPUI itself (edition 2024) uses
-# `std::hint::cold_path`, stable since Rust 1.95 — above any `rust-version` its
-# crates declare (the highest is 1.92). CI's `msrv` job builds the whole shipped
-# feature graph with exactly this toolchain on all three OSes, so the number is
-# measured, not copied from manifests.
+# The GPUI stack sets the floor, and it differs by OS: GPUI itself (edition
+# 2024) uses `std::hint::cold_path`, stable since Rust 1.95, and its macOS
+# backend (gpui-pre-macos) also uses `Option::map_or_default`, stable since 1.98.
+# Both are above any `rust-version` its crates declare (the highest is 1.92).
+# This field states the lowest floor (Linux and Windows); macOS needs 1.98. CI's
+# `msrv` job builds the whole shipped feature graph with exactly each OS's
+# floor, so the numbers are measured, not copied from manifests.
 rust-version = "1.95"
 repository = "https://github.com/peter1490/FileSec"
 

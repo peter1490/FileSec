@@ -230,8 +230,9 @@ block every build); instead the review process is:
    primitives (`aes-gcm`, `chacha20poly1305`, `x25519-dalek`, `ed25519-dalek`,
    `ml-kem`, `ml-dsa`, `blake3`, `argon2`, `ring`) or untrusted-input parsing
    (`ciborium`, `x509-parser`, `quick-xml`, the container/transport parsers) is
-   reviewed by hand before its version is bumped, and the MSRV (1.95, set by
-   GPUI) is re-checked by the CI `msrv` job (see [`Cargo.toml`](../Cargo.toml)).
+   reviewed by hand before its version is bumped, and the MSRV (1.95 on Linux
+   and Windows, 1.98 on macOS, set by GPUI) is re-checked by the CI `msrv` job
+   (see [`Cargo.toml`](../Cargo.toml)).
 3. **License policy is explicit.** The allow-list in `deny.toml` lists every
    license currently present in the graph; adding a crate under any other license
    is a deliberate, reviewed decision.

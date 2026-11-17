@@ -24,7 +24,7 @@ env:
   # One pinned toolchain for CI and releases (bump it in release.yml together).
   # A floating `stable` let new lints and compiler behavior change what a
   # given commit builds into.
-  RUST_TOOLCHAIN: 1.97.0
+  RUST_TOOLCHAIN: 1.98.0
 
 # Supply-chain note: every third-party GitHub Action is pinned by commit SHA with
 # the human-readable version in a trailing comment, so a moved or compromised tag
@@ -160,12 +160,14 @@ jobs:
       - name: Test (all shipped features together)
         run: cargo test --workspace --all-features --locked
 
-  # The declared minimum toolchain (`rust-version = "1.95"` in Cargo.toml). The
-  # other jobs build with the newer pinned toolchain, which cannot catch a
-  # dependency or language feature that silently raised the real minimum. The
-  # floor is GPUI's own use of `std::hint::cold_path` (stable in 1.95), which
-  # no crate's declared `rust-version` reflects — so it is measured here, on
-  # every OS, with every shipped feature. Documented in docs/README.md.
+  # The minimum toolchain per OS. `rust-version = "1.95"` in Cargo.toml is the
+  # lowest of them. The other jobs build with the pinned toolchain, which cannot
+  # catch a dependency or language feature that silently raised the real
+  # minimum. The floors come from GPUI, and no crate's declared `rust-version`
+  # reflects them: `std::hint::cold_path` (stable in 1.95) everywhere, plus
+  # `Option::map_or_default` (stable in 1.98) in the macOS backend. So they are
+  # measured here, on every OS, with every shipped feature. Documented in
+  # docs/README.md.
   msrv:
     timeout-minutes: 45
     name: msrv (${{ matrix.os }}, ${{ matrix.toolchain }})
@@ -175,7 +177,7 @@ jobs:
       matrix:
         include:
           - os: macos-15
-            toolchain: 1.95.0
+            toolchain: 1.98.0
           - os: windows-2025
             toolchain: 1.95.0
           - os: ubuntu-24.04

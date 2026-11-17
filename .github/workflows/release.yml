@@ -37,7 +37,7 @@ env:
   CARGO_TERM_COLOR: always
   # Same pinned toolchain as ci.yml (bump both together). Releases must not
   # float with `stable` (FS-14).
-  RUST_TOOLCHAIN: 1.97.0
+  RUST_TOOLCHAIN: 1.98.0
 
 jobs:
   # ------------------------------------------------------------- Validation

@@ -44,12 +44,15 @@ a matched GPUI snapshot (published as the `gpui-pre-*` crates) and the GPUI
 Component library. The two are pinned exactly together: a newer `gpui-pre`
 snapshot alone is not supported by a given Kit release.
 
-That move set a new toolchain floor: **Rust 1.95**. GPUI itself uses
-`std::hint::cold_path` (stable in 1.95) — higher than any `rust-version` its
-crates declare (the highest is `oo7`'s 1.92) — which is why CI's `msrv` job
-measures the floor by building every shipped feature on macOS, Windows, and
-Linux with exactly that toolchain instead of trusting manifests. It also retired
-the egui-era constraints recorded here before:
+That move set new toolchain floors: **Rust 1.95 on Linux and Windows, 1.98 on
+macOS**. GPUI itself uses `std::hint::cold_path` (stable in 1.95), and its macOS
+backend (`gpui-pre-macos`) also uses `Option::map_or_default` (stable in 1.98).
+Both are higher than any `rust-version` its crates declare (the highest is
+`oo7`'s 1.92), which is why CI's `msrv` job measures each floor by building
+every shipped feature on macOS, Windows, and Linux with exactly that toolchain
+instead of trusting manifests. The pinned CI and release toolchain
+(`RUST_TOOLCHAIN`) moved from 1.97.0 to 1.98.0 for the same reason. The move
+also retired the egui-era constraints recorded here before:
 
 - **winit 0.30's Windows multi-monitor loop** is gone, and with it the
   system-DPI manifest workaround: the executables now declare per-monitor-v2
@@ -86,7 +89,8 @@ workspace minimum and the macOS/Windows minimum-toolchain CI checks move to
 1.87 together. The withdrawn `clipboard-win` 5.4.1 release is also replaced by
 5.4.3 in the desktop lockfile. Linux keeps its existing 1.88 minimum. Vault and identity formats
 are unchanged. (Superseded: the GPUI migration later raised the floor to 1.95 on
-every platform; see "The UI stack and the toolchain floor" above.)
+Linux and Windows and 1.98 on macOS; see "The UI stack and the toolchain floor"
+above.)
 
 The separate maintenance notices for
 [zvariant](https://rustsec.org/advisories/RUSTSEC-2026-0370.html),
