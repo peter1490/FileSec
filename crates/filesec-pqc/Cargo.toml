@@ -31,6 +31,11 @@ available (new identities are classical by default and can be upgraded in-app). 
 It installs alongside the standard `filesec` package."""
 section = "utils"
 priority = "optional"
+# `$auto` is what the binary links (xkbcommon, xcb, fontconfig, freetype, …);
+# GPUI loads the Vulkan loader at runtime, so it is declared explicitly. Mesa's
+# drivers (including a software rasterizer) are what most systems will use.
+depends = "$auto, libvulkan1"
+recommends = "mesa-vulkan-drivers"
 assets = [
     ["target/release/filesec-pqc", "usr/bin/", "755"],
     # Third-party license notices, generated into the release dir by
@@ -55,7 +60,6 @@ assets = [
 # `filesec` binary in filesec-gui. (A whole-workspace `cargo build --workspace`
 # would unify features across both; `default-members` in the root manifest keeps
 # the bare `cargo build`/`test` classical, and CI builds each variant separately.)
-eframe = "0.32.3"
 # This is the full build: post-quantum suites available AND direct peer-to-peer
 # network transfer (`net`). The companion `filesec` binary is the same app
 # without networking. New identities default to classical in both.

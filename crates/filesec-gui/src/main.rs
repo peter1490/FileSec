@@ -1,6 +1,6 @@
 //! FileSec desktop app — the **standard build**.
 //!
-//! Pure-Rust egui front-end over the `filesec-core` cryptography and `.fsec`
+//! Pure-Rust GPUI front-end over the `filesec-core` cryptography and `.fsec`
 //! container format. No webview. Works fully offline: vaults are exchanged as
 //! portable `.fsec` files over any channel.
 //!
@@ -16,6 +16,6 @@
     windows_subsystem = "windows"
 )]
 
-fn main() -> eframe::Result<()> {
-    filesec_gui::run("FileSec")
+fn main() {
+    filesec_gui::run("FileSec");
 }

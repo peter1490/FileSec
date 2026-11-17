@@ -1,22 +1,28 @@
-//! Visual design system: palette, fonts, global style, and reusable widgets.
+//! Visual design system: palette, fonts, appearance, and reusable elements.
 //!
 //! This module is purely presentational and **feature-agnostic** — it carries no
-//! `cfg` gates so every feature permutation (pqc / passkey / keyring) compiles
-//! against the same helpers. [`install`] is called once from
-//! [`crate::run`] with the eframe [`egui::Context`]; it registers the bundled
-//! fonts and installs a light and a dark [`egui::Style`], then leaves egui to
-//! follow the OS theme. [`crate::run`] immediately applies the user's saved
-//! choice on top via [`apply_choice`], so the unlock screen already paints in
-//! the right theme.
+//! `cfg` gates so every feature permutation (pqc / passkey / keyring / net)
+//! compiles against the same helpers. [`install`] is called once from
+//! [`crate::run`] before the window opens: it registers the bundled fonts,
+//! teaches GPUI Component the FileSec palette for both appearances, and starts
+//! out following the OS appearance. [`crate::run`] then applies the user's
+//! saved choice via [`apply_choice`] before the first frame, so the unlock
+//! screen already paints in the right theme.
 //!
-//! The widget helpers ([`card`], [`primary_button`], [`badge`], …) only *build*
-//! UI and return the same [`egui::Response`] the call sites already branch on, so
-//! they are drop-in replacements that keep the immediate-mode, action-collection
-//! rendering pattern intact.
+//! The element helpers ([`card`], [`primary_button`], [`badge`], …) only
+//! *build* elements; behaviour (click handlers, disabled state) is attached by
+//! the caller, which keeps every screen a pure function of the app state.
 
-use std::sync::Arc;
+use std::borrow::Cow;
+use std::rc::Rc;
 
-use eframe::egui::{self, Color32};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
+use gpui_kit::component::theme::{Theme, ThemeConfig, ThemeMode};
+use gpui_kit::component::{Disableable, Sizable};
+use gpui_kit::{
+    div, px, rgb, AnyElement, App, BoxShadow, Div, ElementId, FontWeight, Global, Hsla,
+    InteractiveElement, ParentElement, Pixels, SharedString, Styled, WindowAppearance,
+};
 
 use crate::prefs::ThemeChoice;
 
@@ -24,154 +30,335 @@ use crate::prefs::ThemeChoice;
 // Palette
 // ---------------------------------------------------------------------------
 
-/// Semantic colour tokens for one theme. Helpers resolve the right set from the
-/// active visuals via [`colors`], so they recolour automatically on theme flip.
+/// Raw sRGB palette for one appearance, as `0xRRGGBB`. Kept as integers so the
+/// same table feeds both the GPUI colours ([`Colors`]) and the GPUI Component
+/// theme config (which takes hex strings).
 #[derive(Clone, Copy)]
+struct Palette {
+    bg: u32,
+    surface: u32,
+    surface_hi: u32,
+    sidebar: u32,
+    input: u32,
+    border: u32,
+    text: u32,
+    text_muted: u32,
+    accent: u32,
+    accent_hi: u32,
+    ok: u32,
+    warn: u32,
+    err: u32,
+    on_accent: u32,
+}
+
+const DARK: Palette = Palette {
+    bg: 0x14161b,
+    surface: 0x1b1e25,
+    surface_hi: 0x232730,
+    sidebar: 0x101217,
+    input: 0x0f1116,
+    border: 0x2c313c,
+    text: 0xe6e8ed,
+    text_muted: 0x8a909c,
+    accent: 0x6da5ff,
+    accent_hi: 0x6aa3f5,
+    ok: 0x3fb968,
+    warn: 0xd9a33d,
+    err: 0xe05d5d,
+    on_accent: 0x0c1c34,
+};
+
+const LIGHT: Palette = Palette {
+    bg: 0xf6f7f9,
+    surface: 0xffffff,
+    surface_hi: 0xeef0f3,
+    sidebar: 0xedeff3,
+    input: 0xf3f5f8,
+    border: 0xd9dde3,
+    text: 0x1b1e25,
+    text_muted: 0x5e6573,
+    accent: 0x2f6fe0,
+    accent_hi: 0x1f5fd6,
+    ok: 0x20763e,
+    warn: 0x8a5b09,
+    err: 0xcf4444,
+    on_accent: 0xffffff,
+};
+
+/// Semantic colour tokens for one appearance. Helpers resolve the right set
+/// from the active appearance via [`colors`], so they recolour automatically
+/// when the theme flips.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Colors {
-    pub bg: Color32,
-    pub surface: Color32,
-    pub surface_hi: Color32,
-    pub sidebar: Color32,
-    pub input: Color32,
-    pub border: Color32,
-    pub text: Color32,
-    pub text_muted: Color32,
-    pub accent: Color32,
-    pub accent_hi: Color32,
-    pub ok: Color32,
-    pub warn: Color32,
-    pub err: Color32,
-    pub on_accent: Color32,
+    pub bg: Hsla,
+    pub surface: Hsla,
+    pub surface_hi: Hsla,
+    pub sidebar: Hsla,
+    pub input: Hsla,
+    pub border: Hsla,
+    pub text: Hsla,
+    pub text_muted: Hsla,
+    pub accent: Hsla,
+    pub accent_hi: Hsla,
+    pub ok: Hsla,
+    pub warn: Hsla,
+    pub err: Hsla,
+    pub on_accent: Hsla,
 }
 
 impl Colors {
-    pub const fn dark() -> Self {
+    fn from_palette(p: &Palette) -> Self {
+        let c = |hex: u32| -> Hsla { rgb(hex).into() };
         Self {
-            bg: Color32::from_rgb(0x14, 0x16, 0x1b),
-            surface: Color32::from_rgb(0x1b, 0x1e, 0x25),
-            surface_hi: Color32::from_rgb(0x23, 0x27, 0x30),
-            sidebar: Color32::from_rgb(0x10, 0x12, 0x17),
-            input: Color32::from_rgb(0x0f, 0x11, 0x16),
-            border: Color32::from_rgb(0x2c, 0x31, 0x3c),
-            text: Color32::from_rgb(0xe6, 0xe8, 0xed),
-            text_muted: Color32::from_rgb(0x8a, 0x90, 0x9c),
-            accent: Color32::from_rgb(0x6d, 0xa5, 0xff),
-            accent_hi: Color32::from_rgb(0x6a, 0xa3, 0xf5),
-            ok: Color32::from_rgb(0x3f, 0xb9, 0x68),
-            warn: Color32::from_rgb(0xd9, 0xa3, 0x3d),
-            err: Color32::from_rgb(0xe0, 0x5d, 0x5d),
-            on_accent: Color32::from_rgb(0x0c, 0x1c, 0x34),
+            bg: c(p.bg),
+            surface: c(p.surface),
+            surface_hi: c(p.surface_hi),
+            sidebar: c(p.sidebar),
+            input: c(p.input),
+            border: c(p.border),
+            text: c(p.text),
+            text_muted: c(p.text_muted),
+            accent: c(p.accent),
+            accent_hi: c(p.accent_hi),
+            ok: c(p.ok),
+            warn: c(p.warn),
+            err: c(p.err),
+            on_accent: c(p.on_accent),
         }
     }
 
-    pub const fn light() -> Self {
-        Self {
-            bg: Color32::from_rgb(0xf6, 0xf7, 0xf9),
-            surface: Color32::from_rgb(0xff, 0xff, 0xff),
-            surface_hi: Color32::from_rgb(0xee, 0xf0, 0xf3),
-            sidebar: Color32::from_rgb(0xed, 0xef, 0xf3),
-            input: Color32::from_rgb(0xf3, 0xf5, 0xf8),
-            border: Color32::from_rgb(0xd9, 0xdd, 0xe3),
-            text: Color32::from_rgb(0x1b, 0x1e, 0x25),
-            text_muted: Color32::from_rgb(0x5e, 0x65, 0x73),
-            accent: Color32::from_rgb(0x2f, 0x6f, 0xe0),
-            accent_hi: Color32::from_rgb(0x1f, 0x5f, 0xd6),
-            ok: Color32::from_rgb(0x20, 0x76, 0x3e),
-            warn: Color32::from_rgb(0x8a, 0x5b, 0x09),
-            err: Color32::from_rgb(0xcf, 0x44, 0x44),
-            on_accent: Color32::WHITE,
-        }
+    #[must_use]
+    pub fn dark() -> Self {
+        Self::from_palette(&DARK)
+    }
+
+    #[must_use]
+    pub fn light() -> Self {
+        Self::from_palette(&LIGHT)
     }
 }
 
-/// The token set for the `ui`'s active theme.
-pub fn colors(ui: &egui::Ui) -> Colors {
-    if ui.visuals().dark_mode {
-        Colors::dark()
-    } else {
-        Colors::light()
+/// `c` at an absolute alpha of `a / 255`.
+#[must_use]
+pub fn with_alpha(c: Hsla, a: u8) -> Hsla {
+    Hsla {
+        a: f32::from(a) / 255.0,
+        ..c
     }
 }
 
-/// The token set for the context's active theme (for panel frames built before
-/// a `Ui` exists).
-pub fn colors_for(ctx: &egui::Context) -> Colors {
-    if ctx.theme() == egui::Theme::Dark {
-        Colors::dark()
-    } else {
-        Colors::light()
-    }
-}
-
-/// Accent colour at a soft translucent alpha — for selected nav rows etc.
-pub fn accent_soft(c: Colors) -> Color32 {
+/// Accent colour at a soft translucent alpha — for selected rows and the like.
+#[must_use]
+pub fn accent_soft(c: Colors) -> Hsla {
     with_alpha(c.accent, 40)
 }
 
-// Back-compat shims: the existing `app.rs` colours these status/accent strings
-// directly via `colored_label`/`RichText::color`, which override per call and so
-// read on both themes. Structural uses migrate to `colors(ui)` over time.
-pub const OK_GREEN: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x68);
-pub const ERR_RED: Color32 = Color32::from_rgb(0xe0, 0x5d, 0x5d);
-pub const WARN_AMBER: Color32 = Color32::from_rgb(0xd9, 0xa3, 0x3d);
-pub const MUTED: Color32 = Color32::from_rgb(0x80, 0x87, 0x93);
-pub const ACCENT: Color32 = Color32::from_rgb(0x3f, 0x83, 0xe6);
-
-pub const RADIUS: u8 = 10;
-pub const RADIUS_SM: u8 = 6;
-pub const SIDEBAR_W: f32 = 216.0;
-
-fn with_alpha(c: Color32, a: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+/// Black at `a / 255` alpha — modal backdrops and shadows.
+#[must_use]
+fn black_alpha(a: u8) -> Hsla {
+    with_alpha(rgb(0x000000).into(), a)
 }
 
-fn shadow(offset_y: i8, blur: u8, alpha: u8) -> egui::epaint::Shadow {
-    egui::epaint::Shadow {
-        offset: [0, offset_y],
-        blur,
-        spread: 0,
-        color: Color32::from_black_alpha(alpha),
-    }
+pub const RADIUS: Pixels = px(10.0);
+pub const RADIUS_SM: Pixels = px(6.0);
+pub const SIDEBAR_W: Pixels = px(216.0);
+
+/// Type scale, matching the app's long-standing sizes.
+pub const TEXT_HEADING: Pixels = px(22.0);
+pub const TEXT_H2: Pixels = px(16.0);
+pub const TEXT_BODY: Pixels = px(14.5);
+pub const TEXT_SMALL: Pixels = px(12.0);
+pub const TEXT_MONO: Pixels = px(13.0);
+
+/// Family names inside the bundled font files (what GPUI resolves by name).
+pub const FONT_UI: &str = "Inter";
+pub const FONT_ICONS: &str = "Phosphor";
+
+fn shadow(offset_y: f32, blur: f32, alpha: u8) -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: black_alpha(alpha),
+        offset: gpui_kit::point(px(0.0), px(offset_y)),
+        blur_radius: px(blur),
+        spread_radius: px(0.0),
+        inset: false,
+    }]
 }
 
 // ---------------------------------------------------------------------------
-// Install: fonts + style for both themes
+// Appearance state
 // ---------------------------------------------------------------------------
 
-/// Register bundled fonts and install the light/dark styles. Call once at startup.
-pub fn install(ctx: &egui::Context) {
-    install_fonts(ctx);
-    // Follow the OS appearance until told otherwise. `crate::run` applies the
-    // saved choice right after this, before the first frame.
-    ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::System);
-    ctx.set_style_of(egui::Theme::Dark, style_for(egui::Theme::Dark));
-    ctx.set_style_of(egui::Theme::Light, style_for(egui::Theme::Light));
+/// The live appearance: what the user picked, and what the OS currently is.
+/// Lives in a GPUI global so every view (and the Settings page) reads the one
+/// value actually on screen rather than a copy that could drift.
+struct Appearance {
+    choice: ThemeChoice,
+    system_dark: bool,
+}
+
+impl Global for Appearance {}
+
+fn appearance_is_dark(appearance: WindowAppearance) -> bool {
+    matches!(
+        appearance,
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    )
+}
+
+/// Register bundled fonts and install the light/dark palettes. Call once at
+/// startup, before opening a window (fonts must be known before first layout).
+pub fn install(cx: &mut App) {
+    install_fonts(cx);
+    let system_dark = appearance_is_dark(cx.window_appearance());
+    cx.set_global(Appearance {
+        // Follow the OS appearance until told otherwise. `crate::run` applies
+        // the saved choice right after this, before the first frame.
+        choice: ThemeChoice::System,
+        system_dark,
+    });
+    Theme::update(cx, |theme| {
+        theme.light_theme = Rc::new(component_config(&LIGHT, ThemeMode::Light));
+        theme.dark_theme = Rc::new(component_config(&DARK, ThemeMode::Dark));
+    });
+    sync(cx);
 }
 
 /// Apply a saved [`ThemeChoice`].
 ///
-/// The only place [`ThemeChoice`] is mapped onto egui, so the persistence model
-/// in [`crate::prefs`] stays UI-free.
-pub fn apply_choice(ctx: &egui::Context, choice: ThemeChoice) {
-    ctx.set_theme(match choice {
-        ThemeChoice::System => egui::ThemePreference::System,
-        ThemeChoice::Light => egui::ThemePreference::Light,
-        ThemeChoice::Dark => egui::ThemePreference::Dark,
-    });
+/// The only place [`ThemeChoice`] is mapped onto the toolkit, so the
+/// persistence model in [`crate::prefs`] stays UI-free.
+pub fn apply_choice(choice: ThemeChoice, cx: &mut App) {
+    if !cx.has_global::<Appearance>() {
+        install(cx);
+    }
+    cx.global_mut::<Appearance>().choice = choice;
+    sync(cx);
+}
+
+/// Record a change in the OS appearance (from a window's appearance
+/// observer). Only visible when the user follows the system.
+pub fn set_system_appearance(appearance: WindowAppearance, cx: &mut App) {
+    if !cx.has_global::<Appearance>() {
+        return;
+    }
+    let dark = appearance_is_dark(appearance);
+    if cx.global::<Appearance>().system_dark != dark {
+        cx.global_mut::<Appearance>().system_dark = dark;
+        sync(cx);
+    }
 }
 
 /// The choice currently in force.
-///
-/// egui's `Options` holds the live preference, so the Settings page reads it
-/// back from here rather than keeping a second copy on `App` that could drift
-/// out of sync with what is actually on screen.
 #[must_use]
-pub fn current_choice(ctx: &egui::Context) -> ThemeChoice {
-    match ctx.options(|o| o.theme_preference) {
-        egui::ThemePreference::System => ThemeChoice::System,
-        egui::ThemePreference::Light => ThemeChoice::Light,
-        egui::ThemePreference::Dark => ThemeChoice::Dark,
+pub fn current_choice(cx: &App) -> ThemeChoice {
+    cx.try_global::<Appearance>()
+        .map_or(ThemeChoice::System, |a| a.choice)
+}
+
+/// Whether the dark palette is the one on screen.
+#[must_use]
+pub fn is_dark(cx: &App) -> bool {
+    cx.try_global::<Appearance>()
+        .is_some_and(|a| match a.choice {
+            ThemeChoice::System => a.system_dark,
+            ThemeChoice::Light => false,
+            ThemeChoice::Dark => true,
+        })
+}
+
+/// The token set for the active appearance.
+#[must_use]
+pub fn colors(cx: &App) -> Colors {
+    if is_dark(cx) {
+        Colors::dark()
+    } else {
+        Colors::light()
     }
+}
+
+/// Push the resolved appearance into GPUI Component (inputs, menus, buttons,
+/// scrollbars) and re-render every window.
+fn sync(cx: &mut App) {
+    let mode = if is_dark(cx) {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    };
+    Theme::change(mode, None, cx);
+}
+
+fn hex(c: u32) -> SharedString {
+    format!("#{c:06x}").into()
+}
+
+fn hex_alpha(c: u32, a: u8) -> SharedString {
+    format!("#{c:06x}{a:02x}").into()
+}
+
+/// The FileSec palette expressed as a GPUI Component theme, so its controls
+/// (inputs, menus, checkboxes, scrollbars, buttons) match the app's own
+/// surfaces in both appearances.
+fn component_config(p: &Palette, mode: ThemeMode) -> ThemeConfig {
+    let dark = matches!(mode, ThemeMode::Dark);
+    let mut cfg = ThemeConfig::default();
+    cfg.name = if dark {
+        "FileSec Dark"
+    } else {
+        "FileSec Light"
+    }
+    .into();
+    cfg.mode = mode;
+    cfg.font_family = Some(FONT_UI.into());
+    cfg.font_size = Some(14.5);
+    cfg.radius = Some(6);
+    cfg.radius_lg = Some(10);
+    cfg.shadow = Some(true);
+    let on_danger = if dark { p.on_accent } else { 0xffffff };
+    let k = &mut cfg.colors;
+    k.background = Some(hex(p.bg));
+    k.foreground = Some(hex(p.text));
+    k.border = Some(hex(p.border));
+    k.input = Some(hex(p.border));
+    k.ring = Some(hex(p.accent));
+    k.caret = Some(hex(p.accent));
+    k.selection = Some(hex_alpha(p.accent, 70));
+    k.accent = Some(hex(p.surface_hi));
+    k.accent_foreground = Some(hex(p.text));
+    k.muted = Some(hex(p.surface_hi));
+    k.muted_foreground = Some(hex(p.text_muted));
+    k.popover = Some(hex(p.surface));
+    k.popover_foreground = Some(hex(p.text));
+    k.overlay = Some(hex_alpha(0x000000, 130));
+    k.primary = Some(hex(p.accent));
+    k.primary_hover = Some(hex(p.accent_hi));
+    k.primary_active = Some(hex(p.accent_hi));
+    k.primary_foreground = Some(hex(p.on_accent));
+    k.secondary = Some(hex(p.surface_hi));
+    k.secondary_hover = Some(hex(p.border));
+    k.secondary_active = Some(hex(p.border));
+    k.secondary_foreground = Some(hex(p.text));
+    k.button = Some(hex(p.surface_hi));
+    k.button_hover = Some(hex(p.border));
+    k.button_active = Some(hex(p.border));
+    k.button_foreground = Some(hex(p.text));
+    k.danger = Some(hex(p.err));
+    k.danger_hover = Some(hex(p.err));
+    k.danger_active = Some(hex(p.err));
+    k.danger_foreground = Some(hex(on_danger));
+    k.success = Some(hex(p.ok));
+    k.warning = Some(hex(p.warn));
+    k.list = Some(hex(p.surface));
+    k.list_hover = Some(hex(p.surface_hi));
+    k.list_active = Some(hex_alpha(p.accent, 40));
+    k.list_active_border = Some(hex(p.accent));
+    k.progress_bar = Some(hex(p.accent));
+    k.link = Some(hex(p.accent));
+    k.sidebar = Some(hex(p.sidebar));
+    k.scrollbar = Some(hex_alpha(p.bg, 0));
+    k.scrollbar_thumb = Some(hex_alpha(p.text_muted, 110));
+    k.scrollbar_thumb_hover = Some(hex_alpha(p.text_muted, 170));
+    k.switch = Some(hex(p.border));
+    cfg
 }
 
 /// License notices for the assets compiled into the app (the Inter typeface
@@ -189,139 +376,22 @@ pub const EMBEDDED_ASSET_NOTICES: &[(&str, &str)] = &[
     ),
 ];
 
-fn install_fonts(ctx: &egui::Context) {
-    use egui::{FontData, FontFamily};
-    // Start from the default set so egui's emoji/symbol fallbacks are preserved.
-    let mut fonts = egui::FontDefinitions::default();
+/// Static Inter instances (see scripts/derive_inter_instances.py): GPUI's Linux
+/// text stack only renders a variable font's default instance, so real weights
+/// need real faces to be consistent on every platform.
+const INTER: [&[u8]; 3] = [
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+];
+const PHOSPHOR: &[u8] = include_bytes!("../assets/fonts/Phosphor.ttf");
 
-    fonts.font_data.insert(
-        "Inter".to_owned(),
-        Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/InterVariable.ttf"
-        ))),
-    );
-    fonts.font_data.insert(
-        "Phosphor".to_owned(),
-        Arc::new(FontData::from_static(include_bytes!(
-            "../assets/fonts/Phosphor.ttf"
-        ))),
-    );
-
-    // Inter becomes the primary proportional face; keep the rest as fallbacks so
-    // existing emoji glyphs (🔒 🔑 ⚠ …) still resolve.
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "Inter".to_owned());
-    // Dedicated family for the Phosphor line-icon glyphs.
-    fonts.families.insert(
-        FontFamily::Name("phosphor".into()),
-        vec!["Phosphor".to_owned()],
-    );
-
-    ctx.set_fonts(fonts);
-}
-
-fn style_for(theme: egui::Theme) -> egui::Style {
-    let mut style = theme.default_style();
-    let c = match theme {
-        egui::Theme::Dark => Colors::dark(),
-        egui::Theme::Light => Colors::light(),
-    };
-    apply(&mut style, &c);
-    style
-}
-
-fn apply(style: &mut egui::Style, c: &Colors) {
-    use egui::{
-        CornerRadius, FontFamily::Monospace, FontFamily::Proportional, FontId, Margin, Stroke,
-        TextStyle, Vec2,
-    };
-
-    // Spacing — roomier than egui defaults.
-    let sp = &mut style.spacing;
-    sp.item_spacing = Vec2::new(8.0, 8.0);
-    sp.button_padding = Vec2::new(12.0, 7.0);
-    sp.window_margin = Margin::same(14);
-    sp.menu_margin = Margin::same(8);
-    sp.interact_size = Vec2::new(0.0, 34.0);
-    sp.indent = 18.0;
-
-    // Type scale — larger and cleaner than the tiny egui defaults.
-    style.text_styles = [
-        (TextStyle::Heading, FontId::new(22.0, Proportional)),
-        (
-            TextStyle::Name("H2".into()),
-            FontId::new(16.0, Proportional),
-        ),
-        (TextStyle::Body, FontId::new(14.5, Proportional)),
-        (TextStyle::Button, FontId::new(14.5, Proportional)),
-        (TextStyle::Small, FontId::new(12.0, Proportional)),
-        (TextStyle::Monospace, FontId::new(13.0, Monospace)),
-    ]
-    .into();
-
-    let radius = CornerRadius::same(RADIUS);
-    let radius_sm = CornerRadius::same(RADIUS_SM);
-    let v = &mut style.visuals;
-    v.panel_fill = c.bg;
-    v.window_fill = c.surface;
-    v.extreme_bg_color = c.input;
-    v.text_edit_bg_color = Some(c.input);
-    v.faint_bg_color = c.surface_hi;
-    v.code_bg_color = c.surface_hi;
-    v.override_text_color = Some(c.text);
-    v.hyperlink_color = c.accent;
-    v.warn_fg_color = c.warn;
-    v.error_fg_color = c.err;
-    v.window_corner_radius = radius;
-    v.menu_corner_radius = radius;
-    v.window_stroke = Stroke::new(1.0_f32, c.border);
-    v.window_shadow = shadow(8, 24, 120);
-    v.popup_shadow = shadow(6, 16, 100);
-    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
-    v.selection = egui::style::Selection {
-        bg_fill: with_alpha(c.accent, 70),
-        // Doubles as the focus ring around text inputs (egui draws this stroke
-        // when a TextEdit has keyboard focus), so give it a touch more weight.
-        stroke: Stroke::new(1.5_f32, c.accent),
-    };
-
-    let w = &mut v.widgets;
-    // Non-interactive: labels, separators, group frames.
-    w.noninteractive.corner_radius = radius_sm;
-    w.noninteractive.bg_fill = c.surface;
-    w.noninteractive.weak_bg_fill = c.surface;
-    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, c.border);
-    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, c.text_muted);
-    // Inactive: idle buttons / text edits.
-    w.inactive.corner_radius = radius_sm;
-    w.inactive.bg_fill = c.surface_hi;
-    w.inactive.weak_bg_fill = c.surface_hi;
-    w.inactive.bg_stroke = Stroke::new(1.0_f32, c.border);
-    w.inactive.fg_stroke = Stroke::new(1.0_f32, c.text);
-    w.inactive.expansion = 0.0;
-    // Hovered.
-    w.hovered.corner_radius = radius_sm;
-    w.hovered.bg_fill = c.surface_hi;
-    w.hovered.weak_bg_fill = c.surface_hi;
-    w.hovered.bg_stroke = Stroke::new(1.0_f32, c.accent);
-    w.hovered.fg_stroke = Stroke::new(1.0_f32, c.text);
-    w.hovered.expansion = 1.0;
-    // Active / pressed.
-    w.active.corner_radius = radius_sm;
-    w.active.bg_fill = with_alpha(c.accent, 64);
-    w.active.weak_bg_fill = with_alpha(c.accent, 64);
-    w.active.bg_stroke = Stroke::new(1.0_f32, c.accent);
-    w.active.fg_stroke = Stroke::new(1.0_f32, c.text);
-    w.active.expansion = 1.0;
-    // Open (combo boxes / menus).
-    w.open.corner_radius = radius_sm;
-    w.open.bg_fill = c.surface_hi;
-    w.open.weak_bg_fill = c.surface_hi;
-    w.open.bg_stroke = Stroke::new(1.0_f32, c.border);
-    w.open.fg_stroke = Stroke::new(1.0_f32, c.text);
+fn install_fonts(cx: &mut App) {
+    // Best-effort: if the platform text system refuses a face, GPUI falls back
+    // to the system UI font rather than failing to start.
+    let mut faces: Vec<Cow<'static, [u8]>> = INTER.iter().map(|f| Cow::Borrowed(*f)).collect();
+    faces.push(Cow::Borrowed(PHOSPHOR));
+    let _ = cx.text_system().add_fonts(faces);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,169 +427,173 @@ pub mod icon {
     pub const SAVE: &str = "\u{e248}"; // floppy-disk
     pub const GEAR: &str = "\u{e270}";
     pub const IMPORT: &str = "\u{e010}"; // tray-arrow-down
+    pub const DOTS: &str = "\u{e1fe}"; // dots-three
+    pub const CARET_RIGHT: &str = "\u{e13a}";
+    pub const CARET_DOWN: &str = "\u{e136}";
 }
 
-/// A [`RichText`] rendered in the Phosphor icon family at `size`.
-pub fn icon_text(glyph: &str, size: f32) -> egui::RichText {
-    egui::RichText::new(glyph).font(egui::FontId::new(
-        size,
-        egui::FontFamily::Name("phosphor".into()),
-    ))
+/// A Phosphor glyph at `size`, in `color`.
+pub fn icon_text(glyph: &'static str, size: f32, color: Hsla) -> Div {
+    div()
+        .flex_none()
+        .font_family(FONT_ICONS)
+        .text_size(px(size))
+        .line_height(px(size))
+        .text_color(color)
+        .child(glyph)
 }
 
 // ---------------------------------------------------------------------------
-// Widget helpers
+// Text helpers
 // ---------------------------------------------------------------------------
 
-/// The actual height of a title and a small detail line, separated by two points.
-/// Horizontal rows need this height up front to center the whole text block.
-pub fn two_line_height(ui: &egui::Ui, title_size: f32) -> f32 {
-    ui.fonts(|fonts| fonts.row_height(&egui::FontId::proportional(title_size)))
-        + ui.text_style_height(&egui::TextStyle::Small)
-        + 2.0
+/// Body-size text in `color`.
+pub fn text(s: impl Into<SharedString>, color: Hsla) -> Div {
+    div().text_size(TEXT_BODY).text_color(color).child(s.into())
 }
 
-/// A bordered, rounded, padded surface. Use to group list rows and form sections.
-pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let c = colors(ui);
-    egui::Frame::NONE
-        .fill(c.surface)
-        .stroke(egui::Stroke::new(1.0_f32, c.border))
-        .corner_radius(egui::CornerRadius::same(RADIUS))
-        .inner_margin(egui::Margin::same(16))
-        .outer_margin(egui::Margin {
-            bottom: 8,
-            ..Default::default()
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), add)
-                .inner
-        })
-        .inner
+/// Small supporting text in `color`, wrapping.
+pub fn small(s: impl Into<SharedString>, color: Hsla) -> Div {
+    div()
+        .text_size(TEXT_SMALL)
+        .text_color(color)
+        .child(s.into())
+}
+
+/// Muted small text — the most common supporting-copy style.
+pub fn muted(s: impl Into<SharedString>, c: Colors) -> Div {
+    small(s, c.text_muted)
+}
+
+/// Bold text at `size`.
+pub fn strong(s: impl Into<SharedString>, size: Pixels, color: Hsla) -> Div {
+    div()
+        .text_size(size)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color)
+        .child(s.into())
+}
+
+/// A single line that truncates with an ellipsis instead of wrapping.
+pub fn one_line(el: Div) -> Div {
+    el.min_w_0().overflow_hidden().truncate()
+}
+
+/// Monospace text (fingerprints, addresses, paths).
+pub fn mono(s: impl Into<SharedString>, size: Pixels, color: Hsla, cx: &App) -> Div {
+    div()
+        .font_family(Theme::global(cx).mono_font_family.clone())
+        .text_size(size)
+        .text_color(color)
+        .child(s.into())
+}
+
+// ---------------------------------------------------------------------------
+// Element helpers
+// ---------------------------------------------------------------------------
+
+/// A bordered, rounded, padded surface. Use to group list rows and form
+/// sections. Children are stacked vertically with the app's 8 px rhythm.
+pub fn card(c: Colors) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .bg(c.surface)
+        .border_1()
+        .border_color(c.border)
+        .rounded(RADIUS)
+        .p(px(16.0))
+}
+
+/// A horizontal row with the app's default spacing, vertically centred.
+pub fn row() -> Div {
+    div().flex().flex_row().items_center().gap(px(8.0))
+}
+
+/// A vertical stack with the app's default spacing.
+fn col() -> Div {
+    div().flex().flex_col().gap(px(8.0))
+}
+
+/// A horizontal row whose children wrap onto the next line when narrow.
+pub fn wrap_row() -> Div {
+    row().flex_wrap()
 }
 
 /// Accent-filled primary call-to-action.
-pub fn primary_button(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Response {
-    let c = colors(ui);
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label.into())
-                .color(c.on_accent)
-                .strong(),
-        )
-        .fill(c.accent)
-        .corner_radius(egui::CornerRadius::same(RADIUS_SM))
-        .min_size(egui::vec2(0.0, 32.0)),
-    )
+pub fn primary_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).primary().label(label)
 }
 
 /// Outlined secondary button.
-pub fn secondary_button(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Response {
-    let c = colors(ui);
-    ui.add(
-        egui::Button::new(egui::RichText::new(label.into()).color(c.text))
-            .fill(c.surface_hi)
-            .stroke(egui::Stroke::new(1.0_f32, c.border))
-            .corner_radius(egui::CornerRadius::same(RADIUS_SM))
-            .min_size(egui::vec2(0.0, 32.0)),
-    )
+pub fn secondary_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).label(label)
 }
 
-/// Destructive action button (filled error colour).
-pub fn danger_button(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Response {
-    let c = colors(ui);
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label.into())
-                .color(if ui.visuals().dark_mode {
-                    c.on_accent
-                } else {
-                    Color32::WHITE
-                })
-                .strong(),
-        )
-        .fill(c.err)
-        .corner_radius(egui::CornerRadius::same(RADIUS_SM))
-        .min_size(egui::vec2(0.0, 32.0)),
-    )
+/// Destructive action button: a solid error-colour fill in both appearances
+/// (GPUI Component's own danger variant is only a faint tint in dark mode,
+/// which undersells an irreversible action).
+pub fn danger_button(id: impl Into<ElementId>, label: impl Into<SharedString>, cx: &App) -> Button {
+    let c = colors(cx);
+    let fg = if is_dark(cx) {
+        c.on_accent
+    } else {
+        rgb(0xffffff).into()
+    };
+    let variant = ButtonCustomVariant::new(cx)
+        .color(c.err)
+        .foreground(fg)
+        .hover(c.err.opacity(0.88))
+        .active(c.err.opacity(0.76));
+    Button::new(id).custom(variant).label(label)
+}
+
+/// A borderless text button tinted with the accent colour (links, "Select all").
+pub fn link_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).ghost().small().label(label)
+}
+
+/// A compact secondary button ("Copy").
+pub fn small_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).small().label(label)
 }
 
 /// Accent-filled primary button that fills the available width.
-pub fn primary_button_full(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Response {
-    let c = colors(ui);
-    let w = ui.available_width();
-    ui.add_sized(
-        egui::vec2(w, 36.0),
-        egui::Button::new(
-            egui::RichText::new(label.into())
-                .color(c.on_accent)
-                .strong(),
-        )
-        .fill(c.accent)
-        .corner_radius(egui::CornerRadius::same(RADIUS_SM)),
-    )
+pub fn primary_button_full(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    primary_button(id, label).w_full().h(px(36.0))
 }
 
-/// Outlined secondary button that fills the available width.
-pub fn secondary_button_full(ui: &mut egui::Ui, label: impl Into<String>) -> egui::Response {
-    let c = colors(ui);
-    let w = ui.available_width();
-    ui.add_sized(
-        egui::vec2(w, 36.0),
-        egui::Button::new(egui::RichText::new(label.into()).color(c.text))
-            .fill(c.surface_hi)
-            .stroke(egui::Stroke::new(1.0_f32, c.border))
-            .corner_radius(egui::CornerRadius::same(RADIUS_SM)),
-    )
+/// Secondary button that fills the available width.
+pub fn secondary_button_full(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    secondary_button(id, label).w_full().h(px(36.0))
 }
 
-/// A full-width, comfortably-padded single-line input with the inset field look
-/// and an accent focus ring.
-pub fn text_input(
-    ui: &mut egui::Ui,
-    text: &mut String,
-    hint: &str,
-    password: bool,
-) -> egui::Response {
-    ui.add(
-        egui::TextEdit::singleline(text)
-            .password(password)
-            .hint_text(hint)
-            .desired_width(f32::INFINITY)
-            .margin(egui::Margin::symmetric(12, 9))
-            .font(egui::TextStyle::Body),
-    )
+/// A borderless icon button tinted with the muted text colour. `hover` is its
+/// tooltip and its accessible name.
+pub fn icon_button(
+    id: impl Into<ElementId>,
+    glyph: &'static str,
+    hover: &str,
+    c: Colors,
+) -> Button {
+    let hover: SharedString = hover.to_string().into();
+    Button::new(id)
+        .ghost()
+        .w(px(32.0))
+        .h(px(32.0))
+        .child(icon_text(glyph, 17.0, c.text_muted))
+        .tooltip(hover.clone())
+        .accessibility_label(hover)
 }
 
-/// A full-width multi-line input (e.g. pasting a public key).
-///
-/// Capped at `rows` lines tall: a `TextEdit::multiline` grows with its content,
-/// so pasting a long key would otherwise balloon the field until it pushed the
-/// buttons below it off-screen. Wrapping it in a fixed-height scroll area keeps
-/// the field compact and scrolls the overflow internally instead.
-pub fn text_area(ui: &mut egui::Ui, text: &mut String, hint: &str, rows: usize) -> egui::Response {
-    // Match the visible height to `rows` lines plus the field's vertical margin,
-    // so an empty field fits exactly and only longer content reveals a scrollbar.
-    let row_h = ui.text_style_height(&egui::TextStyle::Body);
-    let max_height = row_h * rows as f32 + 16.0;
-    egui::ScrollArea::vertical()
-        .max_height(max_height)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(text)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(rows)
-                    .margin(egui::Margin::symmetric(10, 8))
-                    .font(egui::TextStyle::Body),
-            )
-        })
-        .inner
+/// Set `disabled` on any GPUI Component control in a builder chain.
+pub fn enabled<T: Disableable>(el: T, enabled: bool) -> T {
+    el.disabled(!enabled)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum BadgeKind {
     Ok,
     Warn,
@@ -529,8 +603,7 @@ pub enum BadgeKind {
 }
 
 /// A small coloured pill — used for trust state and status flags.
-pub fn badge(ui: &mut egui::Ui, text: impl Into<String>, kind: BadgeKind) -> egui::Response {
-    let c = colors(ui);
+pub fn badge(label: impl Into<SharedString>, kind: BadgeKind, c: Colors) -> Div {
     let col = match kind {
         BadgeKind::Ok => c.ok,
         BadgeKind::Warn => c.warn,
@@ -538,174 +611,204 @@ pub fn badge(ui: &mut egui::Ui, text: impl Into<String>, kind: BadgeKind) -> egu
         BadgeKind::Accent => c.accent,
         BadgeKind::Neutral => c.text_muted,
     };
-    egui::Frame::NONE
-        .fill(with_alpha(col, 38))
-        .stroke(egui::Stroke::new(1.0_f32, with_alpha(col, 110)))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text.into()).color(col).small().strong());
-        })
-        .response
+    div()
+        .flex_none()
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(10.0))
+        .bg(with_alpha(col, 38))
+        .border_1()
+        .border_color(with_alpha(col, 110))
+        .text_size(TEXT_SMALL)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(col)
+        .child(label.into())
 }
 
-/// A screen heading with a right-aligned action area.
-pub fn section_header(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
-    if ui.available_width() < 600.0 {
-        ui.heading(title);
-        ui.horizontal_wrapped(right);
+/// A screen heading with a right-aligned action area. Below 600 px the
+/// actions wrap underneath the title instead of squeezing it.
+pub fn section_header(
+    title: impl Into<SharedString>,
+    right: Option<AnyElement>,
+    wide: bool,
+    c: Colors,
+) -> Div {
+    let heading = strong(title, TEXT_HEADING, c.text);
+    let header = if wide {
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(one_line(heading).flex_1())
+            .children(right.map(|r| row().flex_none().child(r)))
     } else {
-        ui.horizontal(|ui| {
-            ui.heading(title);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
-        });
-    }
-    ui.add_space(8.0);
+        col()
+            .w_full()
+            .child(heading)
+            .children(right.map(|r| wrap_row().child(r)))
+    };
+    header.mb(px(8.0))
 }
 
 /// Supporting copy below a page heading, with a consistent reading rhythm.
-pub fn page_description(ui: &mut egui::Ui, text: impl Into<String>) {
-    let c = colors(ui);
-    ui.add(egui::Label::new(egui::RichText::new(text.into()).color(c.text_muted)).wrap());
-    ui.add_space(16.0);
+pub fn page_description(s: impl Into<SharedString>, c: Colors) -> Div {
+    text(s, c.text_muted).w_full().mb(px(16.0))
 }
 
-/// A centered placeholder for empty lists: muted icon, title, subtitle, and a CTA.
+/// A centred placeholder for empty lists: muted icon, title, subtitle, and an
+/// optional call to action.
 pub fn empty_state(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    title: &str,
-    subtitle: &str,
-    cta: impl FnOnce(&mut egui::Ui),
-) {
-    let c = colors(ui);
-    ui.add_space((ui.available_height() * 0.12).clamp(12.0, 48.0));
-    ui.vertical_centered(|ui| {
-        ui.label(icon_text(glyph, 44.0).color(c.text_muted));
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(title).size(16.0).strong());
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new(subtitle).color(c.text_muted));
-        ui.add_space(14.0);
-        cta(ui);
-    });
-}
-
-/// A borderless icon button tinted with the muted text colour. `hover` is its tooltip.
-pub fn icon_button(ui: &mut egui::Ui, glyph: &str, hover: &str) -> egui::Response {
-    let c = colors(ui);
-    let response = ui.add(
-        egui::Button::new(icon_text(glyph, 17.0).color(c.text_muted))
-            .frame(false)
-            .min_size(egui::vec2(32.0, 32.0)),
-    );
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hover)
-    });
-    response.on_hover_text(hover)
+    glyph: &'static str,
+    title: impl Into<SharedString>,
+    subtitle: impl Into<SharedString>,
+    cta: Option<AnyElement>,
+    c: Colors,
+) -> Div {
+    div()
+        .w_full()
+        .pt(px(32.0))
+        .pb(px(16.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .child(icon_text(glyph, 44.0, c.text_muted))
+        .child(div().h(px(10.0)))
+        .child(strong(title, px(16.0), c.text))
+        .child(div().h(px(2.0)))
+        .child(text(subtitle, c.text_muted).text_center())
+        .child(div().h(px(14.0)))
+        .children(cta)
 }
 
 /// An accent-tinted banner (rounded, soft fill) for transient status messages.
-pub fn banner<R>(ui: &mut egui::Ui, accent: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::NONE
-        .fill(with_alpha(accent, 28))
-        .stroke(egui::Stroke::new(1.0_f32, with_alpha(accent, 90)))
-        .corner_radius(egui::CornerRadius::same(RADIUS_SM))
-        .inner_margin(egui::Margin::symmetric(12, 8))
-        .outer_margin(egui::Margin {
-            bottom: 8,
-            ..Default::default()
-        })
-        .show(ui, add)
-        .inner
+pub fn banner(accent: Hsla) -> Div {
+    div()
+        .w_full()
+        .bg(with_alpha(accent, 28))
+        .border_1()
+        .border_color(with_alpha(accent, 90))
+        .rounded(RADIUS_SM)
+        .px(px(12.0))
+        .py(px(8.0))
+        .mb(px(8.0))
 }
 
-/// A subtle centered "OR" divider between alternative actions.
-pub fn divider_or(ui: &mut egui::Ui) {
-    let c = colors(ui);
-    ui.add_space(8.0);
-    ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("OR").color(c.text_muted).small());
-    });
-    ui.add_space(8.0);
+/// A subtle centred "OR" divider between alternative actions.
+pub fn divider_or(c: Colors) -> Div {
+    div()
+        .w_full()
+        .py(px(4.0))
+        .flex()
+        .justify_center()
+        .child(small("OR", c.text_muted))
 }
 
-/// A centered modal dialog with a dimmed backdrop and a title header. Returns
-/// `(should_close, inner)` — `should_close` is `true` when the user clicked the
-/// backdrop or pressed Escape, which the caller maps to its cancel action.
-pub fn modal<R>(
-    ctx: &egui::Context,
-    title: &str,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> (bool, R) {
-    let c = colors_for(ctx);
-    let resp = egui::Modal::new(egui::Id::new(title))
-        .backdrop_color(Color32::from_black_alpha(130))
-        .frame(
-            egui::Frame::NONE
-                .fill(c.surface)
-                .stroke(egui::Stroke::new(1.0_f32, c.border))
-                .corner_radius(egui::CornerRadius::same(RADIUS))
-                .inner_margin(egui::Margin::same(18))
-                .shadow(shadow(8, 28, 140)),
-        )
-        .show(ctx, |ui| {
-            ui.set_max_width((ctx.screen_rect().width() - 64.0).clamp(160.0, 460.0));
-            ui.label(egui::RichText::new(title).size(18.0).strong());
-            ui.add_space(10.0);
-            egui::ScrollArea::vertical()
-                .max_height((ctx.screen_rect().height() - 140.0).max(100.0))
-                .show(ui, add)
-                .inner
-        });
-    (resp.should_close(), resp.inner)
+/// A thin horizontal rule.
+pub fn separator(c: Colors) -> Div {
+    div().w_full().h(px(1.0)).my(px(4.0)).bg(c.border)
 }
 
-/// A floating toast anchored bottom-right. Returns `true` if the user dismissed it.
-pub fn toast(ctx: &egui::Context, msg: &str, error: bool, bottom_inset: f32) -> bool {
-    let c = if ctx.theme() == egui::Theme::Dark {
-        Colors::dark()
-    } else {
-        Colors::light()
-    };
+/// A field caption (above an input).
+pub fn caption(s: impl Into<SharedString>, c: Colors) -> Div {
+    small(s, c.text_muted)
+}
+
+/// The dimmed full-window backdrop used by modals and the busy overlay. It
+/// occludes everything behind it, so the UI underneath cannot be clicked.
+pub fn backdrop(id: impl Into<ElementId>, alpha: u8) -> gpui_kit::Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .bg(black_alpha(alpha))
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+}
+
+/// The surface of a centred modal dialog (title + scrollable body). The caller
+/// places it inside a [`backdrop`] and wires the dismiss behaviour.
+pub fn modal_card(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    width: Pixels,
+    max_height: Pixels,
+    c: Colors,
+) -> gpui_kit::Stateful<Div> {
+    div()
+        .id(id)
+        .occlude()
+        .w(width)
+        .max_h(max_height)
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .bg(c.surface)
+        .border_1()
+        .border_color(c.border)
+        .rounded(RADIUS)
+        .p(px(18.0))
+        .shadow(shadow(8.0, 28.0, 140))
+        .child(strong(title, px(18.0), c.text))
+}
+
+/// The floating toast surface, anchored bottom-right by the caller.
+pub fn toast_card(error: bool, c: Colors) -> Div {
     let accent = if error { c.err } else { c.ok };
-    let mut dismissed = false;
-    egui::Area::new(egui::Id::new("filesec_toast"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -bottom_inset))
-        .interactable(true)
-        .show(ctx, |ui| {
-            ui.set_max_width((ctx.screen_rect().width() - 64.0).clamp(160.0, 420.0));
-            egui::Frame::NONE
-                .fill(c.surface_hi)
-                .stroke(egui::Stroke::new(1.0_f32, accent))
-                .corner_radius(egui::CornerRadius::same(RADIUS))
-                .inner_margin(egui::Margin::symmetric(14, 10))
-                .shadow(shadow(4, 16, 120))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            icon_text(if error { icon::WARNING } else { icon::CHECK }, 16.0)
-                                .color(accent),
-                        );
-                        let text_width = (ui.available_width() - 44.0).max(80.0);
-                        let text = ui.painter().layout(
-                            msg.to_owned(),
-                            egui::TextStyle::Body.resolve(ui.style()),
-                            c.text,
-                            text_width,
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(text_width, text.size().y),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_width(text_width);
-                                ui.label(text);
-                            },
-                        );
-                        dismissed = icon_button(ui, icon::CLOSE, "Dismiss notification").clicked();
-                    });
-                });
-        });
-    dismissed
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .bg(c.surface_hi)
+        .border_1()
+        .border_color(accent)
+        .rounded(RADIUS)
+        .px(px(14.0))
+        .py(px(10.0))
+        .shadow(shadow(4.0, 16.0, 120))
+        .child(icon_text(
+            if error { icon::WARNING } else { icon::CHECK },
+            16.0,
+            accent,
+        ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_palettes_are_distinct_and_opaque() {
+        let (d, l) = (Colors::dark(), Colors::light());
+        assert_ne!(d.bg, l.bg);
+        for c in [d, l] {
+            for col in [c.bg, c.surface, c.text, c.accent, c.err] {
+                assert!((col.a - 1.0).abs() < f32::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn component_config_carries_the_palette() {
+        let cfg = component_config(&DARK, ThemeMode::Dark);
+        assert_eq!(cfg.colors.background.as_deref(), Some("#14161b"));
+        assert_eq!(cfg.colors.primary.as_deref(), Some("#6da5ff"));
+        assert_eq!(cfg.font_family.as_deref(), Some(FONT_UI));
+        let cfg = component_config(&LIGHT, ThemeMode::Light);
+        assert_eq!(cfg.colors.danger_foreground.as_deref(), Some("#ffffff"));
+    }
+
+    #[test]
+    fn embedded_fonts_are_the_expected_faces() {
+        // Sanity: a truncated or swapped asset would silently fall back.
+        assert!(INTER.iter().all(|f| f.len() > 100_000));
+        assert!(PHOSPHOR.len() > 10_000);
+    }
 }

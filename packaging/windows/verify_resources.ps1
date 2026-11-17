@@ -1,6 +1,6 @@
 # Verify that a built FileSec executable embeds the required application
-# manifest (RT_MANIFEST, resource type 24, id 1) declaring system DPI awareness
-# — the winit multi-monitor workaround from
+# manifest (RT_MANIFEST, resource type 24, id 1) declaring per-monitor-v2 DPI
+# awareness, which GPUI needs to render crisply on every monitor — see
 # crates/filesec-gui/build_support/windows_resources.rs (audit FS-15). The
 # check reads the resource back out of the final .exe with the Windows SDK's
 # mt.exe, so it tests what ships, not what the build script intended.
@@ -33,7 +33,10 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $extracted)) {
 }
 
 $xml = Get-Content -Raw -LiteralPath $extracted
-if ($xml -notmatch '<dpiAwareness[^>]*>\s*system\s*</dpiAwareness>') {
-    throw "$File embeds a manifest without <dpiAwareness>system</dpiAwareness>"
+if ($xml -notmatch '<dpiAwareness[^>]*>\s*PerMonitorV2\s*</dpiAwareness>') {
+    throw "$File embeds a manifest without <dpiAwareness>PerMonitorV2</dpiAwareness>"
 }
-Write-Host "OK: $File embeds the system-DPI-aware application manifest"
+if ($xml -notmatch 'Microsoft\.Windows\.Common-Controls') {
+    throw "$File embeds a manifest without the Common Controls v6 dependency"
+}
+Write-Host "OK: $File embeds the per-monitor-v2 DPI-aware application manifest"

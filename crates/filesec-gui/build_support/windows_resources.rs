@@ -5,35 +5,38 @@
 // without the DPI manifest below).
 
 /// Minimal application manifest, embedded as `RT_MANIFEST` (resource type 24)
-/// id 1 so Windows reads it at process creation. It marks the app
-/// **System**-DPI-aware on purpose.
+/// id 1 so Windows reads it at process creation.
 ///
-/// This is a workaround for an upstream winit 0.30 bug on Windows 11 24H2
-/// (rust-windowing/winit#4041): winit's `WM_DPICHANGED` handler mis-validates the
-/// OS-suggested window rect when a window is dragged between monitors with
-/// different scale factors and snaps it back onto the old monitor, which fires
-/// the event again — a feedback loop that grows the window without bound until it
-/// vanishes and the app has to be restarted. Awareness declared in a manifest is
-/// locked in before any code runs, so winit's programmatic per-monitor-v2 call is
-/// ignored and Windows stops emitting the per-monitor `WM_DPICHANGED` events that
-/// drive the loop. The trade-off is that a secondary monitor whose scaling
-/// differs from the primary is bitmap-stretched (slightly soft) rather than
-/// crisp; single-monitor and uniform-scaling setups are unaffected. Drop this and
-/// let winit go back to per-monitor-v2 once a fixed winit ships and eframe bumps.
+/// It marks the app **per-monitor-v2** DPI aware. GPUI renders at each
+/// monitor's own scale factor and handles `WM_DPICHANGED` itself (moving the
+/// window between monitors re-lays it out at the new scale), but it does not
+/// declare the process's DPI awareness: that is the host executable's job, and
+/// without it Windows bitmap-stretches the whole window. Awareness declared in a
+/// manifest is locked in before any code runs. (The egui/winit build declared
+/// *system* awareness instead, to dodge winit#4041's multi-monitor resize loop;
+/// GPUI has no such loop, so a secondary monitor now renders crisp as well.)
+///
+/// The Common Controls v6 dependency is what GPUI's native message boxes
+/// (`TaskDialogIndirect`) need, and matches the manifest Zed itself ships.
 // No `<?xml …?>` prolog: winresource wraps each line in a quoted RC string with
 // surrounding spaces, so the blob starts with whitespace — and a prolog must be
 // the very first bytes of the document. The `<assembly>` root (with harmless
 // leading whitespace) is all Windows' manifest loader needs. This matches
 // winresource's own documented `set_manifest` example.
 // packaging/windows/verify_resources.ps1 checks the built .exe for the
-// `<dpiAwareness>system</dpiAwareness>` element; keep them in sync.
+// `<dpiAwareness>PerMonitorV2</dpiAwareness>` element; keep them in sync.
 pub const DPI_MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
-      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">system</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
     </windowsSettings>
   </application>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
 </assembly>
 "#;
 

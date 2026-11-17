@@ -14,6 +14,6 @@
     windows_subsystem = "windows"
 )]
 
-fn main() -> eframe::Result<()> {
-    filesec_gui::run("FileSec")
+fn main() {
+    filesec_gui::run("FileSec");
 }

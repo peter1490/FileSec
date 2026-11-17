@@ -676,7 +676,7 @@ mod tests {
             contacts: Arc::new(contacts),
             emitter: super::super::Emitter {
                 tx,
-                ctx: egui::Context::default(),
+                repaint: crate::repaint::Repaint::noop(),
             },
             secret: Arc::new(secret),
             expected: Some(alice.fingerprint()),

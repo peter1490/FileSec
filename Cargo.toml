@@ -3,8 +3,9 @@
 # Crates:
 #   - filesec-core: pure crypto + on-disk `.fsec` container format. No GUI. The
 #     unit/fuzz/audit target where the entire security story lives.
-#   - filesec-gui:  thin egui/eframe presentation layer over filesec-core. Ships
-#     the classical `filesec` binary.
+#   - filesec-gui:  thin GPUI (Zed's GPU-accelerated UI framework, via the GPUI
+#     Kit facade) presentation layer over filesec-core. Ships the classical
+#     `filesec` binary.
 #   - filesec-pqc:  the same GUI compiled with the post-quantum suites, shipping
 #     the `filesec-pqc` binary. It is NOT a default member, so the bare
 #     `cargo build`/`cargo test`/`cargo clippy` commands stay on the classical,
@@ -15,7 +16,7 @@ resolver = "2"
 members = ["crates/filesec-core", "crates/filesec-gui", "crates/filesec-pqc"]
 default-members = ["crates/filesec-core", "crates/filesec-gui"]
 # `fuzz/` is a detached cargo-fuzz crate (its own workspace + Cargo.lock). It is
-# nightly-only (libfuzzer-sys) and must never be pulled into the MSRV-1.87 stable
+# nightly-only (libfuzzer-sys) and must never be pulled into the MSRV stable
 # build, the locked default build, or the cargo-deny/audit supply-chain scan.
 exclude = ["fuzz"]
 
@@ -28,8 +29,12 @@ version = "0.4.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["FileSec contributors"]
-# ctutils >= 0.4.4 fixes RUSTSEC-2026-0385 and requires Rust 1.87.
-rust-version = "1.87"
+# The GPUI stack sets the floor: GPUI itself (edition 2024) uses
+# `std::hint::cold_path`, stable since Rust 1.95 — above any `rust-version` its
+# crates declare (the highest is 1.92). CI's `msrv` job builds the whole shipped
+# feature graph with exactly this toolchain on all three OSes, so the number is
+# measured, not copied from manifests.
+rust-version = "1.95"
 repository = "https://github.com/peter1490/FileSec"
 
 # Release profile tuned for a small, fast single binary per OS.

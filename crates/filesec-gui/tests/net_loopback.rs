@@ -74,7 +74,7 @@ fn start_bob(
     contacts: ContactBook,
     expected: Option<[u8; 32]>,
 ) -> (NetHandle, u16, String) {
-    let ctx = egui::Context::default();
+    let ctx = filesec_gui::repaint::Repaint::noop();
     let handle = net::start_listener(
         ListenConfig {
             port: 0,
@@ -134,7 +134,7 @@ fn loopback_transfer_imports_the_vault() {
         },
         alice.clone(),
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
 
     // Bob is offered the transfer and accepts it.
@@ -189,7 +189,7 @@ fn loopback_rejects_unverified_sender() {
         },
         alice,
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
 
     // The receiver must refuse with an error and never import.
@@ -232,7 +232,7 @@ fn loopback_rejects_a_non_designated_sender() {
         },
         alice,
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
 
     let event = recv_until(&bob_h, Duration::from_secs(10), |e| {
@@ -274,7 +274,7 @@ fn loopback_wrong_transfer_code_aborts() {
         },
         alice,
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
 
     // The sender's handshake must fail (the receiver never discloses its Auth to a
@@ -339,7 +339,7 @@ fn loopback_slowloris_does_not_block_a_real_transfer() {
         },
         alice.clone(),
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
 
     let offer = recv_until(&bob_h, Duration::from_secs(10), |e| {
@@ -422,7 +422,7 @@ fn loopback_large_multifile_roundtrips_with_exact_size() {
         },
         alice.clone(),
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
 
     // The offer declares a concrete size that covers the payload. The exact value
@@ -487,7 +487,7 @@ fn send_and_receive(
         },
         alice,
         send_store,
-        egui::Context::default(),
+        filesec_gui::repaint::Repaint::noop(),
     );
     let outcome = loop {
         if let Some(NetEvent::Error(e)) = alice_h.try_recv() {

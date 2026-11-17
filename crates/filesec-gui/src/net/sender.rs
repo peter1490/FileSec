@@ -333,7 +333,7 @@ mod tests {
         let (_commands, command_rx) = mpsc::channel();
         let emitter = Emitter {
             tx: event_tx,
-            ctx: egui::Context::default(),
+            repaint: crate::repaint::Repaint::noop(),
         };
         let data: Vec<u8> = (0..CHUNK * 20 + 123).map(|i| (i % 251) as u8).collect();
         let mut wire = Vec::new();

@@ -7,4 +7,4 @@ Exec=filesec-pqc
 Icon=filesec-pqc
 Terminal=false
 Categories=Utility;Security;
-StartupWMClass=FileSec
+StartupWMClass=filesec-pqc

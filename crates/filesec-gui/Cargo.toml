@@ -1,6 +1,6 @@
 [package]
 name = "filesec-gui"
-description = "Native egui/eframe desktop app for FileSec secure file exchange."
+description = "Native GPUI desktop app for FileSec secure file exchange."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -49,6 +49,11 @@ can be upgraded in-app), and it works offline. The companion `filesec-pqc` \
 package adds direct peer-to-peer network transfer."""
 section = "utils"
 priority = "optional"
+# `$auto` is what the binary links (xkbcommon, xcb, fontconfig, freetype, …);
+# GPUI loads the Vulkan loader at runtime, so it is declared explicitly. Mesa's
+# drivers (including a software rasterizer) are what most systems will use.
+depends = "$auto, libvulkan1"
+recommends = "mesa-vulkan-drivers"
 # `target/release/...` is remapped by cargo-deb to the real (workspace) target
 # dir; other paths are relative to this crate's directory.
 assets = [
@@ -88,28 +93,34 @@ passkey = ["dep:ctap-hid-fido2"]
 keyring = ["dep:keyring"]
 
 [dependencies]
+# Wakes the GPUI foreground task from worker threads (see src/repaint.rs). Already
+# in GPUI's own dependency graph, so it adds no new crate.
+async-channel = "2.5.0"
 # Same version filesec-core already uses (no new crate in the graph). Hashes
 # the identity-migration journal into its committed record.
 blake3 = "1.8.5"
 directories = "6.0.0"
-eframe = "0.32.3"
-egui = "0.32.3"
-egui_extras = "0.32.3"
 filesec-core = { path = "../filesec-core" }
 # Cross-process advisory file locks (flock / LockFileEx) and free-space
 # queries. Enforces a single active writer per data directory (audit FS-05).
-# Pure Rust over rustix 1.x / windows-sys 0.59, both already in the graph;
-# declares a 1.75 MSRV, so it stays within the 1.87 toolchain.
+# Pure Rust over rustix 1.x / windows-sys 0.59, both already in the graph.
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
-rfd = "0.17.2"
+# The UI toolkit: GPUI (Zed's GPU-accelerated UI framework) plus the GPUI
+# Component library (inputs, buttons, menus, scrollbars, …) and its default
+# icon assets, as one pinned facade. `gpui_kit::*` *is* GPUI, so the app never
+# lists the `gpui-pre-*` crates itself; the exact pin keeps Kit and the GPUI
+# snapshot it was built against in step (see docs/DEPENDENCIES.md).
+gpui-kit = "=0.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
+# Grapheme-cluster cursor movement in the zeroizing passphrase field
+# (src/secret_input.rs). Already in GPUI's graph.
+unicode-segmentation = "1.12.0"
 walkdir = "2.5.0"
-# Pinned to match filesec-core (Rust 1.87 MSRV); wipes passphrases held in UI state.
+# Pinned to match filesec-core; wipes passphrases held in UI state.
 zeroize = "1.8.2"
 
 # Hardware passkey backend (opt-in via the `passkey` feature). Keep the
-# validated 3.5.7 client while the compiler floor moves to Rust 1.87 for the
-# ctutils security fix. A newer USB-HID client needs separate hardware testing.
+# validated 3.5.7 client; a newer USB-HID client needs separate hardware testing.
 # It uses `ring` for crypto, so getrandom stays 0.2, and only this optional
 # feature compiles the vendored C hidapi library.
 ctap-hid-fido2 = { version = "=3.5.7", optional = true }
@@ -117,9 +128,9 @@ ctap-hid-fido2 = { version = "=3.5.7", optional = true }
 # OS-keychain backend (opt-in via the `keyring` feature). 3.6 declares a 1.75
 # MSRV and target-gates every platform backend, so each OS pulls only its own:
 # macOS gets `security-framework`, Windows `windows-sys`, Linux the D-Bus Secret
-# Service (which drags in `zbus` — already required on Linux by rfd/directories,
-# so it doesn't raise the Linux MSRV further; the macOS/Windows hosts never
-# compile it). 4.x needs Rust 1.88, so it is held at 3.6 for the 1.87 MSRV.
+# Service (which drags in `zbus` — already required on Linux by GPUI's portal
+# and accessibility backends; the macOS/Windows hosts never compile it). Kept on
+# the validated 3.6 line; 4.x is a separate, hardware-tested upgrade.
 [target.'cfg(target_os = "macos")'.dependencies.keyring]
 version = "3.6"
 optional = true
@@ -148,8 +159,7 @@ features = ["sync-secret-service", "crypto-rust"]
 [build-dependencies]
 winresource = { version = "0.1.31", default-features = false }
 
-# The `net` loopback integration test constructs an `egui::Context` (used as the
-# repaint waker by the transfer threads). egui is already a normal dependency, so
-# this only exposes it to the test crate — no new build cost.
+# Headless GPUI windows for the UI integration tests (src/app/tests.rs): real
+# layout, hit testing, focus and keyboard dispatch without a display server.
 [dev-dependencies]
-egui = "0.32.3"
+gpui-kit = { version = "=0.10.0", features = ["test-support"] }

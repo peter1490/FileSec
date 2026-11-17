@@ -226,10 +226,17 @@ the classical baseline.
 
 ## 6. Known residual risks and accepted exceptions
 
-- Three low-reachability transitive dependency advisories are accepted as
-  documented, time-boxed exceptions because their only fixes would break the 1.86
-  MSRV or the pinned egui stack (see `deny.toml` / `RELEASE.md`). A new advisory
-  still fails CI.
+- A few low-reachability transitive dependency advisories in the UI toolkit's
+  graph (GPUI's Linux text, Wayland and accessibility stacks) are accepted as
+  documented, owned, time-boxed exceptions; none sits on a path that parses
+  vault, container, or network input (see `deny.toml` and
+  [DEPENDENCIES.md](DEPENDENCIES.md)). A new advisory still fails CI.
+- Passphrases and PINs are typed into a dedicated zeroizing field
+  (`secret_input.rs`) that never reaches the clipboard, an undo history, or the
+  text-layout caches. The quick editor's plaintext, however, lives in the UI
+  toolkit's text buffer while the editor is open and is not zeroized there; it
+  is dropped when the editor closes. Live process-memory scraping is out of
+  scope (§2), so this is hygiene rather than a boundary.
 - A fully race-free `openat`-based extraction walk is not implemented (it would
   require a `libc`/`unsafe` dependency this build avoids); see the TOCTOU note in
   §2.
