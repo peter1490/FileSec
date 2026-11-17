@@ -25,8 +25,10 @@ mod tests;
 mod transfer;
 mod views;
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -166,6 +168,10 @@ pub struct FileSecApp {
     last_dir: Option<PathBuf>,
     /// Monotonic toast id, so an old toast's timer never dismisses a new one.
     toast_seq: u64,
+    /// A press on empty titlebar space is waiting for the pointer to move to
+    /// start a window drag (macOS unified titlebar; see
+    /// `views::shell::window_drag_strip`).
+    titlebar_drag: Rc<Cell<bool>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1127,6 +1133,7 @@ impl FileSecApp {
             browser_focus: cx.focus_handle(),
             dialog_focus: cx.focus_handle(),
             root_focus,
+            titlebar_drag: Rc::new(Cell::new(false)),
             last_dir: None,
             toast_seq: 0,
             _subscriptions: subscriptions,
@@ -2033,16 +2040,23 @@ impl Render for FileSecApp {
         let c = theme::colors(cx);
         let viewport = window.viewport_size();
         let unlocked = matches!(self.state, State::Unlocked(_));
-        let content_width =
-            viewport.width - if unlocked { theme::SIDEBAR_W } else { px(0.0) } - px(40.0);
+        // The content column: what is left beside the sidebar, capped at the
+        // page width, minus the page padding on both sides.
+        let content_width = (viewport.width - if unlocked { theme::SIDEBAR_W } else { px(0.0) })
+            .min(theme::CONTENT_MAX)
+            - theme::PAGE_PAD * 2.0;
         let busy_label = self.busy_label();
         let weak = cx.weak_entity();
         let toast = self.toast.as_ref().map(|t| (t.msg.clone(), t.error));
         let prompt_open = self_prompt_open(self);
+        // Clear of the browser's status bar, so a toast never covers the
+        // selection actions.
         let toast_inset = match &self.state {
-            State::Unlocked(s) if s.open.is_some() && !s.show_trash => px(80.0),
-            _ => px(16.0),
+            State::Unlocked(s) if s.open.is_some() && !s.show_trash => px(72.0),
+            _ => px(20.0),
         };
+        let drag_strip = crate::UNIFIED_TITLEBAR
+            .then(|| views::shell::window_drag_strip(self.titlebar_drag.clone()));
         let FileSecApp {
             state,
             fields,
@@ -2098,6 +2112,9 @@ impl Render for FileSecApp {
             .font_family(theme::FONT_UI)
             .text_size(theme::TEXT_BODY)
             .text_color(c.text)
+            // Beneath everything, so the headers' own controls take their
+            // presses first.
+            .children(drag_strip)
             .children(sidebar)
             .child(
                 div()
@@ -2105,7 +2122,6 @@ impl Render for FileSecApp {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .p(px(20.0))
                     .flex()
                     .flex_col()
                     .bg(c.bg)

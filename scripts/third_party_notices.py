@@ -6,7 +6,7 @@ walked from the binary's package through the *locked* dependency graph
 (normal dependencies only; dev/build-only crates are not distributed) — with
 its version, SPDX license expression, and the full text of every license /
 notice / copyright file the crate ships, followed by the licenses of the fonts
-embedded in the application. Identical license texts are printed once and
+and icons embedded in the application. Identical license texts are printed once and
 referenced by id, which keeps the bundle readable.
 
 The crate sources must already be present locally (run it after
@@ -30,10 +30,10 @@ import sys
 
 LICENSE_PREFIXES = ("license", "licence", "copying", "notice", "copyright", "unlicense")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FONTS_DIR = os.path.join(REPO_ROOT, "crates", "filesec-gui", "assets", "fonts")
+ASSETS_DIR = os.path.join(REPO_ROOT, "crates", "filesec-gui", "assets")
 EMBEDDED_ASSETS = (
-    ("Inter (Inter-Regular/SemiBold/Bold.ttf, static instances of InterVariable)", "OFL-1.1", "Inter-LICENSE.txt"),
-    ("Phosphor Icons (Phosphor.ttf)", "MIT", "Phosphor-LICENSE.txt"),
+    ("Inter (Inter-Regular/SemiBold/Bold.ttf, static instances of InterVariable)", "OFL-1.1", "fonts/Inter-LICENSE.txt"),
+    ("Lucide icons (SVGs embedded from gpui-kit-assets)", "ISC AND MIT", "icons/Lucide-LICENSE.txt"),
 )
 
 
@@ -204,7 +204,7 @@ def main():
         "------------------",
     ]
     for title, spdx, filename in EMBEDDED_ASSETS:
-        lines += ["", f"{title} — {spdx}", "", read_text(os.path.join(FONTS_DIR, filename)), ""]
+        lines += ["", f"{title} — {spdx}", "", read_text(os.path.join(ASSETS_DIR, filename)), ""]
     lines += [
         "",
         f"2. Rust crates linked into {args.package} ({len(entries)})",

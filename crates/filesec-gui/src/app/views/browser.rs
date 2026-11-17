@@ -1,6 +1,7 @@
-//! The in-vault file browser: header and banners, breadcrumb, search and sort,
-//! the file tools and inline composers, the virtualized row list, the trash
-//! view, and the fixed selection footer.
+//! The in-vault file browser: the header (back to vaults, vault name, vault
+//! actions), status banners, the toolbar (folder path, search, sort, create),
+//! inline composers, the virtualized table of rows, the trash view, and the
+//! fixed status/selection bar.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,30 +9,40 @@ use std::sync::Arc;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::Sizable;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
-    div, prelude::*, px, uniform_list, AnyElement, Div, ElementId, ExternalPaths, SharedString,
-    WeakEntity,
+    div, prelude::*, px, uniform_list, AnyElement, Div, ElementId, ExternalPaths, FontWeight,
+    SharedString, WeakEntity,
 };
 
 use filesec_core::manifest::EntryKind;
 
-use crate::theme::{self, icon, Colors};
+use crate::theme::{self, ico, icon, Colors};
 
-use super::{any, dropdown, handler, search_field, tooltip_text, View};
+use super::{any, handler, icon_menu, search_field, select_button, tooltip_text, with_menu, View};
 use crate::app::model::{
-    breadcrumb_segments, clamp_dir, file_tint, human_size, leaf_name, parent_dir, shown,
-    trash_item_detail, view_summary, Row, RowClick, TrashItem,
+    breadcrumb_segments, clamp_dir, file_glyph, file_tint, human_size, leaf_name, parent_dir,
+    shown, trash_item_detail, view_summary, Row, RowClick, TrashItem,
 };
 use crate::app::{Action, FileSecApp, RowClickAt, Session, SortMode, BROWSER_CONTEXT};
 
 /// Height of one browser row, and the gap under it (the list's pitch is the
 /// sum: every row is the same height, so the list can be virtualized).
-const ROW_H: f32 = 44.0;
+const ROW_H: f32 = 40.0;
 const ROW_GAP: f32 = 2.0;
 
-/// Height of the fixed selection footer.
-const FOOTER_H: f32 = 44.0;
+/// Height of the fixed status/selection bar.
+const FOOTER_H: f32 = 48.0;
+
+/// Width of the "Size" column.
+const DETAIL_W: f32 = 168.0;
+
+/// Width of the trailing quick-action column.
+const ACTIONS_W: f32 = 60.0;
+
+/// Horizontal inset of the table (rows carry their own inner padding).
+const TABLE_PAD: f32 = 14.0;
 
 pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
     let c = v.c;
@@ -73,103 +84,86 @@ pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
         .size_full()
         .relative()
         .flex()
-        .flex_col()
-        .gap(px(8.0));
+        .flex_col();
 
-    // Navigation and vault actions stay separate from the file tools.
-    let mut right = theme::row();
-    if !in_trash {
-        right = right.child(dropdown(
-            "more",
-            "More",
-            vec![("Extract all files…".into(), Action::ExtractAll, false)],
-            v,
-        ));
-    }
-    let trash_label = if in_trash {
-        "Back to files".to_string()
-    } else {
-        format!("Trash ({trash_len})")
-    };
-    right = right.child(
-        theme::secondary_button("toggle-trash", trash_label)
-            .on_click(v.on(Action::ShowTrash(!in_trash))),
-    );
-    root = root.child(
-        theme::row()
-            .w_full()
-            .justify_between()
-            .child(
-                theme::secondary_button("all-vaults", "←  All vaults")
-                    .on_click(v.on(Action::CloseVault)),
-            )
-            .child(right),
-    );
-    root = root.child(
-        theme::row()
-            .w_full()
-            .child(
-                div()
-                    .id("vault-title")
-                    .flex_1()
-                    .min_w_0()
-                    .tooltip(tooltip_text(name.clone()))
-                    .child(theme::one_line(theme::strong(
-                        name.clone(),
-                        theme::TEXT_HEADING,
-                        c.text,
-                    ))),
-            )
-            .when(!in_trash, |r| {
-                r.child(
-                    theme::primary_button("send-open-vault", "Send vault…")
-                        .on_click(v.on(Action::BeginExport(id.clone()))),
-                )
-            }),
-    );
+    root = root.child(header(&name, &id, in_trash, trash_len, v));
 
+    // Status that must stay on screen while it is true.
+    let mut banners = Vec::new();
     if let Some(leaf) = &editing {
-        root = root.child(
-            theme::banner(c.accent).child(
-                theme::row()
-                    .w_full()
-                    .child(theme::icon_text(icon::EDIT, 16.0, c.accent))
-                    .child(theme::strong(
-                        format!("Editing {leaf}"),
-                        theme::TEXT_BODY,
-                        c.accent,
-                    ))
-                    .child(theme::muted("— edit in your app, then:", c))
-                    .child(div().flex_1())
-                    .child(
-                        theme::primary_button("check-in", "Check in")
-                            .on_click(v.on(Action::CheckIn)),
-                    )
-                    .child(
-                        theme::danger_button("discard", "Discard", v.cx)
-                            .on_click(v.on(Action::Discard)),
-                    ),
-            ),
-        );
+        banners.push(any(theme::banner(c.accent).child(
+            theme::wrap_row()
+                .w_full()
+                .gap(px(10.0))
+                .child(theme::icon_text(icon::EDIT, 16.0, c.accent))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .flex()
+                        .flex_col()
+                        .child(theme::strong(
+                            format!("Editing “{leaf}”"),
+                            theme::TEXT_BODY,
+                            c.text,
+                        ))
+                        .child(theme::muted(
+                            "Save your changes in the other app, then check the file back in.",
+                            c,
+                        )),
+                )
+                .child(
+                    theme::secondary_button("discard", "Discard changes")
+                        .on_click(v.on(Action::Discard)),
+                )
+                .child(
+                    theme::primary_button("check-in", "Check in")
+                        .icon(ico(icon::CHECK))
+                        .on_click(v.on(Action::CheckIn)),
+                ),
+        )));
     }
-
     if !viewing.is_empty() {
         let plural = if viewing.len() == 1 { "y" } else { "ies" };
+        banners.push(any(theme::banner(c.text_muted).child(
+            theme::row()
+                .w_full()
+                .items_start()
+                .gap(px(10.0))
+                .child(theme::icon_text(icon::EYE, 16.0, c.text_muted).mt(px(1.0)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(theme::strong(
+                            format!("{} read-only cop{plural} open", viewing.len()),
+                            theme::TEXT_BODY,
+                            c.text,
+                        ))
+                        .child(theme::muted(
+                            format!(
+                                "{} — wiped automatically when closed, or when you leave this \
+                                 vault.",
+                                viewing.join(", ")
+                            ),
+                            c,
+                        )),
+                ),
+        )));
+    }
+    if !banners.is_empty() {
         root = root.child(
-            theme::banner(c.accent).child(
-                theme::wrap_row()
-                    .child(theme::icon_text(icon::EYE, 16.0, c.accent))
-                    .child(theme::strong(
-                        format!("Viewing {} read-only cop{plural}", viewing.len()),
-                        theme::TEXT_BODY,
-                        c.accent,
-                    ))
-                    .child(theme::muted(format!("({})", viewing.join(", ")), c))
-                    .child(theme::muted(
-                        "— wiped automatically on close, or when you leave the vault.",
-                        c,
-                    )),
-            ),
+            div()
+                .flex_none()
+                .w_full()
+                .px(px(24.0))
+                .pt(px(14.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .children(banners),
         );
     }
 
@@ -180,131 +174,43 @@ pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
             .into_any_element();
     }
 
-    // Breadcrumbs get their own wrapping line, including for deep folders.
-    root = root.child(breadcrumb(&cur, v));
+    root = root.child(toolbar(s, &cur, idle, v));
 
-    let sort_items = SortMode::ALL
-        .iter()
-        .map(|m| {
-            (
-                SharedString::from(m.label()),
-                Action::SetSort(*m),
-                s.sort == *m,
-            )
-        })
-        .collect();
-    root = root.child(
-        theme::row()
-            .w_full()
-            .child(div().flex_none().w(px(170.0)).child(dropdown(
-                "file-sort",
-                s.sort.label(),
-                sort_items,
-                v,
-            )))
-            .child(div().flex_1().min_w_0().child(search_field(
-                "clear-file-search",
-                &v.fields.file_search,
-                Action::ClearFileSearch,
-                v,
-            ))),
-    );
-
-    // One primary file action, with less frequent creation tools grouped.
-    let new_items = vec![
-        (
-            SharedString::from("Folder"),
-            Action::ToggleNewFolder(!s.show_new_folder),
-            false,
-        ),
-        (
-            SharedString::from("Text file"),
-            Action::ToggleNewFile(!s.show_new_file),
-            false,
-        ),
-    ];
-    root = root.child(
-        theme::wrap_row()
-            .child(
-                theme::enabled(theme::primary_button("add-files", "+  Add files…"), idle)
-                    .on_click(v.on(Action::AddFiles)),
-            )
-            .child(
-                theme::enabled(theme::secondary_button("add-folder", "Add folder…"), idle)
-                    .on_click(v.on(Action::AddFolder)),
-            )
-            .when(idle, |r| {
-                r.child(dropdown("new-menu", "New…", new_items, v))
-            }),
-    );
-
-    if s.show_new_folder && idle {
-        root = root.child(
-            theme::card(c).child(
-                theme::wrap_row()
-                    .child(
-                        div()
-                            .w(px(220.0))
-                            .child(Input::new(&v.fields.new_folder_name)),
-                    )
-                    .child(
-                        theme::primary_button("create-folder", "Create")
-                            .on_click(v.on(Action::NewFolder)),
-                    )
-                    .child(
-                        theme::secondary_button("cancel-folder", "Cancel")
-                            .on_click(v.on(Action::ToggleNewFolder(false))),
-                    ),
-            ),
-        );
-    }
-
-    if s.show_new_file && idle {
-        root = root.child(
-            theme::card(c).child(
-                theme::wrap_row()
-                    .child(
-                        div()
-                            .w(px(260.0))
-                            .child(Input::new(&v.fields.new_file_name)),
-                    )
-                    .child(
-                        theme::primary_button("create-file", "Create & edit")
-                            .on_click(v.on(Action::NewFile)),
-                    )
-                    .child(
-                        theme::secondary_button("cancel-file", "Cancel")
-                            .on_click(v.on(Action::ToggleNewFile(false))),
-                    ),
-            ),
-        );
-    }
-
-    // ---- Inline rename composer ----
+    // ---- Inline composers (new folder / new file / rename) ----
     if idle {
+        if s.show_new_folder {
+            root = root.child(composer(
+                icon::FOLDER_PLUS,
+                "New folder".into(),
+                Input::new(&v.fields.new_folder_name),
+                ("create-folder", "Create", Action::NewFolder),
+                ("cancel-folder", Action::ToggleNewFolder(false)),
+                v,
+            ));
+        }
+        if s.show_new_file {
+            root = root.child(composer(
+                icon::FILE_PLUS,
+                "New text file".into(),
+                Input::new(&v.fields.new_file_name),
+                ("create-file", "Create & edit", Action::NewFile),
+                ("cancel-file", Action::ToggleNewFile(false)),
+                v,
+            ));
+        }
         if let Some(target) = s.rename_target.clone() {
-            root = root.child(
-                theme::card(c).child(
-                    theme::wrap_row()
-                        .child(theme::text(
-                            format!("Rename “{}”", shown(leaf_name(&target))),
-                            c.text,
-                        ))
-                        .child(div().w(px(220.0)).child(Input::new(&v.fields.rename)))
-                        .child(
-                            theme::primary_button("confirm-rename", "Save")
-                                .on_click(v.on(Action::ConfirmRename)),
-                        )
-                        .child(
-                            theme::secondary_button("cancel-rename", "Cancel")
-                                .on_click(v.on(Action::CancelRename)),
-                        ),
-                ),
-            );
+            root = root.child(composer(
+                icon::EDIT,
+                format!("Rename “{}”", shown(leaf_name(&target))).into(),
+                Input::new(&v.fields.rename),
+                ("confirm-rename", "Save", Action::ConfirmRename),
+                ("cancel-rename", Action::CancelRename),
+                v,
+            ));
         }
     }
 
-    // ---- The file/folder list ----
+    // ---- The file/folder table ----
     let search = v.text(&v.fields.file_search).to_string();
     let searching = !search.trim().is_empty();
     let rows = s.visible_rows(&model, &cur, &search);
@@ -315,61 +221,50 @@ pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
         any(theme::empty_state(
             icon::FOLDER,
             "This vault is empty",
-            "Add files or folders — or just drag them in from your computer.",
+            "Add files or folders, or drag them here from your computer. They're encrypted \
+             as they're added.",
             idle.then(|| {
-                any(theme::primary_button("add-files-empty", "+  Add files…")
-                    .on_click(v.on(Action::AddFiles)))
+                any(theme::row()
+                    .child(
+                        theme::secondary_button("add-folder-empty", "Add folder…")
+                            .icon(ico(icon::FOLDER_PLUS))
+                            .on_click(v.on(Action::AddFolder)),
+                    )
+                    .child(
+                        theme::primary_button("add-files-empty", "Add files…")
+                            .icon(ico(icon::UPLOAD))
+                            .on_click(v.on(Action::AddFiles)),
+                    ))
             }),
             c,
         ))
     } else if rows.is_empty() {
         if searching {
-            any(div()
-                .w_full()
-                .pt(px(40.0))
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(8.0))
-                .child(theme::icon_text(icon::FILE, 40.0, c.text_muted))
-                .child(theme::strong(
-                    format!("No files match “{}”", search.trim()),
-                    theme::TEXT_BODY,
-                    c.text,
-                ))
-                .child(theme::text(
-                    "Search includes every folder in this vault.",
-                    c.text_muted,
-                ))
-                .child(
-                    theme::secondary_button("clear-search-nomatch", "Clear search")
-                        .on_click(v.on(Action::ClearFileSearch)),
-                ))
+            any(theme::empty_state(
+                icon::SEARCH,
+                format!("No files match “{}”", search.trim()),
+                "Search looks in every folder of this vault.",
+                Some(any(theme::secondary_button(
+                    "clear-search-nomatch",
+                    "Clear search",
+                )
+                .on_click(v.on(Action::ClearFileSearch)))),
+                c,
+            ))
         } else {
             any(theme::empty_state(
                 icon::FOLDER,
                 "This folder is empty",
                 "Add files here, or drag them in from your computer.",
                 idle.then(|| {
-                    any(theme::primary_button("add-files-folder", "+  Add files…")
+                    any(theme::primary_button("add-files-folder", "Add files…")
+                        .icon(ico(icon::UPLOAD))
                         .on_click(v.on(Action::AddFiles)))
                 }),
                 c,
             ))
         }
     } else {
-        // An at-a-glance summary of the current view, plus a "select all"
-        // affordance on the right when there's more than one item to select.
-        let summary = theme::row()
-            .w_full()
-            .justify_between()
-            .child(theme::muted(view_summary(&rows, searching), c))
-            .when(idle && rows.len() > 1, |r| {
-                r.child(
-                    theme::link_button("select-all", "Select all")
-                        .on_click(v.on(Action::SelectAllVisible)),
-                )
-            });
         let selected = Arc::new(s.selected.clone());
         let clear_on_blank = !s.selected.is_empty();
         any(div()
@@ -377,16 +272,17 @@ pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
             .flex_1()
             .min_h_0()
             .w_full()
+            .px(px(TABLE_PAD))
             .flex()
             .flex_col()
-            .gap(px(2.0))
             // Clicking the blank space below the last row clears the
             // selection, like a file explorer.
             .when(clear_on_blank, |area| {
                 area.on_click(v.on(Action::ClearSelection))
             })
-            .child(summary)
-            .child(row_list(rows, selected, idle, searching, v)))
+            .child(column_header(searching, v))
+            .child(div().h(px(4.0)))
+            .child(row_list(rows.clone(), selected, idle, searching, v)))
     };
 
     root = root.child(
@@ -398,7 +294,7 @@ pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
             .flex_col()
             .child(list),
     );
-    root = root.child(selection_footer(&s.selected, idle, v));
+    root = root.child(status_bar(&s.selected, &rows, searching, idle, v));
 
     // ---- Drag-and-drop from the OS (into the current folder) ----
     let drop_target = if cur.is_empty() {
@@ -408,31 +304,262 @@ pub(in crate::app) fn browser(s: &mut Session, v: &View) -> AnyElement {
     };
     let dnd = idle && !s.modal_open();
     root = root.when(dnd, |r| {
-        r.drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.bg(theme::accent_soft(c)).rounded(theme::RADIUS)
-        })
+        r.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(theme::accent_soft(c)))
     });
     if dnd && v.cx.has_active_drag() {
         root = root.child(
             div()
                 .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .rounded(theme::RADIUS)
+                .top(px(8.0))
+                .left(px(8.0))
+                .right(px(8.0))
+                .bottom(px(8.0))
+                .rounded(theme::RADIUS_LG)
                 .border_2()
                 .border_color(c.accent)
+                .bg(theme::with_alpha(c.bg, 200))
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .child(theme::strong(
-                    format!("Drop to add to {drop_target}"),
-                    px(18.0),
+                .gap(px(12.0))
+                .child(theme::icon_tile(
+                    icon::UPLOAD,
+                    52.0,
                     c.accent,
-                )),
+                    theme::accent_soft(c),
+                ))
+                .child(theme::strong(
+                    format!("Drop to add to “{drop_target}”"),
+                    px(16.0),
+                    c.text,
+                ))
+                .child(theme::muted("Files are encrypted as they're added.", c)),
         );
     }
     root.into_any_element()
+}
+
+/// The page header: back to the vault list, the vault's name, and the
+/// vault-level actions.
+fn header(name: &str, id: &str, in_trash: bool, trash_len: usize, v: &View) -> Div {
+    let c = v.c;
+    let mut right = theme::row().flex_none().gap(px(6.0));
+    let trash_label = if in_trash {
+        "Back to files".to_string()
+    } else if trash_len > 0 {
+        format!("Trash ({trash_len})")
+    } else {
+        "Trash".to_string()
+    };
+    right = right.child(
+        theme::ghost_button("toggle-trash", trash_label)
+            .icon(ico(if in_trash { icon::FOLDER } else { icon::TRASH }))
+            .on_click(v.on(Action::ShowTrash(!in_trash))),
+    );
+    if !in_trash {
+        right = right
+            .child(icon_menu(
+                "more",
+                icon::DOTS,
+                "More actions",
+                vec![("Extract all files…".into(), Action::ExtractAll, false)],
+                v,
+            ))
+            .child(
+                theme::secondary_button("send-open-vault", "Send vault…")
+                    .icon(ico(icon::SEND))
+                    .on_click(v.on(Action::BeginExport(id.to_string()))),
+            );
+    }
+    div()
+        .flex_none()
+        .w_full()
+        .h(theme::HEADER_H)
+        .pl(px(14.0))
+        .pr(px(24.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .border_b_1()
+        .border_color(c.border_subtle)
+        .child(
+            Button::new("all-vaults")
+                .ghost()
+                .icon(ico(icon::BACK))
+                .label("Vaults")
+                .tooltip("Back to all vaults")
+                .on_click(v.on(Action::CloseVault)),
+        )
+        .child(theme::text("/", c.text_subtle))
+        .child(
+            div()
+                .id("vault-title")
+                .flex_1()
+                .min_w_0()
+                .tooltip(tooltip_text(name.to_string()))
+                .child(theme::one_line(theme::strong(
+                    name.to_string(),
+                    px(16.0),
+                    c.text,
+                ))),
+        )
+        .child(right)
+}
+
+/// Folder path on the left; search, sort, and creation on the right. Narrow
+/// windows split it over two lines so every control stays reachable.
+fn toolbar(s: &Session, cur: &str, idle: bool, v: &View) -> Div {
+    let sort_items = SortMode::ALL
+        .iter()
+        .map(|m| {
+            (
+                SharedString::from(m.label()),
+                Action::SetSort(*m),
+                s.sort == *m,
+            )
+        })
+        .collect();
+    let sort = with_menu(
+        select_button("file-sort", s.sort.label())
+            .icon(ico(icon::SORT))
+            .w(px(178.0)),
+        sort_items,
+        v,
+    );
+    let new_items = vec![
+        (
+            SharedString::from("New folder"),
+            Action::ToggleNewFolder(!s.show_new_folder),
+            false,
+        ),
+        (
+            SharedString::from("New text file"),
+            Action::ToggleNewFile(!s.show_new_file),
+            false,
+        ),
+        (SharedString::default(), Action::AddFolder, false),
+        (
+            SharedString::from("Add a folder from disk…"),
+            Action::AddFolder,
+            false,
+        ),
+    ];
+    let new_menu = with_menu(
+        theme::enabled(select_button("new-menu", "New").icon(ico(icon::PLUS)), idle),
+        new_items,
+        v,
+    );
+    let add = theme::enabled(
+        theme::primary_button("add-files", "Add files…").icon(ico(icon::UPLOAD)),
+        idle,
+    )
+    .on_click(v.on(Action::AddFiles));
+    let search = search_field(
+        "clear-file-search",
+        &v.fields.file_search,
+        Action::ClearFileSearch,
+        v,
+    );
+    let frame = div()
+        .flex_none()
+        .w_full()
+        .px(px(24.0))
+        .pt(px(14.0))
+        .pb(px(10.0))
+        .flex()
+        .flex_col()
+        .gap(px(10.0));
+    if v.width >= px(700.0) {
+        frame.child(
+            theme::row()
+                .w_full()
+                .child(div().flex_1().min_w_0().child(breadcrumb(cur, v)))
+                .child(div().w(px(220.0)).child(search))
+                .child(sort)
+                .child(new_menu)
+                .child(add),
+        )
+    } else {
+        frame
+            .child(
+                theme::row()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().child(breadcrumb(cur, v)))
+                    .child(add),
+            )
+            .child(
+                theme::row()
+                    .w_full()
+                    .child(div().flex_1().min_w_0().child(search))
+                    .child(sort)
+                    .child(new_menu),
+            )
+    }
+}
+
+/// An inline, single-field composer (new folder / new file / rename).
+fn composer(
+    glyph: icon::Glyph,
+    title: SharedString,
+    input: Input,
+    confirm: (&'static str, &'static str, Action),
+    cancel: (&'static str, Action),
+    v: &View,
+) -> Div {
+    let c = v.c;
+    div().flex_none().w_full().px(px(24.0)).pb(px(10.0)).child(
+        div()
+            .w_full()
+            .p(px(10.0))
+            .pl(px(14.0))
+            .rounded(theme::RADIUS)
+            .bg(c.surface)
+            .border_1()
+            .border_color(c.border)
+            .child(
+                theme::wrap_row()
+                    .w_full()
+                    .gap(px(10.0))
+                    .child(theme::icon_text(glyph, 16.0, c.text_muted))
+                    .child(theme::one_line(theme::text(title, c.text)).max_w(px(260.0)))
+                    .child(div().flex_1().min_w(px(180.0)).child(input.w_full()))
+                    .child(theme::ghost_button(cancel.0, "Cancel").on_click(v.on(cancel.1)))
+                    .child(theme::primary_button(confirm.0, confirm.1).on_click(v.on(confirm.2))),
+            ),
+    )
+}
+
+/// The table's column captions.
+fn column_header(searching: bool, v: &View) -> Div {
+    let c = v.c;
+    let caption = |s: &'static str| {
+        div()
+            .text_size(px(12.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(c.text_muted)
+            .child(s)
+    };
+    div()
+        .flex_none()
+        .w_full()
+        .h(px(32.0))
+        .px(px(10.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .border_b_1()
+        .border_color(c.border_subtle)
+        .child(div().w(px(16.0)))
+        .child(caption("Name").flex_1())
+        .child(
+            caption(if searching { "Size · Folder" } else { "Size" })
+                .w(px(DETAIL_W))
+                .flex_none(),
+        )
+        .child(div().w(px(ACTIONS_W)).flex_none())
 }
 
 /// The virtualized row list: only rows intersecting the viewport are built.
@@ -473,10 +600,10 @@ fn row_click(event: &gpui_kit::ClickEvent, cx: &gpui_kit::App) -> RowClick {
     }
 }
 
-/// One row in the file browser: a full-width, hover/selected-highlighted
-/// surface with a type-tinted icon, the name/detail block, and trailing quick
-/// actions. The body click resolves selection / open on dispatch; trailing
-/// buttons and the right-click menu emit their actions directly.
+/// One row of the table: a full-width, hover/selected-highlighted surface
+/// with a type icon, the name, the size column, and trailing quick actions.
+/// The body click resolves selection / open on dispatch; trailing buttons and
+/// the right-click menu emit their actions directly.
 fn entry_row(
     row: &Row,
     selected: bool,
@@ -486,10 +613,11 @@ fn entry_row(
     app: &WeakEntity<FileSecApp>,
 ) -> AnyElement {
     let is_dir = row.kind == EntryKind::Dir;
+    let leaf = leaf_name(&row.path);
     let (glyph, col) = if is_dir {
         (icon::FOLDER, c.accent)
     } else {
-        (icon::FILE, file_tint(leaf_name(&row.path), c))
+        (file_glyph(leaf), file_tint(leaf, c))
     };
     let secondary = if is_dir {
         format!(
@@ -518,14 +646,8 @@ fn entry_row(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(10.0))
         .rounded(theme::RADIUS_SM)
-        .border_1()
-        .border_color(if selected {
-            c.accent
-        } else {
-            theme::with_alpha(c.accent, 0)
-        })
         .when(selected, |r| r.bg(theme::accent_soft(c)))
         .when(!selected, |r| r.hover(|s| s.bg(c.surface_hi)))
         .cursor_pointer()
@@ -537,57 +659,63 @@ fn entry_row(
             });
             let _ = click_app.update(cx, |this, cx| this.dispatch(action, window, cx));
         })
-        .child(theme::icon_text(glyph, 18.0, col))
+        .child(theme::icon_text(glyph, 16.0, col))
         .child(
             div()
+                .id(ElementId::Name(format!("row-name:{path}").into()))
                 .flex_1()
                 .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
+                .tooltip(tooltip_text(path.clone()))
+                .child(theme::one_line(
                     div()
-                        .id(ElementId::Name(format!("row-name:{path}").into()))
-                        .w_full()
-                        .tooltip(tooltip_text(path.clone()))
-                        .child(theme::one_line(
-                            div()
-                                .text_size(theme::TEXT_BODY)
-                                .text_color(c.text)
-                                .child(shown(leaf_name(&path))),
-                        ))
-                        .test_support(),
-                )
-                .child(
-                    div()
-                        .id(ElementId::Name(format!("row-detail:{path}").into()))
-                        .w_full()
-                        .child(theme::one_line(theme::small(secondary, c.text_muted)))
-                        .test_support(),
-                ),
+                        .text_size(theme::TEXT_BODY)
+                        .text_color(c.text)
+                        .when(selected, |d| d.font_weight(FontWeight::SEMIBOLD))
+                        .child(shown(leaf)),
+                ))
+                .test_support(),
         )
-        .when(!is_dir, |r| {
-            r.child(
-                theme::icon_button(
-                    SharedString::from(format!("view:{path}")),
-                    icon::EYE,
-                    "View file read-only",
-                    c,
-                )
-                .on_click(handler(app, Action::ViewFile(path.clone()))),
-            )
-        })
         .child(
-            Button::new(SharedString::from(format!("row-menu:{path}")))
-                .ghost()
-                .w(px(32.0))
-                .h(px(32.0))
-                .child(theme::icon_text(icon::DOTS, 17.0, c.text_muted))
-                .accessibility_label(SharedString::from(format!(
-                    "Actions for {}",
-                    leaf_name(&path)
-                )))
-                .dropdown_menu(move |menu, _, _| entry_menu(menu, &menu_row, idle, &menu_app)),
+            div()
+                .id(ElementId::Name(format!("row-detail:{path}").into()))
+                .w(px(DETAIL_W))
+                .flex_none()
+                .child(theme::one_line(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(c.text_muted)
+                        .child(secondary),
+                ))
+                .test_support(),
+        )
+        .child(
+            theme::row()
+                .w(px(ACTIONS_W))
+                .flex_none()
+                .gap(px(4.0))
+                .justify_end()
+                .when(!is_dir, |r| {
+                    r.child(
+                        theme::icon_button(
+                            SharedString::from(format!("view:{path}")),
+                            icon::EYE,
+                            "View read-only",
+                            c,
+                        )
+                        .small()
+                        .on_click(handler(app, Action::ViewFile(path.clone()))),
+                    )
+                })
+                .child(
+                    theme::icon_button(
+                        SharedString::from(format!("row-menu:{path}")),
+                        icon::DOTS,
+                        &format!("Actions for {}", leaf_name(&path)),
+                        c,
+                    )
+                    .small()
+                    .dropdown_menu(move |menu, _, _| entry_menu(menu, &menu_row, idle, &menu_app)),
+                ),
         )
         .context_menu(move |menu, _, _| entry_menu(menu, &ctx_row, idle, &ctx_app));
 
@@ -640,22 +768,28 @@ fn entry_menu(
     menu
 }
 
-/// The folder breadcrumb ("Home / a / b"); each ancestor crumb navigates.
+/// The folder path ("All files › a › b"); each ancestor navigates.
 fn breadcrumb(current: &str, v: &View) -> Div {
     let c = v.c;
     let segs = breadcrumb_segments(current);
     let last = segs.len().saturating_sub(1);
-    let mut row = theme::wrap_row().w_full().gap(px(4.0));
+    let mut row = theme::row()
+        .w_full()
+        .min_w_0()
+        .gap(px(2.0))
+        .overflow_hidden();
     for (i, (label, target)) in segs.into_iter().enumerate() {
+        let label = if i == 0 {
+            "All files".to_string()
+        } else {
+            label
+        };
         if i > 0 {
-            row = row.child(theme::text("/", c.text_muted));
+            row = row.child(theme::icon_text(icon::CARET_RIGHT, 14.0, c.text_subtle));
         }
         if i == last {
-            row = row.child(theme::one_line(theme::strong(
-                label,
-                theme::TEXT_BODY,
-                c.text,
-            )));
+            row = row
+                .child(theme::one_line(theme::strong(label, theme::TEXT_BODY, c.text)).px(px(6.0)));
         } else {
             row = row.child(
                 theme::link_button(SharedString::from(format!("crumb:{target}")), label)
@@ -666,171 +800,224 @@ fn breadcrumb(current: &str, v: &View) -> Div {
     row
 }
 
-/// A fixed footer; its height does not depend on whether anything is selected.
-fn selection_footer(selected: &HashSet<String>, idle: bool, v: &View) -> Div {
+/// The fixed bar under the table: a summary of the folder, or the actions for
+/// the current selection. Its height never changes, so rows never jump.
+fn status_bar(
+    selected: &HashSet<String>,
+    rows: &[Row],
+    searching: bool,
+    idle: bool,
+    v: &View,
+) -> Div {
     let c = v.c;
     let frame = div()
         .flex_none()
         .w_full()
         .h(px(FOOTER_H))
-        .px(px(10.0))
+        .px(px(24.0))
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0))
+        .border_t_1()
+        .border_color(c.border_subtle)
         .bg(if selected.is_empty() {
-            c.surface
+            c.bg
         } else {
-            theme::accent_soft(c)
-        })
-        .border_1()
-        .border_color(c.border)
-        .rounded(theme::RADIUS_SM);
+            theme::with_alpha(c.accent, if c.dark { 22 } else { 12 })
+        });
     if selected.is_empty() {
-        return frame.child(theme::one_line(theme::muted(
-            "Select items for actions · Double-click to open",
-            c,
-        )));
+        let summary = if rows.is_empty() {
+            String::new()
+        } else {
+            view_summary(rows, searching)
+        };
+        return frame
+            .child(theme::one_line(theme::muted(summary, c)).flex_1())
+            .when(v.wide(), |f| {
+                f.child(theme::small("Double-click to open", c.text_subtle))
+            })
+            .when(idle && rows.len() > 1, |f| {
+                f.child(
+                    theme::link_button("select-all", "Select all")
+                        .on_click(v.on(Action::SelectAllVisible)),
+                )
+            });
     }
     let paths: Vec<String> = selected.iter().cloned().collect();
     frame
-        .child(theme::strong(
-            format!("{} selected", selected.len()),
-            theme::TEXT_SMALL,
-            c.accent,
-        ))
-        .child(div().flex_1())
-        .child(
-            theme::enabled(theme::primary_button("extract-selection", "Extract…"), idle)
-                .on_click(v.on(Action::ExtractSelected)),
-        )
-        .child(
-            theme::enabled(theme::secondary_button("move-selection", "Move…"), idle)
-                .on_click(v.on(Action::BeginMove(paths))),
-        )
-        .child(
-            theme::enabled(theme::secondary_button("trash-selection", "Trash"), idle)
-                .tooltip("Move selected items to Trash")
-                .on_click(v.on(Action::TrashSelected)),
-        )
         .child(
             theme::enabled(
-                theme::icon_button("clear-selection", icon::CLOSE, "Clear selection", c),
+                theme::icon_button("clear-selection", icon::CLOSE, "Clear selection", c).small(),
                 idle,
             )
             .on_click(v.on(Action::ClearSelection)),
         )
+        .child(theme::strong(
+            format!("{} selected", selected.len()),
+            px(13.0),
+            c.text,
+        ))
+        .child(div().flex_1())
+        .child(
+            theme::enabled(
+                theme::secondary_button("trash-selection", "Trash")
+                    .small()
+                    .icon(ico(icon::TRASH)),
+                idle,
+            )
+            .tooltip("Move selected items to Trash")
+            .on_click(v.on(Action::TrashSelected)),
+        )
+        .child(
+            theme::enabled(
+                theme::secondary_button("move-selection", "Move…")
+                    .small()
+                    .icon(ico(icon::FOLDER_INPUT)),
+                idle,
+            )
+            .on_click(v.on(Action::BeginMove(paths))),
+        )
+        .child(
+            theme::enabled(
+                theme::primary_button("extract-selection", "Extract…")
+                    .small()
+                    .icon(ico(icon::DOWNLOAD)),
+                idle,
+            )
+            .on_click(v.on(Action::ExtractSelected)),
+        )
 }
 
-/// The trash view: soft-deleted entries, each with Restore / Delete forever, plus
-/// an "Empty Trash" action. Items stay encrypted at rest until purged, and are
-/// never included when a vault is sent or extracted.
-fn trash_panel(items: &[TrashItem], idle: bool, confirm_empty: bool, v: &View) -> Div {
+/// The trash view: soft-deleted entries, each with Restore / Delete forever,
+/// plus "Empty Trash". Items stay encrypted at rest until purged, and are never
+/// included when a vault is sent or extracted.
+fn trash_panel(
+    items: &[TrashItem],
+    idle: bool,
+    confirm_empty: bool,
+    v: &View,
+) -> gpui_kit::Stateful<Div> {
     let c = v.c;
     // Emptying the trash is the one irreversible bulk action here, so it takes
-    // a second click to confirm.
-    let mut actions = theme::row();
+    // a second, explicit click that names the consequence.
+    let mut actions = theme::wrap_row().justify_end();
     if !items.is_empty() && idle {
         if confirm_empty {
             actions = actions
                 .child(theme::muted(
-                    format!("Delete {} item(s) forever?", items.len()),
+                    format!(
+                        "Permanently delete {} item{}? This can't be undone.",
+                        items.len(),
+                        if items.len() == 1 { "" } else { "s" }
+                    ),
                     c,
                 ))
                 .child(
-                    theme::secondary_button("cancel-empty-trash", "Cancel")
+                    theme::ghost_button("cancel-empty-trash", "Cancel")
                         .on_click(v.on(Action::PromptEmptyTrash(false))),
                 )
                 .child(
-                    theme::danger_button("confirm-empty-trash", "Delete all permanently", v.cx)
+                    theme::danger_button("confirm-empty-trash", "Delete all", v.cx)
                         .on_click(v.on(Action::EmptyTrash)),
                 );
         } else {
             actions = actions.child(
-                theme::danger_button("empty-trash", "Empty Trash", v.cx)
+                theme::secondary_button("empty-trash", "Empty Trash…")
                     .on_click(v.on(Action::PromptEmptyTrash(true))),
             );
         }
     }
-    // The title and the actions each stay in one piece; when the window is
-    // too narrow for both on one line, the actions wrap below the title.
     let header = theme::wrap_row()
         .w_full()
         .justify_between()
+        .gap(px(12.0))
         .child(
-            theme::row()
-                .child(theme::icon_text(icon::TRASH, 18.0, c.text_muted))
-                .child(theme::strong("Trash", theme::TEXT_HEADING, c.text)),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(theme::strong("Trash", theme::TEXT_H2, c.text))
+                .child(theme::muted(
+                    "Deleted items stay encrypted here until you empty the Trash. They're \
+                     never included when you send or extract this vault.",
+                    c,
+                )),
         )
         .child(actions);
     let body: AnyElement = if items.is_empty() {
         any(theme::empty_state(
             icon::TRASH,
             "Trash is empty",
-            "Files you delete land here, so you can put them back.",
+            "Files you delete land here first, so you can put them back.",
             None,
             c,
         ))
     } else {
-        any(
-            super::page_scroll("trash-list").children(items.iter().map(|item| {
-                let (glyph, col) = if item.kind == EntryKind::Dir {
-                    (icon::FOLDER, c.accent)
-                } else {
-                    (icon::FILE, file_tint(leaf_name(&item.orig_path), c))
-                };
-                let tp = item.trashed_path.clone();
-                theme::card(c).child(
-                    theme::row()
-                        .w_full()
-                        .gap(px(10.0))
-                        .child(theme::icon_text(glyph, 18.0, col))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(theme::one_line(theme::text(
-                                    shown(leaf_name(&item.orig_path)),
-                                    c.text,
-                                )))
-                                .child(theme::muted(trash_item_detail(item), c)),
-                        )
-                        .when(idle, |r| {
-                            r.child(
-                                theme::primary_button(
-                                    SharedString::from(format!("restore:{tp}")),
-                                    "Restore",
-                                )
-                                .on_click(v.on(Action::RestoreTrashed(tp.clone()))),
-                            )
-                            .child(
-                                theme::danger_button(
-                                    SharedString::from(format!("purge:{tp}")),
-                                    "Delete forever",
-                                    v.cx,
-                                )
-                                .on_click(v.on(Action::PurgeTrashed(tp.clone()))),
-                            )
-                        }),
+        let mut list = theme::list_container(c);
+        for (i, item) in items.iter().enumerate() {
+            let leaf = leaf_name(&item.orig_path);
+            let (glyph, col) = if item.kind == EntryKind::Dir {
+                (icon::FOLDER, c.accent)
+            } else {
+                (file_glyph(leaf), file_tint(leaf, c))
+            };
+            let tp = item.trashed_path.clone();
+            let row = theme::row()
+                .w_full()
+                .px(px(16.0))
+                .py(px(10.0))
+                .gap(px(12.0))
+                .child(theme::icon_text(glyph, 16.0, col))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(theme::one_line(theme::text(shown(leaf), c.text)))
+                        .child(theme::one_line(theme::muted(trash_item_detail(item), c))),
                 )
-            })),
-        )
+                .when(idle, |r| {
+                    r.child(
+                        theme::ghost_button(
+                            SharedString::from(format!("purge:{tp}")),
+                            "Delete forever",
+                        )
+                        .small()
+                        .on_click(v.on(Action::PurgeTrashed(tp.clone()))),
+                    )
+                    .child(
+                        theme::secondary_button(
+                            SharedString::from(format!("restore:{tp}")),
+                            "Restore",
+                        )
+                        .small()
+                        .icon(ico(icon::RESTORE))
+                        .on_click(v.on(Action::RestoreTrashed(tp.clone()))),
+                    )
+                });
+            list = list.child(theme::list_row_divider(i, row, c));
+        }
+        any(list)
     };
     div()
+        .id("trash-list")
         .flex_1()
         .min_h_0()
         .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(header)
-        .child(theme::muted(
-            "Deleted items stay encrypted here until you empty the Trash. They're never \
-             included when you Send or Extract a vault.",
-            c,
-        ))
-        .child(body)
+        .overflow_y_scroll()
+        .child(
+            div()
+                .w_full()
+                .px(px(24.0))
+                .pt(px(18.0))
+                .pb(px(32.0))
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .child(header)
+                .child(body),
+        )
 }

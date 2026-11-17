@@ -136,7 +136,7 @@ impl Fields {
             unlock_pin: secret("Security-key PIN (if set)", cx),
             new_vault_name: input("e.g. Personal documents", window, cx),
             vault_search: input("Find a vault…", window, cx),
-            contact_search: input("Find a contact by name or fingerprint…", window, cx),
+            contact_search: input("Find by name or fingerprint…", window, cx),
             file_search: input("Search all files…", window, cx),
             new_folder_name: input("Folder name", window, cx),
             new_file_name: input("Name with extension, e.g. notes.txt", window, cx),

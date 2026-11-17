@@ -612,6 +612,7 @@ impl Render for SecretInput {
             .flex()
             .items_center()
             .overflow_hidden()
+            // The same fill as every other text field (see `Colors::input`).
             .bg(c.input)
             .border_1()
             .border_color(if focused { c.accent } else { c.border })
