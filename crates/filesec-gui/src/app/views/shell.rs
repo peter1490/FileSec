@@ -180,7 +180,7 @@ pub(in crate::app) fn sidebar(s: &Session, v: &View) -> gpui_kit::Stateful<Div> 
         .rounded(theme::RADIUS)
         .border_1()
         .border_color(c.border_subtle)
-        .bg(if c.dark { c.surface } else { c.surface })
+        .bg(c.surface)
         .flex()
         .flex_row()
         .items_center()
